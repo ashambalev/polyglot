@@ -4,28 +4,29 @@
         test-rust test-rust-all test-rust-identity test-rust-dialect \
         test-rust-transpile test-rust-pretty test-rust-roundtrip test-rust-matrix \
         test-rust-compat test-rust-errors test-rust-functions test-rust-custom test-rust-lib test-rust-verify \
-        test-rust-transpile-generic test-rust-parser \
+        test-rust-transpile-generic test-rust-parser test-rust-check \
         test-rust-clickhouse-parser test-rust-clickhouse-coverage \
         test-ffi \
         test-compare build-wasm clean-fixtures clean-clickhouse-fixtures clean-external clean \
         generate-bindings copy-bindings cargo-build-release \
-        build-ffi build-ffi-static generate-ffi-header build-ffi-example clean-ffi \
+        build-all build-ffi build-ffi-static generate-ffi-header build-ffi-example clean-ffi \
         develop-python test-python build-python typecheck-python \
         python-docs-build python-docs-preview python-docs-deploy \
-        bench-compare bench-rust bench-rust-parsing-report bench-python bench-parse bench-parse-quick bench-parse-full bench-simple bench-simple-full bench-transpile bench-transpile-quick \
+        bench-compare bench-rust bench-rust-parsing-report bench-python bench-parse bench-parse-quick bench-parse-full bench-simple bench-simple-quick bench-simple-full bench-transpile bench-transpile-quick \
         playground-dev playground-build playground-preview playground-deploy \
+        documentation-dev documentation-build documentation-preview documentation-deploy \
         fmt \
-        bump-version
+        dev validate bump-version
 
 # =============================================================================
 # Pinned External Project Versions
 # =============================================================================
 
 SQLGLOT_REPO := https://github.com/tobymao/sqlglot.git
-SQLGLOT_REF := v30.6.0
+SQLGLOT_REF := v30.7.0
 
 CLICKHOUSE_REPO := https://github.com/ClickHouse/ClickHouse.git
-CLICKHOUSE_REF := v26.2.16.4-stable
+CLICKHOUSE_REF := v26.2.17.31-stable
 
 # Default target
 help:
@@ -42,16 +43,17 @@ help:
 	@echo "  make clean-external          - Remove external project clones"
 	@echo ""
 	@echo "Rust Tests (fast):"
-	@echo "  make test-rust           - Run all Rust tests"
+	@echo "  make test-rust           - Run SQLGlot-named Rust tests"
 	@echo "  make test-rust-all       - Run all sqlglot fixture tests"
-	@echo "  make test-rust-lib       - Run lib unit tests (736)"
+	@echo "  make test-rust-lib       - Run lib unit tests"
+	@echo "  make test-rust-check     - Compile Rust test targets without running them"
 	@echo "  make test-rust-verify    - Run full Rust verification suite incl. FFI"
 	@echo ""
 	@echo "  SQLGlot Fixture Tests:"
-	@echo "  make test-rust-identity         - Generic identity tests (955)"
+	@echo "  make test-rust-identity         - Generic identity tests"
 	@echo "  make test-rust-dialect          - Dialect identity tests"
 	@echo "  make test-rust-transpile        - Transpilation tests"
-	@echo "  make test-rust-pretty           - Pretty-printing tests (24)"
+	@echo "  make test-rust-pretty           - Pretty-printing tests"
 	@echo "  make test-rust-transpile-generic - Normalization/transpile tests (test_transpile.py)"
 	@echo "  make test-rust-parser           - Parser round-trip/error tests (test_parser.py)"
 	@echo ""
@@ -60,7 +62,7 @@ help:
 	@echo "  make test-rust-matrix    - Dialect matrix transpilation tests"
 	@echo "  make test-rust-compat    - SQLGlot compatibility tests"
 	@echo "  make test-rust-errors    - Error handling tests"
-	@echo "  make test-rust-functions - Function normalization tests"
+	@echo "  make test-rust-functions - Function-focused unit tests"
 	@echo "  make test-rust-custom   - Custom dialect tests (DataFusion, etc.)"
 	@echo "  make test-ffi           - Run C FFI crate tests"
 	@echo ""
@@ -80,6 +82,7 @@ help:
 	@echo "  make bench-parse-quick   - Parse benchmark fast mode (core-only + quick)"
 	@echo "  make bench-parse-full    - Parse benchmark (all available parsers)"
 	@echo "  make bench-simple        - Simple parse benchmark (core-only, median-of-5)"
+	@echo "  make bench-simple-quick  - Simple parse benchmark fast mode"
 	@echo "  make bench-simple-full   - Simple parse benchmark (all available parsers)"
 	@echo "  make bench-transpile     - Transpile benchmark (polyglot vs sqlglot)"
 	@echo "  make bench-transpile-quick - Transpile benchmark fast mode"
@@ -88,7 +91,9 @@ help:
 	@echo "  make generate-bindings   - Generate TypeScript bindings (ts-rs) and copy to SDK"
 	@echo "  make copy-bindings       - Copy bindings from Rust crate to TypeScript SDK"
 	@echo "  make build-wasm          - Build WASM package"
+	@echo "  make cargo-build-release - Build core Rust crate in release mode"
 	@echo "  make build-ffi           - Build C FFI shared/static library"
+	@echo "  make build-ffi-static    - Build C FFI static library"
 	@echo "  make generate-ffi-header - Generate C header via cbindgen/build.rs"
 	@echo "  make build-ffi-example   - Build and run C example"
 	@echo "  make develop-python      - Build/install Python extension in uv-managed env"
@@ -96,9 +101,18 @@ help:
 	@echo "  make build-python        - Build Python wheels (maturin)"
 	@echo "  make typecheck-python    - Type-check Python package stubs"
 	@echo "  make python-docs-build   - Build Python API docs into packages/python-docs/dist"
+	@echo "  make python-docs-preview - Preview Python API docs"
 	@echo "  make python-docs-deploy  - Deploy Python API docs to Cloudflare Pages"
 	@echo "  make build-all           - Build everything"
 	@echo "  make fmt                 - Format all code (Rust + TypeScript SDK)"
+	@echo "  make dev                 - Run quick development checks"
+	@echo "  make validate            - Run validation before commit"
+	@echo ""
+	@echo "Documentation:"
+	@echo "  make documentation-dev      - Run documentation dev server"
+	@echo "  make documentation-build    - Build documentation for production"
+	@echo "  make documentation-preview  - Preview documentation production build"
+	@echo "  make documentation-deploy   - Deploy documentation to Cloudflare Pages"
 	@echo ""
 	@echo "Playground:"
 	@echo "  make playground-dev         - Run playground dev server"
@@ -178,7 +192,7 @@ extract-all-fixtures: extract-fixtures extract-clickhouse-fixtures
 test-rust:
 	cargo test -p polyglot-sql sqlglot -- --nocapture
 
-# Run only generic identity tests (955 tests)
+# Run only generic identity tests
 test-rust-identity:
 	cargo test -p polyglot-sql sqlglot_identity -- --nocapture
 
@@ -190,11 +204,11 @@ test-rust-dialect:
 test-rust-transpile:
 	cargo test -p polyglot-sql sqlglot_transpilation -- --nocapture
 
-# Run pretty-printing tests (24 tests)
+# Run pretty-printing tests
 test-rust-pretty:
 	cargo test -p polyglot-sql sqlglot_pretty -- --nocapture
 
-# Run lib unit tests (736 tests)
+# Run lib unit tests
 test-rust-lib:
 	cargo test --lib -p polyglot-sql
 
@@ -251,7 +265,7 @@ test-rust-parser:
 # Additional Rust Tests
 # -----------------------------------------------------------------------------
 
-# Run organized roundtrip unit tests (131 tests)
+# Run organized roundtrip unit tests
 test-rust-roundtrip:
 	cargo test -p polyglot-sql --test identity_roundtrip -- --nocapture
 
@@ -267,9 +281,9 @@ test-rust-compat:
 test-rust-errors:
 	cargo test -p polyglot-sql --test error_handling -- --nocapture
 
-# Run function normalization tests
+# Run function-focused unit tests
 test-rust-functions:
-	cargo test -p polyglot-sql --test test_function_normalizations -- --nocapture
+	cargo test -p polyglot-sql --lib function -- --nocapture
 
 # Run custom dialect tests (auto-discovers all dialects in custom_fixtures/)
 test-rust-custom:
@@ -392,25 +406,6 @@ copy-bindings:
 build-wasm:
 	cd crates/polyglot-sql-wasm && wasm-pack build --target bundler --release --out-dir ../../packages/sdk/wasm
 	cd packages/sdk && npm run build
-
-# Priority dialects for per-dialect WASM builds
-PRIORITY_DIALECTS := postgresql mysql bigquery snowflake duckdb tsql clickhouse
-
-# Build a single per-dialect WASM binary (usage: make build-wasm-dialect D=clickhouse)
-build-wasm-dialect:
-ifndef D
-	$(error Usage: make build-wasm-dialect D=<dialect>)
-endif
-	cd crates/polyglot-sql-wasm && wasm-pack build --target bundler --release \
-		--out-dir ../../packages/sdk/wasm/$(D) \
-		-- --no-default-features --features "console_error_panic_hook,dialect-$(D)"
-
-# Build all priority per-dialect WASM binaries
-build-wasm-dialects:
-	@for d in $(PRIORITY_DIALECTS); do \
-		echo "Building WASM for dialect: $$d"; \
-		$(MAKE) build-wasm-dialect D=$$d; \
-	done
 
 # Build everything (release-safe order)
 build-all:

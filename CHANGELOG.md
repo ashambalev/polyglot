@@ -4,6 +4,41 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.6] - 2026-05-06
+
+### Added
+- BigQuery parser support for alias-first `UNNEST ... WITH OFFSET` table
+  expressions, including `UNNEST(arr) AS elem WITH OFFSET AS off` and
+  normalization of `WITH OFFSET off` to `WITH OFFSET AS off`.
+- Focused round-trip coverage for BigQuery `UNNEST` with offset aliases in
+  both `FROM` and `CROSS JOIN` table expressions.
+
+### Changed
+- Updated SQLGlot and ClickHouse fixture pins to `v30.7.0` and
+  `v26.2.17.31-stable`.
+- Cleaned up Makefile target metadata, help output, and `.PHONY` coverage so
+  advertised development commands resolve consistently.
+
+### Fixed
+- SQLGlot fixture compatibility for updated dialect identity and transpilation
+  cases, including MySQL DDL/charset forms, DuckDB FROM-first joins, Redshift
+  approximate percentile and interval output, Snowflake string/array/UUID
+  rewrites, Oracle `JSON_TABLE ... FORMAT JSON`, Exasol `OPEN`, and BigQuery
+  drop-primary-key forms.
+- Fabric/T-SQL interval arithmetic rewrites for additional interval expression
+  shapes, including cast interval values and colon parameters.
+- Broken `make test-rust-functions` target, which now runs the existing
+  function-focused library tests.
+
+## [0.3.5] - 2026-04-29
+
+### Fixed
+- PostgreSQL and SQLite transpilation regressions around TPCH-style stack-heavy
+  queries and dialect-specific expression rewrites.
+- Snowflake parser support for dollar-string literals in `PUT`/`FROM` command
+  forms and UUID-like paths in stage references.
+- Python compatibility tests for Snowflake connector command handling.
+
 ## [0.3.4] - 2026-04-27
 
 ### Added
@@ -173,6 +208,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.3.6]: https://github.com/tobilg/polyglot/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/tobilg/polyglot/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/tobilg/polyglot/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/tobilg/polyglot/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/tobilg/polyglot/compare/v0.3.1...v0.3.2

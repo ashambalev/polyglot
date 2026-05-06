@@ -42,6 +42,7 @@ impl DialectImpl for RedshiftDialect {
             supports_column_join_marks: true,
             locking_reads_supported: false,
             tz_to_with_time_zone: true,
+            single_string_interval: true,
             ..Default::default()
         }
     }

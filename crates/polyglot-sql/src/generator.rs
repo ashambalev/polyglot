@@ -14198,6 +14198,12 @@ impl Generator {
         // - MySQL: IN, FROM, LIKE (when FROM is present)
         use crate::dialects::DialectType;
         let is_snowflake = matches!(self.config.dialect, Some(DialectType::Snowflake));
+        let is_mysql = matches!(self.config.dialect, Some(DialectType::MySQL));
+        let mysql_tables_scope_as_from = is_mysql
+            && matches!(s.this.as_str(), "TABLES" | "FULL TABLES")
+            && s.scope_kind.as_deref() == Some("SCHEMA")
+            && s.scope.is_some()
+            && s.from.is_none();
 
         if !is_snowflake && s.from.is_some() {
             // MySQL ordering: IN, FROM, LIKE
@@ -14254,7 +14260,12 @@ impl Generator {
             }
 
             // IN scope_kind [scope]
-            if let Some(ref scope_kind) = s.scope_kind {
+            if mysql_tables_scope_as_from {
+                self.write_space();
+                self.write_keyword("FROM");
+                self.write_space();
+                self.generate_expression(s.scope.as_ref().unwrap())?;
+            } else if let Some(ref scope_kind) = s.scope_kind {
                 self.write_space();
                 self.write_keyword("IN");
                 self.write_space();
@@ -17187,6 +17198,62 @@ impl Generator {
             return Ok(());
         }
 
+        // ClickHouse uses dateTrunc casing.
+        if self.config.dialect == Some(DialectType::ClickHouse)
+            && func.name.eq_ignore_ascii_case("DATE_TRUNC")
+            && func.args.len() == 2
+        {
+            self.write("dateTrunc(");
+            self.generate_expression(&func.args[0])?;
+            self.write(", ");
+            self.generate_expression(&func.args[1])?;
+            self.write(")");
+            return Ok(());
+        }
+
+        // Presto-family dialects spell SUBSTRING as SUBSTR in SQLGlot outputs.
+        if matches!(
+            self.config.dialect,
+            Some(DialectType::Presto | DialectType::Trino | DialectType::Athena)
+        ) && func.name.eq_ignore_ascii_case("SUBSTRING")
+        {
+            self.write_keyword("SUBSTR");
+            self.write("(");
+            for (i, arg) in func.args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expression(arg)?;
+            }
+            self.write(")");
+            return Ok(());
+        }
+
+        if self.config.dialect == Some(DialectType::Snowflake)
+            && func.name.eq_ignore_ascii_case("LIST_DISTINCT")
+            && func.args.len() == 1
+        {
+            self.write_keyword("ARRAY_DISTINCT");
+            self.write("(");
+            self.write_keyword("ARRAY_COMPACT");
+            self.write("(");
+            self.generate_expression(&func.args[0])?;
+            self.write("))");
+            return Ok(());
+        }
+
+        if self.config.dialect == Some(DialectType::Snowflake)
+            && func.name.eq_ignore_ascii_case("LIST")
+            && func.args.len() == 1
+            && !matches!(func.args.first(), Some(Expression::Select(_)))
+        {
+            self.write_keyword("ARRAY_AGG");
+            self.write("(");
+            self.generate_expression(&func.args[0])?;
+            self.write(")");
+            return Ok(());
+        }
+
         // Redshift: CONCAT(a, b, ...) -> a || b || ...
         if self.config.dialect == Some(DialectType::Redshift)
             && func.name.eq_ignore_ascii_case("CONCAT")
@@ -17256,10 +17323,49 @@ impl Generator {
             return Ok(());
         }
 
-        // UUID_STRING(args) from Snowflake -> dialect-specific UUID function (dropping args)
+        // UUID_STRING(args) from Snowflake -> dialect-specific UUID function.
         if func.name.eq_ignore_ascii_case("UUID_STRING")
             && !matches!(self.config.dialect, Some(DialectType::Snowflake) | None)
         {
+            if matches!(
+                self.config.dialect,
+                Some(DialectType::Hive | DialectType::Spark | DialectType::Databricks)
+            ) {
+                self.write_keyword("CAST");
+                self.write("(");
+                self.write_keyword("UUID");
+                self.write("() ");
+                self.write_keyword("AS");
+                self.write(" ");
+                self.write_keyword("STRING");
+                self.write(")");
+                return Ok(());
+            }
+
+            if matches!(
+                self.config.dialect,
+                Some(DialectType::Presto | DialectType::Trino)
+            ) {
+                self.write_keyword("CAST");
+                self.write("(");
+                self.write_keyword("UUID");
+                self.write("() ");
+                self.write_keyword("AS");
+                self.write(" ");
+                self.write_keyword("VARCHAR");
+                self.write(")");
+                return Ok(());
+            }
+
+            if self.config.dialect == Some(DialectType::DuckDB) && func.args.len() == 2 {
+                self.write("(SELECT LOWER(SUBSTRING(h, 1, 8) || '-' || SUBSTRING(h, 9, 4) || '-' || '5' || SUBSTRING(h, 14, 3) || '-' || FORMAT('{:02x}', CAST('0x' || SUBSTRING(h, 17, 2) AS INT) & 63 | 128) || SUBSTRING(h, 19, 2) || '-' || SUBSTRING(h, 21, 12)) FROM (SELECT SUBSTRING(SHA1(UNHEX(REPLACE(");
+                self.generate_expression(&func.args[0])?;
+                self.write(", '-', '')) || ENCODE(");
+                self.generate_expression(&func.args[1])?;
+                self.write(")), 1, 32) AS h))");
+                return Ok(());
+            }
+
             let func_name = match self.config.dialect {
                 Some(DialectType::PostgreSQL) | Some(DialectType::Redshift) => "GEN_RANDOM_UUID",
                 Some(DialectType::BigQuery) => "GENERATE_UUID",
@@ -18570,9 +18676,17 @@ impl Generator {
     }
 
     fn generate_substring(&mut self, f: &SubstringFunc) -> Result<()> {
-        // Oracle uses SUBSTR; most others use SUBSTRING
-        let is_oracle = matches!(self.config.dialect, Some(DialectType::Oracle));
-        if is_oracle {
+        // Oracle and Presto-family dialects use SUBSTR; most others use SUBSTRING
+        let use_substr = matches!(
+            self.config.dialect,
+            Some(
+                DialectType::Oracle
+                    | DialectType::Presto
+                    | DialectType::Trino
+                    | DialectType::Athena
+            )
+        );
+        if use_substr {
             self.write_keyword("SUBSTR");
         } else {
             self.write_keyword("SUBSTRING");
@@ -19197,7 +19311,11 @@ impl Generator {
     }
 
     fn generate_date_trunc(&mut self, f: &DateTruncFunc) -> Result<()> {
-        self.write_keyword("DATE_TRUNC");
+        if self.config.dialect == Some(DialectType::ClickHouse) {
+            self.write("dateTrunc");
+        } else {
+            self.write_keyword("DATE_TRUNC");
+        }
         self.write("('");
         self.write_datetime_field(&f.unit);
         self.write("', ");
@@ -20862,6 +20980,34 @@ impl Generator {
     }
 
     fn generate_named_struct(&mut self, f: &NamedStructFunc) -> Result<()> {
+        if matches!(
+            self.config.dialect,
+            Some(DialectType::Spark | DialectType::Databricks)
+        ) {
+            self.write_keyword("STRUCT");
+            self.write("(");
+            for (i, (name, value)) in f.pairs.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expression(value)?;
+                self.write(" ");
+                self.write_keyword("AS");
+                self.write(" ");
+                if let Expression::Literal(lit) = name {
+                    if let Literal::String(field_name) = lit.as_ref() {
+                        self.generate_identifier(&Identifier::new(field_name))?;
+                    } else {
+                        self.generate_expression(name)?;
+                    }
+                } else {
+                    self.generate_expression(name)?;
+                }
+            }
+            self.write(")");
+            return Ok(());
+        }
+
         self.write_keyword("NAMED_STRUCT");
         self.write("(");
         for (i, (name, value)) in f.pairs.iter().enumerate() {
@@ -29884,6 +30030,10 @@ impl Generator {
             if let Some(kind) = &e.kind {
                 self.write_space();
                 self.write(kind);
+            }
+            if e.format_json {
+                self.write_space();
+                self.write_keyword("FORMAT JSON");
             }
             if let Some(path) = &e.path {
                 self.write_space();

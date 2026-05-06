@@ -13619,6 +13619,8 @@ pub struct JSONColumnDef {
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
+    pub format_json: bool,
+    #[serde(default)]
     pub path: Option<Box<Expression>>,
     #[serde(default)]
     pub nested_schema: Option<Box<Expression>>,

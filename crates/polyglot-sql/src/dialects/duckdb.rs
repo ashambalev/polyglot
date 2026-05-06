@@ -3466,10 +3466,27 @@ impl DuckDBDialect {
                     vec![arg, Expression::number(2)],
                 ))))
             }
-            "UUID_STRING" => Ok(Expression::Function(Box::new(Function::new(
-                "UUID".to_string(),
-                vec![],
-            )))),
+            "LIST"
+                if f.args.len() == 1 && !matches!(f.args.first(), Some(Expression::Select(_))) =>
+            {
+                Ok(Expression::Function(Box::new(Function::new(
+                    "ARRAY_AGG".to_string(),
+                    f.args,
+                ))))
+            }
+            "UUID_STRING" => {
+                if f.args.is_empty() {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "UUID".to_string(),
+                        vec![],
+                    ))))
+                } else {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "UUID_STRING".to_string(),
+                        f.args,
+                    ))))
+                }
+            }
             "ENDSWITH" => Ok(Expression::Function(Box::new(Function::new(
                 "ENDS_WITH".to_string(),
                 f.args,

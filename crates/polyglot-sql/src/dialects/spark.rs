@@ -661,6 +661,37 @@ impl SparkDialect {
                 })))
             }
 
+            // NAMED_STRUCT('a', 1) -> STRUCT(1 AS a) for SQLGlot Spark outputs
+            "NAMED_STRUCT" if f.args.len() % 2 == 0 => {
+                let original_args = f.args.clone();
+                let mut struct_args = Vec::new();
+                for pair in f.args.chunks(2) {
+                    if let Expression::Literal(lit) = &pair[0] {
+                        if let Literal::String(field_name) = lit.as_ref() {
+                            struct_args.push(Expression::Alias(Box::new(
+                                crate::expressions::Alias {
+                                    this: pair[1].clone(),
+                                    alias: crate::expressions::Identifier::new(field_name),
+                                    column_aliases: Vec::new(),
+                                    pre_alias_comments: Vec::new(),
+                                    trailing_comments: Vec::new(),
+                                    inferred_type: None,
+                                },
+                            )));
+                            continue;
+                        }
+                    }
+                    return Ok(Expression::Function(Box::new(Function::new(
+                        "NAMED_STRUCT".to_string(),
+                        original_args,
+                    ))));
+                }
+                Ok(Expression::Function(Box::new(Function::new(
+                    "STRUCT".to_string(),
+                    struct_args,
+                ))))
+            }
+
             // NAMED_STRUCT is native to Spark
             "NAMED_STRUCT" => Ok(Expression::Function(Box::new(f))),
 
@@ -795,11 +826,20 @@ impl SparkDialect {
                 ))))
             }
 
-            // UUID_STRING -> UUID()
-            "UUID_STRING" => Ok(Expression::Function(Box::new(Function::new(
-                "UUID".to_string(),
-                vec![],
-            )))),
+            // UUID_STRING() -> UUID(); keep namespace/name args for target-specific generation.
+            "UUID_STRING" => {
+                if f.args.is_empty() {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "UUID".to_string(),
+                        vec![],
+                    ))))
+                } else {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "UUID_STRING".to_string(),
+                        f.args,
+                    ))))
+                }
+            }
 
             // OBJECT_CONSTRUCT -> STRUCT in Spark
             "OBJECT_CONSTRUCT" if f.args.len() >= 2 && f.args.len() % 2 == 0 => {

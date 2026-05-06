@@ -1003,6 +1003,11 @@ impl Parser {
                 self.parse_rm_command()
             }
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("CALL") => self.parse_call(),
+            TokenType::Var if self.peek().text.eq_ignore_ascii_case("OPEN") => {
+                self.skip(); // consume OPEN
+                self.parse_command()?
+                    .ok_or_else(|| self.parse_error("Failed to parse OPEN statement"))
+            }
             TokenType::Var
                 if self.peek().text.eq_ignore_ascii_case("EXCHANGE")
                     && matches!(
@@ -3353,6 +3358,9 @@ impl Parser {
         // Parse the FROM clause (table references)
         let from = self.parse_from()?;
 
+        // DuckDB FROM-first syntax allows joins before the SELECT projection.
+        let joins = self.parse_joins()?;
+
         // Check if there's an explicit SELECT clause after FROM
         let expressions = if self.check(TokenType::Select) {
             self.skip(); // consume SELECT
@@ -3452,7 +3460,7 @@ impl Parser {
         let select = Select {
             expressions,
             from: Some(from),
-            joins: Vec::new(),
+            joins,
             lateral_views: Vec::new(),
             prewhere,
             where_clause,
@@ -3598,6 +3606,7 @@ impl Parser {
         let expr = if matches!(
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
+                | Some(crate::dialects::DialectType::DuckDB)
         ) && self.check(TokenType::LParen)
             && (self.check_next(TokenType::Select)
                 || self.check_next(TokenType::With)
@@ -5612,6 +5621,54 @@ impl Parser {
                     trailing_comments: Vec::new(),
                     inferred_type: None,
                 })),
+            };
+        }
+
+        // BigQuery places WITH OFFSET after the table alias:
+        // UNNEST(arr) AS elem WITH OFFSET AS off
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::BigQuery)
+        ) && self.match_text_seq(&["WITH", "OFFSET"])
+        {
+            let offset_alias = {
+                let has_as = self.match_token(TokenType::As);
+                if has_as || self.check(TokenType::Identifier) || self.check(TokenType::Var) {
+                    let alias_name = self.advance().text;
+                    Some(crate::expressions::Identifier {
+                        name: alias_name,
+                        quoted: false,
+                        trailing_comments: Vec::new(),
+                        span: None,
+                    })
+                } else {
+                    None
+                }
+            };
+
+            expr = match expr {
+                Expression::Alias(alias) => match alias.this {
+                    Expression::Unnest(mut u) => {
+                        u.alias = Some(alias.alias);
+                        u.with_ordinality = true;
+                        u.offset_alias = offset_alias;
+                        Expression::Unnest(u)
+                    }
+                    other => Expression::Alias(Box::new(Alias {
+                        this: other,
+                        alias: alias.alias,
+                        column_aliases: alias.column_aliases,
+                        pre_alias_comments: alias.pre_alias_comments,
+                        trailing_comments: alias.trailing_comments,
+                        inferred_type: alias.inferred_type,
+                    })),
+                },
+                Expression::Unnest(mut u) => {
+                    u.with_ordinality = true;
+                    u.offset_alias = offset_alias;
+                    Expression::Unnest(u)
+                }
+                other => other,
             };
         }
 
@@ -18851,7 +18908,24 @@ impl Parser {
             // Handle IF EXISTS before determining what to drop
             let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
 
-            if self.match_token(TokenType::Partition) {
+            if self.match_token(TokenType::PrimaryKey)
+                || (self.match_identifier("PRIMARY") && self.match_token(TokenType::Key))
+            {
+                self.match_token(TokenType::Key);
+                let trailing_if_exists =
+                    if_exists || self.match_keywords(&[TokenType::If, TokenType::Exists]);
+                let sql = if trailing_if_exists {
+                    "DROP PRIMARY KEY IF EXISTS".to_string()
+                } else {
+                    "DROP PRIMARY KEY".to_string()
+                };
+                Ok(AlterTableAction::Raw { sql })
+            } else if self.match_token(TokenType::Index) || self.match_token(TokenType::Key) {
+                let name = self.expect_identifier_with_quoted()?;
+                Ok(AlterTableAction::Raw {
+                    sql: format!("DROP INDEX {}", self.format_identifier_for_raw_sql(&name)),
+                })
+            } else if self.match_token(TokenType::Partition) {
                 // DROP [IF EXISTS] PARTITION expr [, PARTITION expr ...]
                 // ClickHouse supports: PARTITION 201901, PARTITION ALL,
                 // PARTITION tuple(...), PARTITION ID '...'
@@ -19193,13 +19267,27 @@ impl Parser {
                 });
             }
             // MODIFY COLUMN (MySQL/Snowflake syntax — routes through same action parser as ALTER COLUMN)
-            self.match_token(TokenType::Column); // optional COLUMN keyword
-            let name = Identifier::new(self.expect_identifier()?);
-            let action = self.parse_alter_column_action()?;
-            Ok(AlterTableAction::AlterColumn {
-                name,
-                action,
-                use_modify_keyword: true,
+            let mut tokens: Vec<(String, TokenType)> = vec![("MODIFY".to_string(), TokenType::Var)];
+            if !self.match_token(TokenType::Column) {
+                tokens.push(("COLUMN".to_string(), TokenType::Column));
+            } else {
+                tokens.push(("COLUMN".to_string(), TokenType::Column));
+            }
+            let mut paren_depth = 0i32;
+            while !self.is_at_end() && !self.check(TokenType::Semicolon) {
+                if self.check(TokenType::Comma) && paren_depth == 0 {
+                    break;
+                }
+                let token = self.advance();
+                if token.token_type == TokenType::LParen {
+                    paren_depth += 1;
+                } else if token.token_type == TokenType::RParen {
+                    paren_depth -= 1;
+                }
+                tokens.push((self.raw_sql_token_text(&token), token.token_type));
+            }
+            Ok(AlterTableAction::Raw {
+                sql: self.join_command_tokens(tokens),
             })
         } else if self.match_identifier("CHANGE") {
             // CHANGE [COLUMN] old_name new_name [data_type] [COMMENT 'comment'] - Hive/MySQL/SingleStore syntax
@@ -23045,6 +23133,30 @@ impl Parser {
             prev_token_type = Some(*token_type);
         }
         result
+    }
+
+    fn raw_sql_token_text(&self, token: &crate::tokens::Token) -> String {
+        match token.token_type {
+            TokenType::QuotedIdentifier => format!("`{}`", token.text),
+            TokenType::String => format!("'{}'", token.text),
+            _ => token.text.clone(),
+        }
+    }
+
+    fn format_identifier_for_raw_sql(&self, ident: &Identifier) -> String {
+        if ident.quoted || ident.name.chars().any(char::is_whitespace) {
+            format!("`{}`", ident.name)
+        } else {
+            ident.name.clone()
+        }
+    }
+
+    fn format_charset_for_raw_sql(&self, ident: &Identifier) -> String {
+        if ident.name.chars().any(char::is_whitespace) {
+            format!("`{}`", ident.name)
+        } else {
+            ident.name.clone()
+        }
     }
 
     /// Join Teradata table option tokens with Teradata-specific spacing
@@ -30144,7 +30256,50 @@ impl Parser {
         if self.check(TokenType::Var) && self.peek().text.eq_ignore_ascii_case("APPROXIMATE") {
             let saved_pos = self.current;
             self.skip(); // consume APPROXIMATE
-                         // Parse the COUNT(DISTINCT ...) that follows
+
+            if self.check(TokenType::Var)
+                && matches!(
+                    self.peek().text.to_ascii_uppercase().as_str(),
+                    "PERCENTILE_DISC" | "PERCENTILE_CONT"
+                )
+            {
+                let name = self.advance().text.to_ascii_uppercase();
+                self.expect(TokenType::LParen)?;
+                let args = if self.check(TokenType::RParen) {
+                    Vec::new()
+                } else {
+                    self.parse_expression_list()?
+                };
+                self.expect(TokenType::RParen)?;
+                let func = Expression::Function(Box::new(Function {
+                    name: format!("APPROXIMATE {}", name),
+                    args,
+                    distinct: false,
+                    trailing_comments: Vec::new(),
+                    use_bracket_syntax: false,
+                    no_parens: false,
+                    quoted: false,
+                    span: None,
+                    inferred_type: None,
+                }));
+
+                if self.match_token(TokenType::Within) {
+                    self.expect(TokenType::Group)?;
+                    self.expect(TokenType::LParen)?;
+                    self.expect(TokenType::Order)?;
+                    self.expect(TokenType::By)?;
+                    let order_by = self.parse_order_by_list()?;
+                    self.expect(TokenType::RParen)?;
+                    return Ok(Expression::WithinGroup(Box::new(WithinGroup {
+                        this: func,
+                        order_by,
+                    })));
+                }
+
+                return Ok(func);
+            }
+
+            // Parse the COUNT(DISTINCT ...) that follows
             let func = self.parse_primary()?;
             // Check if it's COUNT with DISTINCT
             if let Expression::Count(ref count_expr) = func {
@@ -33371,12 +33526,8 @@ impl Parser {
             (crate::function_registry::TypedParseKind::Variadic, "CHAR") => {
                 let args = self.parse_expression_list()?;
                 let charset = if self.match_token(TokenType::Using) {
-                    if !self.is_at_end() {
-                        let charset_token = self.advance();
-                        Some(charset_token.text.clone())
-                    } else {
-                        None
-                    }
+                    let charset = self.expect_identifier_or_keyword_with_quoted()?;
+                    Some(self.format_charset_for_raw_sql(&charset))
                 } else {
                     None
                 };
@@ -33406,12 +33557,8 @@ impl Parser {
             (crate::function_registry::TypedParseKind::Variadic, "CHR") => {
                 let args = self.parse_expression_list()?;
                 let charset = if self.match_token(TokenType::Using) {
-                    if !self.is_at_end() {
-                        let charset_token = self.advance();
-                        Some(charset_token.text.clone())
-                    } else {
-                        None
-                    }
+                    let charset = self.expect_identifier_or_keyword_with_quoted()?;
+                    Some(self.format_charset_for_raw_sql(&charset))
                 } else {
                     None
                 };
@@ -33747,11 +33894,13 @@ impl Parser {
 
                 let this = self.parse_expression()?;
                 if self.match_token(TokenType::Using) {
-                    let charset = self.expect_identifier()?;
+                    let charset = self.expect_identifier_or_keyword_with_quoted()?;
                     self.expect(TokenType::RParen)?;
                     Ok(Some(Expression::Cast(Box::new(Cast {
                         this,
-                        to: DataType::CharacterSet { name: charset },
+                        to: DataType::CharacterSet {
+                            name: self.format_charset_for_raw_sql(&charset),
+                        },
                         trailing_comments: Vec::new(),
                         double_colon_syntax: false,
                         format: None,
@@ -39328,6 +39477,7 @@ impl Parser {
                     || self.check_keyword())
                     && !self.check(TokenType::Generated)
                     && !self.check(TokenType::As)
+                    && !self.check(TokenType::From)
                     && !self.check(TokenType::Not)
                     && !self.check(TokenType::Null)
                     && !self.check(TokenType::Default)
@@ -40245,6 +40395,7 @@ impl Parser {
                     && !self.check(TokenType::RParen)
                     && !self.check(TokenType::Comma)
                     && !self.check(TokenType::As)
+                    && !self.check(TokenType::From)
                     && !self.check(TokenType::Not)
                     && !self.check(TokenType::Null)
                 {
@@ -45185,13 +45336,8 @@ impl Parser {
 
         // Check for USING charset
         let charset = if self.match_token(TokenType::Using) {
-            self.parse_var()?.map(|v| {
-                if let Expression::Identifier(id) = v {
-                    id.name
-                } else {
-                    String::new()
-                }
-            })
+            let charset = self.expect_identifier_or_keyword_with_quoted()?;
+            Some(self.format_charset_for_raw_sql(&charset))
         } else {
             None
         };
@@ -46317,11 +46463,12 @@ impl Parser {
 
         // Check for USING charset (CONVERT(x USING utf8))
         if self.match_token(TokenType::Using) {
-            let _ = self.parse_var(); // charset
-                                      // Return as Cast with charset
+            let charset = self.expect_identifier_or_keyword_with_quoted()?;
             return Ok(Some(Expression::Cast(Box::new(Cast {
                 this,
-                to: DataType::Char { length: None },
+                to: DataType::CharacterSet {
+                    name: self.format_charset_for_raw_sql(&charset),
+                },
                 trailing_comments: Vec::new(),
                 double_colon_syntax: false,
                 format: None,
@@ -49451,6 +49598,7 @@ impl Parser {
             return Ok(Some(Expression::JSONColumnDef(Box::new(JSONColumnDef {
                 this: None,
                 kind: None,
+                format_json: false,
                 path: None,
                 nested_schema: None,
                 ordinality: None,
@@ -49695,6 +49843,7 @@ impl Parser {
             return Ok(Some(Expression::JSONColumnDef(Box::new(JSONColumnDef {
                 this: None,
                 kind: None,
+                format_json: false,
                 path: path.map(Box::new),
                 nested_schema: nested_schema.map(Box::new),
                 ordinality: None,
@@ -49725,6 +49874,8 @@ impl Parser {
             None
         };
 
+        let format_json = self.match_text_seq(&["FORMAT", "JSON"]);
+
         // Parse PATH 'json_path'
         let path = if self.match_text_seq(&["PATH"]) {
             self.parse_string()?
@@ -49735,6 +49886,7 @@ impl Parser {
         Ok(Some(Expression::JSONColumnDef(Box::new(JSONColumnDef {
             this: name.map(Box::new),
             kind,
+            format_json,
             path: path.map(Box::new),
             nested_schema: None,
             ordinality,
@@ -60456,6 +60608,75 @@ OPTIONS (
         );
         let result = generated.unwrap();
         assert_eq!(result.trim(), sql, "Round-trip mismatch for: {}", sql);
+    }
+
+    fn assert_bigquery_roundtrip(sql: &str) {
+        let parsed = crate::parse(sql, crate::DialectType::BigQuery);
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse: {} - {:?}",
+            sql,
+            parsed.err()
+        );
+        let stmts = parsed.unwrap();
+        assert_eq!(stmts.len(), 1, "Expected 1 statement for: {}", sql);
+        let generated = crate::generate(&stmts[0], crate::DialectType::BigQuery);
+        assert!(
+            generated.is_ok(),
+            "Failed to generate: {} - {:?}",
+            sql,
+            generated.err()
+        );
+        let result = generated.unwrap();
+        assert_eq!(result.trim(), sql, "Round-trip mismatch for: {}", sql);
+    }
+
+    fn assert_bigquery_generates(sql: &str, expected: &str) {
+        let parsed = crate::parse(sql, crate::DialectType::BigQuery);
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse: {} - {:?}",
+            sql,
+            parsed.err()
+        );
+        let stmts = parsed.unwrap();
+        assert_eq!(stmts.len(), 1, "Expected 1 statement for: {}", sql);
+        let generated = crate::generate(&stmts[0], crate::DialectType::BigQuery);
+        assert!(
+            generated.is_ok(),
+            "Failed to generate: {} - {:?}",
+            sql,
+            generated.err()
+        );
+        let result = generated.unwrap();
+        assert_eq!(
+            result.trim(),
+            expected,
+            "Generated SQL mismatch for: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_bigquery_unnest_alias_before_with_offset_roundtrip() {
+        assert_bigquery_roundtrip(
+            "SELECT elem, off FROM UNNEST([1, 2, 3]) AS elem WITH OFFSET AS off",
+        );
+    }
+
+    #[test]
+    fn test_bigquery_unnest_alias_before_with_offset_no_as_normalizes() {
+        assert_bigquery_generates(
+            "SELECT elem, off FROM UNNEST([1, 2, 3]) AS elem WITH OFFSET off",
+            "SELECT elem, off FROM UNNEST([1, 2, 3]) AS elem WITH OFFSET AS off",
+        );
+    }
+
+    #[test]
+    fn test_bigquery_join_unnest_alias_before_with_offset_roundtrip() {
+        assert_bigquery_roundtrip(
+            "SELECT t.id, elem, off FROM t CROSS JOIN UNNEST(t.arr) AS elem WITH OFFSET AS off",
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ impl DialectImpl for MySQLDialect {
         config.escape_follow_chars = vec!['0', 'b', 'n', 'r', 't', 'Z', '%', '_'];
         // MySQL allows identifiers to start with digits (e.g., 1a, 1_a)
         config.identifiers_can_start_with_digit = true;
+        config.hex_number_strings = true;
         config
     }
 

@@ -17530,7 +17530,13 @@ impl Dialect {
                                 let mut args = f.args;
                                 let date = args.remove(0);
                                 let interval_expr = args.remove(0);
-                                let (val, unit) = Self::extract_interval_parts(&interval_expr);
+                                let (val, unit) = Self::extract_interval_parts(&interval_expr)
+                                    .unwrap_or_else(|| {
+                                        (
+                                            interval_expr.clone(),
+                                            crate::expressions::IntervalUnit::Day,
+                                        )
+                                    });
                                 let unit_str = Self::interval_unit_to_string(&unit);
                                 let is_literal = matches!(&val,
                                     Expression::Literal(lit) if matches!(lit.as_ref(), Literal::Number(_) | Literal::String(_))
@@ -20841,37 +20847,13 @@ impl Dialect {
                                     _ => Ok(Expression::Function(f)),
                                 }
                             }
-                            // CONCAT_WS('-', args...) -> CONCAT_WS('-', CAST(arg AS VARCHAR), ...) for Presto/Trino
-                            "CONCAT_WS" if f.args.len() >= 2 => match target {
-                                DialectType::Presto | DialectType::Trino | DialectType::Athena => {
-                                    let mut args = f.args;
-                                    let sep = args.remove(0);
-                                    let cast_args: Vec<Expression> = args
-                                        .into_iter()
-                                        .map(|a| {
-                                            Expression::Cast(Box::new(Cast {
-                                                this: a,
-                                                to: DataType::VarChar {
-                                                    length: None,
-                                                    parenthesized_length: false,
-                                                },
-                                                double_colon_syntax: false,
-                                                trailing_comments: Vec::new(),
-                                                format: None,
-                                                default: None,
-                                                inferred_type: None,
-                                            }))
-                                        })
-                                        .collect();
-                                    let mut new_args = vec![sep];
-                                    new_args.extend(cast_args);
-                                    Ok(Expression::Function(Box::new(Function::new(
-                                        "CONCAT_WS".to_string(),
-                                        new_args,
-                                    ))))
-                                }
-                                DialectType::DuckDB => {
-                                    let args = f.args;
+                            // CONCAT_WS from Generic is null-propagating in SQLGlot fixtures.
+                            // Trino also requires non-separator arguments cast to VARCHAR.
+                            "CONCAT_WS" if f.args.len() >= 2 => {
+                                fn concat_ws_null_case(
+                                    args: Vec<Expression>,
+                                    else_expr: Expression,
+                                ) -> Expression {
                                     let mut null_checks = args.iter().cloned().map(|arg| {
                                         Expression::IsNull(Box::new(crate::expressions::IsNull {
                                             this: arg,
@@ -20893,19 +20875,89 @@ impl Dialect {
                                                 inferred_type: None,
                                             }))
                                         });
-                                    Ok(Expression::Case(Box::new(Case {
+                                    Expression::Case(Box::new(Case {
                                         operand: None,
                                         whens: vec![(null_check, Expression::Null(Null))],
-                                        else_: Some(Expression::Function(Box::new(Function::new(
-                                            "CONCAT_WS".to_string(),
-                                            args,
-                                        )))),
+                                        else_: Some(else_expr),
                                         comments: vec![],
                                         inferred_type: None,
-                                    })))
+                                    }))
                                 }
-                                _ => Ok(Expression::Function(f)),
-                            },
+
+                                match target {
+                                    DialectType::Trino
+                                        if matches!(source, DialectType::Generic) =>
+                                    {
+                                        let original_args = f.args.clone();
+                                        let mut args = f.args;
+                                        let sep = args.remove(0);
+                                        let cast_args: Vec<Expression> = args
+                                            .into_iter()
+                                            .map(|a| {
+                                                Expression::Cast(Box::new(Cast {
+                                                    this: a,
+                                                    to: DataType::VarChar {
+                                                        length: None,
+                                                        parenthesized_length: false,
+                                                    },
+                                                    double_colon_syntax: false,
+                                                    trailing_comments: Vec::new(),
+                                                    format: None,
+                                                    default: None,
+                                                    inferred_type: None,
+                                                }))
+                                            })
+                                            .collect();
+                                        let mut new_args = vec![sep];
+                                        new_args.extend(cast_args);
+                                        let else_expr = Expression::Function(Box::new(
+                                            Function::new("CONCAT_WS".to_string(), new_args),
+                                        ));
+                                        Ok(concat_ws_null_case(original_args, else_expr))
+                                    }
+                                    DialectType::Presto
+                                    | DialectType::Trino
+                                    | DialectType::Athena => {
+                                        let mut args = f.args;
+                                        let sep = args.remove(0);
+                                        let cast_args: Vec<Expression> = args
+                                            .into_iter()
+                                            .map(|a| {
+                                                Expression::Cast(Box::new(Cast {
+                                                    this: a,
+                                                    to: DataType::VarChar {
+                                                        length: None,
+                                                        parenthesized_length: false,
+                                                    },
+                                                    double_colon_syntax: false,
+                                                    trailing_comments: Vec::new(),
+                                                    format: None,
+                                                    default: None,
+                                                    inferred_type: None,
+                                                }))
+                                            })
+                                            .collect();
+                                        let mut new_args = vec![sep];
+                                        new_args.extend(cast_args);
+                                        Ok(Expression::Function(Box::new(Function::new(
+                                            "CONCAT_WS".to_string(),
+                                            new_args,
+                                        ))))
+                                    }
+                                    DialectType::Spark
+                                    | DialectType::Hive
+                                    | DialectType::DuckDB
+                                        if matches!(source, DialectType::Generic) =>
+                                    {
+                                        let args = f.args;
+                                        let else_expr = Expression::Function(Box::new(
+                                            Function::new("CONCAT_WS".to_string(), args.clone()),
+                                        ));
+                                        Ok(concat_ws_null_case(args, else_expr))
+                                    }
+                                    _ => Ok(Expression::Function(f)),
+                                }
+                            }
                             // ARRAY_SLICE(x, start, end) -> SLICE(x, start, end) for Presto/Trino/Databricks, arraySlice for ClickHouse
                             "ARRAY_SLICE" if f.args.len() >= 2 => match target {
                                 DialectType::DuckDB
@@ -31957,66 +32009,93 @@ impl Dialect {
     /// Returns (value_expression, IntervalUnit)
     fn extract_interval_parts(
         interval_expr: &Expression,
-    ) -> (Expression, crate::expressions::IntervalUnit) {
-        use crate::expressions::{IntervalUnit, IntervalUnitSpec};
+    ) -> Option<(Expression, crate::expressions::IntervalUnit)> {
+        use crate::expressions::{DataType, IntervalUnit, IntervalUnitSpec, Literal};
 
-        if let Expression::Interval(iv) = interval_expr {
-            let val = iv.this.clone().unwrap_or(Expression::number(0));
-            let unit = match &iv.unit {
-                Some(IntervalUnitSpec::Simple { unit, .. }) => *unit,
-                None => {
-                    // Unit might be embedded in the string value (Snowflake format: '5 DAY')
-                    if let Expression::Literal(lit) = &val {
-                        if let crate::expressions::Literal::String(s) = lit.as_ref() {
-                            let parts: Vec<&str> = s.trim().splitn(2, ' ').collect();
-                            if parts.len() == 2 {
-                                let unit_str = parts[1].trim().to_ascii_uppercase();
-                                let parsed_unit = match unit_str.as_str() {
-                                    "YEAR" | "YEARS" => IntervalUnit::Year,
-                                    "QUARTER" | "QUARTERS" => IntervalUnit::Quarter,
-                                    "MONTH" | "MONTHS" => IntervalUnit::Month,
-                                    "WEEK" | "WEEKS" | "ISOWEEK" => IntervalUnit::Week,
-                                    "DAY" | "DAYS" => IntervalUnit::Day,
-                                    "HOUR" | "HOURS" => IntervalUnit::Hour,
-                                    "MINUTE" | "MINUTES" => IntervalUnit::Minute,
-                                    "SECOND" | "SECONDS" => IntervalUnit::Second,
-                                    "MILLISECOND" | "MILLISECONDS" => IntervalUnit::Millisecond,
-                                    "MICROSECOND" | "MICROSECONDS" => IntervalUnit::Microsecond,
-                                    _ => IntervalUnit::Day,
-                                };
-                                // Return just the numeric part as value and parsed unit
-                                return (
-                                    Expression::Literal(Box::new(
-                                        crate::expressions::Literal::String(
-                                            parts[0].trim().to_string(),
-                                        ),
-                                    )),
-                                    parsed_unit,
-                                );
-                            }
-                            IntervalUnit::Day
-                        } else {
-                            IntervalUnit::Day
+        fn unit_from_str(unit: &str) -> Option<IntervalUnit> {
+            match unit.trim().to_ascii_uppercase().as_str() {
+                "YEAR" | "YEARS" => Some(IntervalUnit::Year),
+                "QUARTER" | "QUARTERS" => Some(IntervalUnit::Quarter),
+                "MONTH" | "MONTHS" => Some(IntervalUnit::Month),
+                "WEEK" | "WEEKS" | "ISOWEEK" => Some(IntervalUnit::Week),
+                "DAY" | "DAYS" => Some(IntervalUnit::Day),
+                "HOUR" | "HOURS" => Some(IntervalUnit::Hour),
+                "MINUTE" | "MINUTES" => Some(IntervalUnit::Minute),
+                "SECOND" | "SECONDS" => Some(IntervalUnit::Second),
+                "MILLISECOND" | "MILLISECONDS" => Some(IntervalUnit::Millisecond),
+                "MICROSECOND" | "MICROSECONDS" => Some(IntervalUnit::Microsecond),
+                "NANOSECOND" | "NANOSECONDS" => Some(IntervalUnit::Nanosecond),
+                _ => None,
+            }
+        }
+
+        fn parts_from_literal_string(s: &str) -> Option<(Expression, IntervalUnit)> {
+            let mut parts = s.split_whitespace();
+            let value = parts.next()?;
+            let unit = unit_from_str(parts.next()?)?;
+            Some((
+                Expression::Literal(Box::new(Literal::String(value.to_string()))),
+                unit,
+            ))
+        }
+
+        fn unit_from_spec(unit: &IntervalUnitSpec) -> Option<IntervalUnit> {
+            match unit {
+                IntervalUnitSpec::Simple { unit, .. } => Some(*unit),
+                IntervalUnitSpec::Expr(expr) => match expr.as_ref() {
+                    Expression::Day(_) => Some(IntervalUnit::Day),
+                    Expression::Month(_) => Some(IntervalUnit::Month),
+                    Expression::Year(_) => Some(IntervalUnit::Year),
+                    Expression::Identifier(id) => unit_from_str(&id.name),
+                    Expression::Var(v) => unit_from_str(&v.this),
+                    Expression::Column(col) => unit_from_str(&col.name.name),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        match interval_expr {
+            Expression::Interval(iv) => {
+                let val = iv.this.clone().unwrap_or(Expression::number(0));
+                if let Expression::Literal(lit) = &val {
+                    if let Literal::String(s) = lit.as_ref() {
+                        if let Some(parts) = parts_from_literal_string(s) {
+                            return Some(parts);
                         }
-                    } else {
-                        IntervalUnit::Day
                     }
                 }
-                _ => IntervalUnit::Day,
-            };
-            (val, unit)
-        } else {
-            // Not an interval - pass through
-            (interval_expr.clone(), crate::expressions::IntervalUnit::Day)
+                let unit = iv
+                    .unit
+                    .as_ref()
+                    .and_then(unit_from_spec)
+                    .unwrap_or(IntervalUnit::Day);
+                Some((val, unit))
+            }
+            Expression::Cast(cast) if matches!(cast.to, DataType::Interval { .. }) => {
+                if let Expression::Literal(lit) = &cast.this {
+                    if let Literal::String(s) = lit.as_ref() {
+                        if let Some(parts) = parts_from_literal_string(s) {
+                            return Some(parts);
+                        }
+                    }
+                }
+                let unit = match &cast.to {
+                    DataType::Interval {
+                        unit: Some(unit), ..
+                    } => unit_from_str(unit).unwrap_or(IntervalUnit::Day),
+                    _ => IntervalUnit::Day,
+                };
+                Some((cast.this.clone(), unit))
+            }
+            _ => None,
         }
     }
 
     fn rewrite_tsql_interval_arithmetic(expr: &Expression) -> Option<Expression> {
         match expr {
             Expression::Add(op) => {
-                let Expression::Interval(_) = &op.right else {
-                    return None;
-                };
+                Self::extract_interval_parts(&op.right)?;
                 Some(Self::build_tsql_dateadd_from_interval(
                     op.left.clone(),
                     &op.right,
@@ -32024,9 +32103,7 @@ impl Dialect {
                 ))
             }
             Expression::Sub(op) => {
-                let Expression::Interval(_) = &op.right else {
-                    return None;
-                };
+                Self::extract_interval_parts(&op.right)?;
                 Some(Self::build_tsql_dateadd_from_interval(
                     op.left.clone(),
                     &op.right,
@@ -32042,7 +32119,8 @@ impl Dialect {
         interval: &Expression,
         subtract: bool,
     ) -> Expression {
-        let (value, unit) = Self::extract_interval_parts(interval);
+        let (value, unit) = Self::extract_interval_parts(interval)
+            .unwrap_or_else(|| (interval.clone(), crate::expressions::IntervalUnit::Day));
         let unit = Self::interval_unit_to_string(&unit);
         let amount = Self::tsql_dateadd_amount(value, subtract);
 
@@ -32053,7 +32131,7 @@ impl Dialect {
     }
 
     fn tsql_dateadd_amount(value: Expression, negate: bool) -> Expression {
-        use crate::expressions::UnaryOp;
+        use crate::expressions::{Parameter, ParameterStyle, UnaryOp};
 
         fn numeric_literal_value(value: &Expression) -> Option<&str> {
             match value {
@@ -32065,6 +32143,38 @@ impl Dialect {
                 _ => None,
             }
         }
+
+        fn colon_parameter(value: &Expression) -> Option<Expression> {
+            let Expression::Literal(lit) = value else {
+                return None;
+            };
+            let crate::expressions::Literal::String(s) = lit.as_ref() else {
+                return None;
+            };
+            let name = s.strip_prefix(':')?;
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return None;
+            }
+
+            Some(Expression::Parameter(Box::new(Parameter {
+                name: if name.chars().all(|ch| ch.is_ascii_digit()) {
+                    None
+                } else {
+                    Some(name.to_string())
+                },
+                index: name.parse::<u32>().ok(),
+                style: ParameterStyle::Colon,
+                quoted: false,
+                string_quoted: false,
+                expression: None,
+            })))
+        }
+
+        let value = colon_parameter(&value).unwrap_or(value);
 
         if let Some(n) = numeric_literal_value(&value) {
             if let Ok(parsed) = n.parse::<f64>() {
@@ -32527,7 +32637,10 @@ impl Dialect {
             "TIMESTAMP_ADD" | "DATETIME_ADD" | "TIME_ADD" if args.len() == 2 => {
                 let ts = args.remove(0);
                 let interval_expr = args.remove(0);
-                let (val, unit) = Self::extract_interval_parts(&interval_expr);
+                let (val, unit) =
+                    Self::extract_interval_parts(&interval_expr).unwrap_or_else(|| {
+                        (interval_expr.clone(), crate::expressions::IntervalUnit::Day)
+                    });
 
                 match target {
                     DialectType::Snowflake => {
@@ -32657,7 +32770,10 @@ impl Dialect {
             "TIMESTAMP_SUB" | "DATETIME_SUB" | "TIME_SUB" if args.len() == 2 => {
                 let ts = args.remove(0);
                 let interval_expr = args.remove(0);
-                let (val, unit) = Self::extract_interval_parts(&interval_expr);
+                let (val, unit) =
+                    Self::extract_interval_parts(&interval_expr).unwrap_or_else(|| {
+                        (interval_expr.clone(), crate::expressions::IntervalUnit::Day)
+                    });
 
                 match target {
                     DialectType::Snowflake => {
@@ -32789,7 +32905,10 @@ impl Dialect {
             "DATE_SUB" if args.len() == 2 => {
                 let date = args.remove(0);
                 let interval_expr = args.remove(0);
-                let (val, unit) = Self::extract_interval_parts(&interval_expr);
+                let (val, unit) =
+                    Self::extract_interval_parts(&interval_expr).unwrap_or_else(|| {
+                        (interval_expr.clone(), crate::expressions::IntervalUnit::Day)
+                    });
 
                 match target {
                     DialectType::Databricks | DialectType::Spark => {
@@ -33144,7 +33263,10 @@ impl Dialect {
             "DATE_ADD" if args.len() == 2 => {
                 let date = args.remove(0);
                 let interval_expr = args.remove(0);
-                let (val, unit) = Self::extract_interval_parts(&interval_expr);
+                let (val, unit) =
+                    Self::extract_interval_parts(&interval_expr).unwrap_or_else(|| {
+                        (interval_expr.clone(), crate::expressions::IntervalUnit::Day)
+                    });
                 let unit_str = Self::interval_unit_to_string(&unit);
 
                 match target {

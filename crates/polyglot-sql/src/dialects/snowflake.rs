@@ -2392,6 +2392,15 @@ impl SnowflakeDialect {
                 ))))
             }
 
+            "STRTOK_TO_ARRAY" if f.args.len() == 1 => {
+                let mut args = f.args;
+                args.push(Expression::string(" ".to_string()));
+                Ok(Expression::Function(Box::new(Function::new(
+                    "STRTOK_TO_ARRAY".to_string(),
+                    args,
+                ))))
+            }
+
             // WEEKOFYEAR -> WEEK
             "WEEKOFYEAR" => Ok(Expression::Function(Box::new(Function::new(
                 "WEEK".to_string(),

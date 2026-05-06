@@ -213,6 +213,37 @@ impl DatabricksDialect {
                 f.args,
             )))),
 
+            // NAMED_STRUCT('a', 1) -> STRUCT(1 AS a) for SQLGlot Databricks outputs
+            "NAMED_STRUCT" if f.args.len() % 2 == 0 => {
+                let original_args = f.args.clone();
+                let mut struct_args = Vec::new();
+                for pair in f.args.chunks(2) {
+                    if let Expression::Literal(lit) = &pair[0] {
+                        if let Literal::String(field_name) = lit.as_ref() {
+                            struct_args.push(Expression::Alias(Box::new(
+                                crate::expressions::Alias {
+                                    this: pair[1].clone(),
+                                    alias: crate::expressions::Identifier::new(field_name),
+                                    column_aliases: Vec::new(),
+                                    pre_alias_comments: Vec::new(),
+                                    trailing_comments: Vec::new(),
+                                    inferred_type: None,
+                                },
+                            )));
+                            continue;
+                        }
+                    }
+                    return Ok(Expression::Function(Box::new(Function::new(
+                        "NAMED_STRUCT".to_string(),
+                        original_args,
+                    ))));
+                }
+                Ok(Expression::Function(Box::new(Function::new(
+                    "STRUCT".to_string(),
+                    struct_args,
+                ))))
+            }
+
             // GETDATE -> CURRENT_TIMESTAMP
             "GETDATE" => Ok(Expression::CurrentTimestamp(
                 crate::expressions::CurrentTimestamp {

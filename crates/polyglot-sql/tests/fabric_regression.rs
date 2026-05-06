@@ -83,3 +83,46 @@ fn any_eq_subquery_not_rewritten() {
     let out = pg_to_fabric("SELECT * FROM t WHERE col = ANY(SELECT id FROM s)");
     assert_eq!(out, "SELECT * FROM t WHERE col = ANY (SELECT id FROM s)");
 }
+
+// ---------------------------------------------------------------------------
+// PostgreSQL interval arithmetic -> Fabric DATEADD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn date_minus_interval_with_precision_rewrites_to_dateadd() {
+    let out =
+        pg_to_fabric("SELECT l_shipdate <= DATE '1998-12-01' - INTERVAL '3' DAY (3) FROM lineitem");
+    assert_eq!(
+        out,
+        "SELECT l_shipdate <= DATEADD(DAY, -3, CAST('1998-12-01' AS DATE)) FROM lineitem"
+    );
+}
+
+#[test]
+fn date_minus_interval_placeholder_rewrites_to_unquoted_dateadd_amount() {
+    let out = pg_to_fabric(
+        "SELECT l_shipdate <= DATE '1998-12-01' - INTERVAL ':1' DAY (3) FROM lineitem",
+    );
+    assert_eq!(
+        out,
+        "SELECT l_shipdate <= DATEADD(DAY, -:1, CAST('1998-12-01' AS DATE)) FROM lineitem"
+    );
+}
+
+#[test]
+fn date_minus_cast_interval_rewrites_to_dateadd() {
+    let out = pg_to_fabric("SELECT shipdate - CAST('3 day' AS INTERVAL) FROM lineitem");
+    assert_eq!(out, "SELECT DATEADD(DAY, -3, shipdate) FROM lineitem");
+}
+
+#[test]
+fn date_plus_cast_interval_rewrites_to_dateadd() {
+    let out = pg_to_fabric("SELECT shipdate + CAST('3 day' AS INTERVAL) FROM lineitem");
+    assert_eq!(out, "SELECT DATEADD(DAY, 3, shipdate) FROM lineitem");
+}
+
+#[test]
+fn date_minus_double_colon_interval_rewrites_to_dateadd() {
+    let out = pg_to_fabric("SELECT shipdate - '3 day'::INTERVAL FROM lineitem");
+    assert_eq!(out, "SELECT DATEADD(DAY, -3, shipdate) FROM lineitem");
+}
