@@ -21,6 +21,8 @@ fn build_deep_subquery_chain(depth: usize) -> Expression {
             this: current,
             alias: Some(Identifier::new(format!("s{i}"))),
             column_aliases: Vec::new(),
+            alias_explicit_as: false,
+            alias_keyword: None,
             order_by: None,
             limit: None,
             offset: None,

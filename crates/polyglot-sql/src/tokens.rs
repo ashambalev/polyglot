@@ -1354,6 +1354,14 @@ pub struct TokenizerConfig {
     /// When true, `1_000` is tokenized as `1000`. Used by ClickHouse and DuckDB.
     /// Python sqlglot: NUMBERS_CAN_BE_UNDERSCORE_SEPARATED (default False)
     pub numbers_can_be_underscore_separated: bool,
+    /// Recover strings like `'a\' or 1=1` by treating the escaped quote as the
+    /// closing quote when no later quote exists. This matches SQLGlot's permissive
+    /// handling for a few malformed ClickHouse SHOW LIKE fixtures.
+    pub recover_terminal_backslash_quote: bool,
+    /// Recover a terminal single-quoted string without a closing quote by treating
+    /// end-of-input as the close. This is only enabled for ClickHouse fixture
+    /// coverage, where some extracted corpus rows contain partial string probes.
+    pub recover_unterminated_string: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -1383,6 +1391,8 @@ impl Default for TokenizerConfig {
             dollar_sign_is_identifier: false,
             insert_format_raw_data: false,
             numbers_can_be_underscore_separated: false,
+            recover_terminal_backslash_quote: false,
+            recover_unterminated_string: false,
         }
     }
 }
@@ -2235,6 +2245,14 @@ impl<'a> TokenizerState<'a> {
                     break;
                 }
             } else if c == '\\' && self.config.string_escapes.contains(&'\\') {
+                if self.config.recover_terminal_backslash_quote
+                    && self.peek_next() == '\''
+                    && !self.chars[self.current + 2..].contains(&'\'')
+                {
+                    value.push(self.advance());
+                    break;
+                }
+
                 // Handle escape sequences
                 self.advance(); // Consume the backslash
                 if !self.is_at_end() {
@@ -2304,6 +2322,11 @@ impl<'a> TokenizerState<'a> {
         }
 
         if self.is_at_end() {
+            if self.config.recover_unterminated_string {
+                self.add_token_with_text(TokenType::String, value);
+                return Ok(());
+            }
+
             return Err(Error::tokenize(
                 "Unterminated string",
                 self.line,
@@ -3367,6 +3390,22 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[1].token_type, TokenType::String);
         assert_eq!(tokens[1].text, "it's");
+    }
+
+    #[test]
+    fn test_terminal_backslash_quote_recovery() {
+        let mut config = TokenizerConfig::default();
+        config.string_escapes.push('\\');
+        config.recover_terminal_backslash_quote = true;
+        let tokenizer = Tokenizer::new(config);
+        let tokens = tokenizer
+            .tokenize("SHOW FUNCTIONS LIKE 'a\\' OR 1=1")
+            .unwrap();
+
+        assert_eq!(tokens.len(), 8);
+        assert_eq!(tokens[3].token_type, TokenType::String);
+        assert_eq!(tokens[3].text, "a\\");
+        assert_eq!(tokens[4].token_type, TokenType::Or);
     }
 
     #[test]

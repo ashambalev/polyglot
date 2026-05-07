@@ -196,6 +196,8 @@ fn wrap_table_in_subquery(table: TableRef, alias_name: &str) -> Expression {
         this: Expression::Select(Box::new(inner_select)),
         alias: Some(Identifier::new(alias_name)),
         column_aliases: Vec::new(),
+        alias_explicit_as: false,
+        alias_keyword: None,
         order_by: None,
         limit: None,
         offset: None,

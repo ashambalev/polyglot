@@ -4011,6 +4011,12 @@ pub struct Subquery {
     pub alias: Option<Identifier>,
     /// Optional column aliases: AS t(c1, c2)
     pub column_aliases: Vec<Identifier>,
+    /// Whether AS keyword was explicitly used for the alias.
+    #[serde(default)]
+    pub alias_explicit_as: bool,
+    /// Original alias keyword spelling, e.g. `AS` vs `as`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alias_keyword: Option<String>,
     /// ORDER BY clause (for parenthesized queries)
     pub order_by: Option<OrderBy>,
     /// LIMIT clause
@@ -4493,6 +4499,12 @@ pub struct Alias {
     /// Optional column aliases for table-valued functions: AS t(col1, col2) or AS (col1, col2)
     #[serde(default)]
     pub column_aliases: Vec<Identifier>,
+    /// Whether AS keyword was explicitly used for the alias.
+    #[serde(default)]
+    pub alias_explicit_as: bool,
+    /// Original alias keyword spelling, e.g. `AS` vs `as`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alias_keyword: Option<String>,
     /// Comments that appeared between the expression and AS keyword
     #[serde(default)]
     pub pre_alias_comments: Vec<String>,
@@ -4511,6 +4523,8 @@ impl Alias {
             this,
             alias,
             column_aliases: Vec::new(),
+            alias_explicit_as: false,
+            alias_keyword: None,
             pre_alias_comments: Vec::new(),
             trailing_comments: Vec::new(),
             inferred_type: None,
@@ -4523,6 +4537,8 @@ impl Alias {
             this,
             alias: Identifier::empty(),
             column_aliases,
+            alias_explicit_as: false,
+            alias_keyword: None,
             pre_alias_comments: Vec::new(),
             trailing_comments: Vec::new(),
             inferred_type: None,
@@ -8436,6 +8452,9 @@ pub struct CreateView {
     /// Redshift: AUTO REFRESH YES|NO for materialized views
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub auto_refresh: Option<bool>,
+    /// ClickHouse: POPULATE / EMPTY before AS in materialized views
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub clickhouse_population: Option<String>,
     /// ClickHouse: ON CLUSTER clause
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_cluster: Option<OnCluster>,
@@ -8478,6 +8497,7 @@ impl CreateView {
             unique_key: None,
             no_schema_binding: false,
             auto_refresh: None,
+            clickhouse_population: None,
             on_cluster: None,
             to_table: None,
             table_properties: Vec::new(),

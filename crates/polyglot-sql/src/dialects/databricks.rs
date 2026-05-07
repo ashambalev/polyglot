@@ -225,6 +225,8 @@ impl DatabricksDialect {
                                     this: pair[1].clone(),
                                     alias: crate::expressions::Identifier::new(field_name),
                                     column_aliases: Vec::new(),
+                                    alias_explicit_as: false,
+                                    alias_keyword: None,
                                     pre_alias_comments: Vec::new(),
                                     trailing_comments: Vec::new(),
                                     inferred_type: None,

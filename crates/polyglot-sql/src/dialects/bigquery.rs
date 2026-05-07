@@ -683,6 +683,8 @@ impl DialectImpl for BigQueryDialect {
                     this: unnest,
                     alias: Identifier::new("_col"),
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,

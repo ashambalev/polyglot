@@ -2203,6 +2203,8 @@ impl Generator {
                 this: expr.clone(),
                 alias: col.name.clone(),
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -2213,6 +2215,8 @@ impl Generator {
                 this: expr.clone(),
                 alias: ident.clone(),
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -4041,6 +4045,8 @@ impl Generator {
                     this: inner_expr,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -4435,98 +4441,132 @@ impl Generator {
                     self.write_space();
                 }
             }
-            self.write_keyword("GROUP BY");
-            // Handle ALL/DISTINCT modifier: Some(true) = ALL, Some(false) = DISTINCT
-            match group_by.all {
-                Some(true) => {
-                    self.write_space();
-                    self.write_keyword("ALL");
-                }
-                Some(false) => {
-                    self.write_space();
-                    self.write_keyword("DISTINCT");
-                }
-                None => {}
-            }
-            if !group_by.expressions.is_empty() {
-                // Check for trailing WITH CUBE or WITH ROLLUP (Hive/MySQL syntax)
-                // These are represented as Cube/Rollup expressions with empty expressions at the end
-                let mut trailing_cube = false;
-                let mut trailing_rollup = false;
-                let mut plain_expressions: Vec<&Expression> = Vec::new();
-                let mut grouping_sets_expressions: Vec<&Expression> = Vec::new();
-                let mut cube_expressions: Vec<&Expression> = Vec::new();
-                let mut rollup_expressions: Vec<&Expression> = Vec::new();
+            let clickhouse_bare_modifiers =
+                matches!(self.config.dialect, Some(DialectType::ClickHouse))
+                    && group_by.all.is_none()
+                    && (group_by.totals || !group_by.expressions.is_empty())
+                    && group_by.expressions.iter().all(|expr| match expr {
+                        Expression::Cube(c) => c.expressions.is_empty(),
+                        Expression::Rollup(r) => r.expressions.is_empty(),
+                        _ => false,
+                    });
 
-                for expr in &group_by.expressions {
-                    match expr {
-                        Expression::Cube(c) if c.expressions.is_empty() => {
-                            trailing_cube = true;
-                        }
-                        Expression::Rollup(r) if r.expressions.is_empty() => {
-                            trailing_rollup = true;
-                        }
-                        Expression::Function(f) if f.name == "CUBE" => {
-                            cube_expressions.push(expr);
-                        }
-                        Expression::Function(f) if f.name == "ROLLUP" => {
-                            rollup_expressions.push(expr);
-                        }
-                        Expression::Function(f) if f.name == "GROUPING SETS" => {
-                            grouping_sets_expressions.push(expr);
-                        }
-                        _ => {
-                            plain_expressions.push(expr);
-                        }
-                    }
-                }
+            if clickhouse_bare_modifiers {
+                let trailing_cube = group_by
+                    .expressions
+                    .iter()
+                    .any(|expr| matches!(expr, Expression::Cube(c) if c.expressions.is_empty()));
+                let trailing_rollup = group_by
+                    .expressions
+                    .iter()
+                    .any(|expr| matches!(expr, Expression::Rollup(r) if r.expressions.is_empty()));
 
-                // Reorder: plain expressions first, then GROUPING SETS, CUBE, ROLLUP
-                let mut regular_expressions: Vec<&Expression> = Vec::new();
-                regular_expressions.extend(plain_expressions);
-                regular_expressions.extend(grouping_sets_expressions);
-                regular_expressions.extend(cube_expressions);
-                regular_expressions.extend(rollup_expressions);
-
-                if self.config.pretty {
-                    self.write_newline();
-                    self.indent_level += 1;
-                    self.write_indent();
-                } else {
-                    self.write_space();
-                }
-
-                for (i, expr) in regular_expressions.iter().enumerate() {
-                    if i > 0 {
-                        if self.config.pretty {
-                            self.write(",");
-                            self.write_newline();
-                            self.write_indent();
-                        } else {
-                            self.write(", ");
-                        }
-                    }
-                    self.generate_expression(expr)?;
-                }
-
-                if self.config.pretty {
-                    self.indent_level -= 1;
-                }
-
-                // Output trailing WITH CUBE or WITH ROLLUP
                 if trailing_cube {
-                    self.write_space();
                     self.write_keyword("WITH CUBE");
                 } else if trailing_rollup {
-                    self.write_space();
                     self.write_keyword("WITH ROLLUP");
                 }
-            }
 
-            // ClickHouse: WITH TOTALS
-            if group_by.totals {
-                self.write_space();
-                self.write_keyword("WITH TOTALS");
+                if group_by.totals {
+                    if trailing_cube || trailing_rollup {
+                        self.write_space();
+                    }
+                    self.write_keyword("WITH TOTALS");
+                }
+            } else {
+                self.write_keyword("GROUP BY");
+                // Handle ALL/DISTINCT modifier: Some(true) = ALL, Some(false) = DISTINCT
+                match group_by.all {
+                    Some(true) => {
+                        self.write_space();
+                        self.write_keyword("ALL");
+                    }
+                    Some(false) => {
+                        self.write_space();
+                        self.write_keyword("DISTINCT");
+                    }
+                    None => {}
+                }
+                if !group_by.expressions.is_empty() {
+                    // Check for trailing WITH CUBE or WITH ROLLUP (Hive/MySQL syntax)
+                    // These are represented as Cube/Rollup expressions with empty expressions at the end
+                    let mut trailing_cube = false;
+                    let mut trailing_rollup = false;
+                    let mut plain_expressions: Vec<&Expression> = Vec::new();
+                    let mut grouping_sets_expressions: Vec<&Expression> = Vec::new();
+                    let mut cube_expressions: Vec<&Expression> = Vec::new();
+                    let mut rollup_expressions: Vec<&Expression> = Vec::new();
+
+                    for expr in &group_by.expressions {
+                        match expr {
+                            Expression::Cube(c) if c.expressions.is_empty() => {
+                                trailing_cube = true;
+                            }
+                            Expression::Rollup(r) if r.expressions.is_empty() => {
+                                trailing_rollup = true;
+                            }
+                            Expression::Function(f) if f.name == "CUBE" => {
+                                cube_expressions.push(expr);
+                            }
+                            Expression::Function(f) if f.name == "ROLLUP" => {
+                                rollup_expressions.push(expr);
+                            }
+                            Expression::Function(f) if f.name == "GROUPING SETS" => {
+                                grouping_sets_expressions.push(expr);
+                            }
+                            _ => {
+                                plain_expressions.push(expr);
+                            }
+                        }
+                    }
+
+                    // Reorder: plain expressions first, then GROUPING SETS, CUBE, ROLLUP
+                    let mut regular_expressions: Vec<&Expression> = Vec::new();
+                    regular_expressions.extend(plain_expressions);
+                    regular_expressions.extend(grouping_sets_expressions);
+                    regular_expressions.extend(cube_expressions);
+                    regular_expressions.extend(rollup_expressions);
+
+                    if self.config.pretty {
+                        self.write_newline();
+                        self.indent_level += 1;
+                        self.write_indent();
+                    } else {
+                        self.write_space();
+                    }
+
+                    for (i, expr) in regular_expressions.iter().enumerate() {
+                        if i > 0 {
+                            if self.config.pretty {
+                                self.write(",");
+                                self.write_newline();
+                                self.write_indent();
+                            } else {
+                                self.write(", ");
+                            }
+                        }
+                        self.generate_expression(expr)?;
+                    }
+
+                    if self.config.pretty {
+                        self.indent_level -= 1;
+                    }
+
+                    // Output trailing WITH CUBE or WITH ROLLUP
+                    if trailing_cube {
+                        self.write_space();
+                        self.write_keyword("WITH CUBE");
+                    } else if trailing_rollup {
+                        self.write_space();
+                        self.write_keyword("WITH ROLLUP");
+                    }
+                }
+
+                // ClickHouse: WITH TOTALS
+                if group_by.totals {
+                    self.write_space();
+                    self.write_keyword("WITH TOTALS");
+                }
             }
         }
 
@@ -5354,6 +5394,8 @@ impl Generator {
                     for part in hint.split_whitespace() {
                         if part.eq_ignore_ascii_case("GLOBAL") {
                             global = true;
+                        } else if part.eq_ignore_ascii_case("ALL") {
+                            strictness = Some("ALL");
                         } else if part.eq_ignore_ascii_case("ANY") {
                             strictness = Some("ANY");
                         } else if part.eq_ignore_ascii_case("ASOF") {
@@ -5776,9 +5818,10 @@ impl Generator {
 
         // ARRAY JOIN items need comma-separated output (Tuple holds multiple items)
         if matches!(join.kind, JoinKind::Array | JoinKind::LeftArray) {
-            self.write_space();
             match &join.this {
+                Expression::Tuple(t) if t.expressions.is_empty() => {}
                 Expression::Tuple(t) => {
+                    self.write_space();
                     for (i, item) in t.expressions.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
@@ -5787,6 +5830,7 @@ impl Generator {
                     }
                 }
                 other => {
+                    self.write_space();
                     self.generate_expression(other)?;
                 }
             }
@@ -6693,8 +6737,13 @@ impl Generator {
                 self.write_keyword("MINUS");
             }
             Some(DialectType::ClickHouse) => {
-                // ClickHouse: drop ALL from EXCEPT ALL
                 self.write_keyword("EXCEPT");
+                let preserve_all = self.config.source_dialect.is_none()
+                    || matches!(self.config.source_dialect, Some(DialectType::ClickHouse));
+                if except.all && preserve_all {
+                    self.write_space();
+                    self.write_keyword("ALL");
+                }
                 if except.distinct {
                     self.write_space();
                     self.write_keyword("DISTINCT");
@@ -6890,9 +6939,7 @@ impl Generator {
                     self.write_space();
                     self.write_keyword("FIELDS TERMINATED BY");
                     self.write_space();
-                    self.write("'");
-                    self.write(val);
-                    self.write("'");
+                    self.generate_string_literal(val)?;
                 }
                 if let Some(val) = &row_format.collection_items_terminated_by {
                     self.write_space();
@@ -7732,27 +7779,39 @@ impl Generator {
             return Ok(());
         }
 
-        // Handle [SHALLOW | DEEP] CLONE/COPY source_table [AT(...) | BEFORE(...)]
-        if let Some(ref clone_source) = ct.clone_source {
-            self.write_space();
-            if ct.is_copy && self.config.supports_table_copy {
-                // BigQuery uses COPY
-                self.write_keyword("COPY");
-            } else if ct.shallow_clone {
-                self.write_keyword("SHALLOW CLONE");
-            } else if ct.deep_clone {
-                self.write_keyword("DEEP CLONE");
-            } else {
-                self.write_keyword("CLONE");
-            }
-            self.write_space();
-            self.generate_table(clone_source)?;
-            // Generate AT/BEFORE time travel clause (stored as Raw expression)
-            if let Some(ref at_clause) = ct.clone_at_clause {
+        // ClickHouse uses CREATE TABLE target AS source [ENGINE ...] for table-structure copies.
+        if is_clickhouse {
+            if let Some(ref clone_source) = ct.clone_source {
                 self.write_space();
-                self.generate_expression(at_clause)?;
+                self.write_keyword("AS");
+                self.write_space();
+                self.generate_table(clone_source)?;
             }
-            return Ok(());
+        }
+
+        // Handle [SHALLOW | DEEP] CLONE/COPY source_table [AT(...) | BEFORE(...)]
+        if !is_clickhouse {
+            if let Some(ref clone_source) = ct.clone_source {
+                self.write_space();
+                if ct.is_copy && self.config.supports_table_copy {
+                    // BigQuery uses COPY
+                    self.write_keyword("COPY");
+                } else if ct.shallow_clone {
+                    self.write_keyword("SHALLOW CLONE");
+                } else if ct.deep_clone {
+                    self.write_keyword("DEEP CLONE");
+                } else {
+                    self.write_keyword("CLONE");
+                }
+                self.write_space();
+                self.generate_table(clone_source)?;
+                // Generate AT/BEFORE time travel clause (stored as Raw expression)
+                if let Some(ref at_clause) = ct.clone_at_clause {
+                    self.write_space();
+                    self.generate_expression(at_clause)?;
+                }
+                return Ok(());
+            }
         }
 
         // Handle PARTITION OF property
@@ -8274,11 +8333,15 @@ impl Generator {
             self.write_space();
             self.write_keyword("AS");
             self.write_space();
-            if ct.as_select_parenthesized {
+            let source_is_clickhouse =
+                matches!(self.config.source_dialect, Some(DialectType::ClickHouse));
+            let wrap_as_select =
+                ct.as_select_parenthesized && !(is_clickhouse && source_is_clickhouse);
+            if wrap_as_select {
                 self.write("(");
             }
             self.generate_expression(query)?;
-            if ct.as_select_parenthesized {
+            if wrap_as_select {
                 self.write(")");
             }
 
@@ -11308,6 +11371,12 @@ impl Generator {
         for prop in &cv.table_properties {
             self.write_space();
             self.generate_expression(prop)?;
+        }
+
+        // ClickHouse: POPULATE / EMPTY before AS
+        if let Some(ref population) = cv.clickhouse_population {
+            self.write_space();
+            self.write_keyword(population);
         }
 
         // Only output AS clause if there's a real query (not just NULL placeholder)
@@ -14408,6 +14477,7 @@ impl Generator {
                 // For other dialects, convert to decimal integer
                 match self.config.dialect {
                     Some(DialectType::BigQuery)
+                    | Some(DialectType::ClickHouse)
                     | Some(DialectType::TSQL)
                     | Some(DialectType::Fabric) => {
                         self.write("0x");
@@ -14546,7 +14616,10 @@ impl Generator {
                 // Extract content from tag\x00content format
                 let (_tag, content) = crate::tokens::parse_dollar_string_token(s);
                 // Step 1: Escape backslashes if the dialect uses backslash as a string escape
-                let escape_backslash = matches!(self.config.dialect, Some(DialectType::Snowflake));
+                let escape_backslash = matches!(
+                    self.config.dialect,
+                    Some(DialectType::ClickHouse) | Some(DialectType::Snowflake)
+                );
                 // Step 2: Determine quote escaping style
                 // Snowflake: ' -> \' (backslash escape)
                 // PostgreSQL, DuckDB, others: ' -> '' (doubled quote)
@@ -15290,6 +15363,15 @@ impl Generator {
         };
 
         if needs_quoting {
+            let quote_style = if matches!(self.config.dialect, Some(DialectType::ClickHouse))
+                && matches!(self.config.source_dialect, Some(DialectType::ClickHouse))
+                && quote_style.start == '"'
+                && output_name.contains('"')
+            {
+                &IdentifierQuoteStyle::BACKTICK
+            } else {
+                quote_style
+            };
             // Escape any quote characters within the identifier
             let escaped_name = if quote_style.start == quote_style.end {
                 output_name.replace(
@@ -15346,11 +15428,22 @@ impl Generator {
             && name.len() > 2
             && (name.starts_with("0x") || name.starts_with("0X"))
             && !name[2..].chars().all(|c| c.is_ascii_hexdigit());
+        let clickhouse_unsafe_identifier =
+            matches!(self.config.dialect, Some(DialectType::ClickHouse))
+                && matches!(self.config.source_dialect, Some(DialectType::ClickHouse))
+                && !name.starts_with('{')
+                && !name.contains('(')
+                && !name.contains(')')
+                && name != "?"
+                && name
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || c == '_'));
         let needs_quoting = id.quoted
             || self.is_reserved_keyword(name)
             || self.config.always_quote_identifiers
             || needs_digit_quoting
-            || mysql_invalid_hex_identifier;
+            || mysql_invalid_hex_identifier
+            || clickhouse_unsafe_identifier;
 
         // Check for MySQL index column prefix length: name(16) or name(16) ASC/DESC
         // When quoted, we need to output `name`(16) not `name(16)`
@@ -16536,7 +16629,15 @@ impl Generator {
 
         self.write_space();
         if !skip_as {
-            self.write_keyword("AS");
+            if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+                if let Some(ref alias_keyword) = alias.alias_keyword {
+                    self.write(alias_keyword);
+                } else {
+                    self.write_keyword("AS");
+                }
+            } else {
+                self.write_keyword("AS");
+            }
             self.write_space();
         }
 
@@ -16876,12 +16977,9 @@ impl Generator {
     }
 
     /// Check if the current dialect prefers :: cast syntax
-    /// Note: Python sqlglot normalizes all :: to CAST() for output, even for PostgreSQL
-    /// So we return false for all dialects to match Python sqlglot's behavior
+    /// Preserve ClickHouse's native `::` shorthand when the parser saw it.
     fn dialect_prefers_double_colon(&self) -> bool {
-        // Python sqlglot normalizes :: syntax to CAST() for all dialects
-        // Even PostgreSQL outputs CAST() not ::
-        false
+        matches!(self.config.dialect, Some(DialectType::ClickHouse))
     }
 
     /// Generate MOD function - uses % operator for Snowflake/MySQL/Presto/Trino, MOD() for others
@@ -17620,7 +17718,19 @@ impl Generator {
 
         // For qualified names (schema.function or object.method), preserve original case
         // because they can be case-sensitive (e.g., TSQL XML methods like .nodes(), .value())
-        if func.name.contains('.') && !has_ordinality {
+        let quote_source_clickhouse_function =
+            matches!(self.config.dialect, Some(DialectType::ClickHouse))
+                && matches!(self.config.source_dialect, Some(DialectType::ClickHouse))
+                && func.quoted;
+
+        if quote_source_clickhouse_function {
+            self.generate_identifier(&Identifier {
+                name: func.name.clone(),
+                quoted: true,
+                trailing_comments: Vec::new(),
+                span: None,
+            })?;
+        } else if func.name.contains('.') && !has_ordinality {
             // Don't normalize qualified functions - preserve original case
             // If the function was quoted (e.g., BigQuery `p.d.UdF`), wrap it in backticks
             if func.quoted {
@@ -17825,8 +17935,13 @@ impl Generator {
         }
 
         // IGNORE NULLS / RESPECT NULLS inside parens (for BigQuery style or when config says in_func)
+        let clickhouse_ignore_nulls_outside =
+            matches!(self.config.dialect, Some(DialectType::ClickHouse));
         if self.config.ignore_nulls_in_func
-            && !matches!(self.config.dialect, Some(DialectType::DuckDB))
+            && !matches!(
+                self.config.dialect,
+                Some(DialectType::DuckDB) | Some(DialectType::ClickHouse)
+            )
         {
             if let Some(ignore) = func.ignore_nulls {
                 self.write_space();
@@ -17873,7 +17988,7 @@ impl Generator {
         self.write(")");
 
         // IGNORE NULLS / RESPECT NULLS outside parens (standard style)
-        if !self.config.ignore_nulls_in_func
+        if (!self.config.ignore_nulls_in_func || clickhouse_ignore_nulls_outside)
             && !matches!(self.config.dialect, Some(DialectType::DuckDB))
         {
             if let Some(ignore) = func.ignore_nulls {
@@ -19453,6 +19568,7 @@ impl Generator {
 
         // Choose function name based on target dialect
         let func_name = match self.config.dialect {
+            Some(DialectType::ClickHouse) => f.original_name.as_deref().unwrap_or("IF"),
             Some(DialectType::Snowflake) => "IFF",
             Some(DialectType::SQLite) | Some(DialectType::TSQL) => "IIF",
             Some(DialectType::Drill) => "`IF`",
@@ -19547,8 +19663,9 @@ impl Generator {
                 self.generate_expression(expr)?;
             }
         }
-        // RESPECT NULLS / IGNORE NULLS
-        if let Some(ignore) = f.ignore_nulls {
+        let clickhouse_ignore_nulls_outside =
+            matches!(self.config.dialect, Some(DialectType::ClickHouse));
+        if let Some(ignore) = f.ignore_nulls.filter(|_| !clickhouse_ignore_nulls_outside) {
             self.write_space();
             if ignore {
                 self.write_keyword("IGNORE NULLS");
@@ -19557,6 +19674,14 @@ impl Generator {
             }
         }
         self.write(")");
+        if let Some(ignore) = f.ignore_nulls.filter(|_| clickhouse_ignore_nulls_outside) {
+            self.write_space();
+            if ignore {
+                self.write_keyword("IGNORE NULLS");
+            } else {
+                self.write_keyword("RESPECT NULLS");
+            }
+        }
         if let Some(ref filter) = f.filter {
             self.write_space();
             self.write_keyword("FILTER");
@@ -19590,8 +19715,11 @@ impl Generator {
             self.write_keyword("DISTINCT");
             self.write_space();
         }
-        // Skip generating the expression if it's a NULL placeholder for zero-arg aggregates like MODE()
-        if !matches!(f.this, Expression::Null(_)) {
+        // MODE() uses a NULL placeholder internally for its zero-arg ordered-set form.
+        // Other aggregates may legitimately receive NULL as an explicit argument.
+        let is_zero_arg_mode =
+            name.eq_ignore_ascii_case("MODE") && matches!(f.this, Expression::Null(_));
+        if !is_zero_arg_mode {
             self.generate_expression(&f.this)?;
         }
         // Generate IGNORE NULLS / RESPECT NULLS inside parens if config says so (BigQuery style)
@@ -20435,6 +20563,8 @@ impl Generator {
                             this: arg.clone(),
                             alias: crate::expressions::Identifier::new(field_names[i].clone()),
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -21454,6 +21584,29 @@ impl Generator {
             }
             self.write(" -> ");
         }
+        if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+            if let Expression::Lambda(inner) = &f.body {
+                self.generate_lambda_with_parenthesized_single_param(inner)?;
+                return Ok(());
+            }
+        }
+
+        self.generate_expression(&f.body)
+    }
+
+    fn generate_lambda_with_parenthesized_single_param(&mut self, f: &LambdaExpr) -> Result<()> {
+        if f.colon {
+            return self.generate_lambda(f);
+        }
+
+        self.write("(");
+        for (i, param) in f.parameters.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_identifier(param)?;
+        }
+        self.write(") -> ");
         self.generate_expression(&f.body)
     }
 
@@ -21938,7 +22091,25 @@ impl Generator {
             return self.generate_binary_op(op, keyword);
         };
 
-        self.generate_expression(terms[0])?;
+        let wrap_clickhouse_or_term = |generator: &mut Self, term: &Expression| -> Result<()> {
+            let should_wrap = matches!(connector, ConnectorOperator::Or)
+                && matches!(generator.config.dialect, Some(DialectType::ClickHouse))
+                && matches!(
+                    generator.config.source_dialect,
+                    Some(DialectType::ClickHouse)
+                )
+                && matches!(term, Expression::And(_));
+            if should_wrap {
+                generator.write("(");
+                generator.generate_expression(term)?;
+                generator.write(")");
+            } else {
+                generator.generate_expression(term)?;
+            }
+            Ok(())
+        };
+
+        wrap_clickhouse_or_term(self, terms[0])?;
         for term in terms.iter().skip(1) {
             if self.config.pretty && matches!(self.config.dialect, Some(DialectType::Snowflake)) {
                 self.write_newline();
@@ -21949,7 +22120,7 @@ impl Generator {
                 self.write_keyword(keyword);
             }
             self.write_space();
-            self.generate_expression(term)?;
+            wrap_clickhouse_or_term(self, term)?;
         }
 
         Ok(())
@@ -22244,9 +22415,13 @@ impl Generator {
                         self.generate_expression(expr)?;
                     }
                     self.write(")");
-                } else {
+                } else if in_expr.is_field {
                     self.write_space();
                     self.generate_expression(&in_expr.expressions[0])?;
+                } else {
+                    self.write(" (");
+                    self.generate_expression(&in_expr.expressions[0])?;
+                    self.write(")");
                 }
             } else {
                 let is_bare_ref = single_expr
@@ -22606,13 +22781,15 @@ impl Generator {
 
         if let Some(alias) = &subquery.alias {
             self.write_space();
-            // Oracle doesn't use AS for subquery aliases
-            let skip_as = matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::Oracle)
-            );
+            let skip_as = matches!(self.config.dialect, Some(DialectType::Oracle))
+                || (matches!(self.config.dialect, Some(DialectType::ClickHouse))
+                    && !subquery.alias_explicit_as);
             if !skip_as {
-                self.write_keyword("AS");
+                if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+                    self.write(subquery.alias_keyword.as_deref().unwrap_or("AS"));
+                } else {
+                    self.write_keyword("AS");
+                }
                 self.write_space();
             }
             self.generate_identifier(alias)?;
@@ -24313,7 +24490,18 @@ impl Generator {
                             self.write(name);
                         } else {
                             self.write(mapped);
-                            self.write(suffix);
+                            if matches!(base_upper.as_str(), "ENUM8" | "ENUM16")
+                                && !suffix.is_empty()
+                            {
+                                let escaped_suffix = suffix
+                                    .replace('\\', "\\\\")
+                                    .replace('\t', "\\t")
+                                    .replace('\n', "\\n")
+                                    .replace('\r', "\\r");
+                                self.write(&escaped_suffix);
+                            } else {
+                                self.write(suffix);
+                            }
                         }
                     }
                     Some(DialectType::MySQL)
@@ -31465,7 +31653,16 @@ impl Generator {
                 self.write_space();
                 self.write_keyword("SET");
                 self.write_space();
-                self.generate_expression(aggregates)?;
+                if let Expression::Tuple(t) = aggregates.as_ref() {
+                    for (i, agg) in t.expressions.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.generate_expression(agg)?;
+                    }
+                } else {
+                    self.generate_expression(aggregates)?;
+                }
             }
         }
         Ok(())
@@ -35752,7 +35949,7 @@ impl Generator {
                             subquery_no_alias,
                         )))?;
                         self.write_space();
-                        self.write_keyword("TABLESAMPLE");
+                        self.write_keyword(self.config.tablesample_keywords);
                         self.generate_sample_body(sample)?;
                         if let Some(ref seed) = sample.seed {
                             self.write_space();
@@ -35781,7 +35978,7 @@ impl Generator {
                     // Output the base expression without alias
                     self.generate_expression(&a.this)?;
                     self.write_space();
-                    self.write_keyword("TABLESAMPLE");
+                    self.write_keyword(self.config.tablesample_keywords);
                     self.generate_sample_body(sample)?;
                     if let Some(ref seed) = sample.seed {
                         self.write_space();
@@ -35811,7 +36008,7 @@ impl Generator {
             // Default: generate wrapped expression first, then TABLESAMPLE
             self.generate_expression(this)?;
             self.write_space();
-            self.write_keyword("TABLESAMPLE");
+            self.write_keyword(self.config.tablesample_keywords);
             self.generate_sample_body(sample)?;
             // Seed for table-level sample
             if let Some(ref seed) = sample.seed {
@@ -35836,7 +36033,7 @@ impl Generator {
         }
 
         // Legacy pattern: TABLESAMPLE [method] (expressions) or TABLESAMPLE method BUCKET numerator OUT OF denominator
-        self.write_keyword("TABLESAMPLE");
+        self.write_keyword(self.config.tablesample_keywords);
         if let Some(method) = &e.method {
             self.write_space();
             self.write_keyword(method);

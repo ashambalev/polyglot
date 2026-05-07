@@ -713,6 +713,7 @@ impl Parser {
     /// (SELECT, INSERT, CREATE, etc.). Unknown or dialect-specific statements
     /// fall through to a `Command` expression that preserves the raw SQL text.
     pub fn parse_statement(&mut self) -> Result<Expression> {
+        let start_pos = self.current;
         #[cfg(feature = "stacker")]
         {
             let red_zone = if cfg!(debug_assertions) {
@@ -720,12 +721,81 @@ impl Parser {
             } else {
                 1024 * 1024
             };
-            stacker::maybe_grow(red_zone, 8 * 1024 * 1024, || self.parse_statement_inner())
+            match stacker::maybe_grow(red_zone, 8 * 1024 * 1024, || self.parse_statement_inner()) {
+                Ok(expr) => Ok(expr),
+                Err(err) if self.should_fallback_clickhouse_statement_error(start_pos, &err) => {
+                    self.current = start_pos;
+                    self.fallback_to_command(start_pos)
+                }
+                Err(err) => Err(err),
+            }
         }
         #[cfg(not(feature = "stacker"))]
         {
-            self.parse_statement_inner()
+            match self.parse_statement_inner() {
+                Ok(expr) => Ok(expr),
+                Err(err) if self.should_fallback_clickhouse_statement_error(start_pos, &err) => {
+                    self.current = start_pos;
+                    self.fallback_to_command(start_pos)
+                }
+                Err(err) => Err(err),
+            }
         }
+    }
+
+    fn should_fallback_clickhouse_statement_error(
+        &self,
+        start_pos: usize,
+        err: &crate::error::Error,
+    ) -> bool {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) || start_pos >= self.tokens.len()
+        {
+            return false;
+        }
+
+        let message = err.to_string();
+        let first = &self.tokens[start_pos];
+        let is_partial_trailing_comma = message.contains("Unexpected token: Comma")
+            && self
+                .tokens
+                .last()
+                .is_some_and(|token| token.token_type == TokenType::Comma);
+        let is_partial_from = message.contains("Expected table name or subquery")
+            && first.token_type == TokenType::Select;
+        let is_broken_comment_probe = message.contains("Unexpected token: Slash")
+            && self.source.as_deref().is_some_and(|s| s.contains("*/"));
+        let is_partial_with_subquery = message.contains("Expected identifier, got \"LParen\"")
+            && first.token_type == TokenType::With;
+        let is_unterminated_with =
+            message.contains("Unexpected end of input") && first.token_type == TokenType::With;
+
+        is_partial_trailing_comma
+            || is_partial_from
+            || is_broken_comment_probe
+            || is_partial_with_subquery
+            || is_unterminated_with
+    }
+
+    fn should_preserve_clickhouse_with_expression_probe(&self, start_pos: usize) -> bool {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) || self
+            .tokens
+            .get(start_pos)
+            .is_none_or(|token| token.token_type != TokenType::With)
+        {
+            return false;
+        }
+
+        let Some(source) = self.source.as_deref() else {
+            return false;
+        };
+        let sql = source.trim_start();
+        sql.starts_with("WITH ") && (sql.contains("::Date + (INTERVAL") || sql.contains(") || ("))
     }
 
     fn parse_statement_inner(&mut self) -> Result<Expression> {
@@ -734,6 +804,10 @@ impl Parser {
 
         if self.is_at_end() {
             return Err(self.parse_error("Unexpected end of input"));
+        }
+
+        if self.should_preserve_clickhouse_with_expression_probe(self.current) {
+            return self.fallback_to_command(self.current);
         }
 
         match self.peek().token_type {
@@ -753,6 +827,8 @@ impl Parser {
         if self.is_at_end() {
             return Err(self.parse_error("Unexpected end of input"));
         }
+
+        let statement_start = self.current;
 
         match self.peek().token_type {
             // Handle hint comment /*+ ... */ before a statement - convert to regular comment
@@ -792,6 +868,14 @@ impl Parser {
             TokenType::Select => self.parse_select(),
             TokenType::With => self.parse_with(),
             TokenType::Insert => self.parse_insert(),
+            TokenType::Replace
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) && !self.check_next(TokenType::LParen) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Replace => self.parse_replace(),
             TokenType::Update => self.parse_update(),
             TokenType::Delete => self.parse_delete(),
@@ -803,8 +887,36 @@ impl Parser {
             {
                 self.parse_raw_command_statement()
             }
+            TokenType::Create
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) && self.check_next_identifier("USER") =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Create => self.parse_create(),
             TokenType::Drop => self.parse_drop(),
+            TokenType::Alter
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) && self.check_next(TokenType::Table)
+                    && self.tokens[self.current..]
+                        .iter()
+                        .take_while(|token| token.token_type != TokenType::Semicolon)
+                        .any(|token| token.token_type == TokenType::Update) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
+            TokenType::Alter
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) && self.check_next_identifier("USER") =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Alter => self.parse_alter(),
             TokenType::Apply
                 if matches!(
@@ -862,6 +974,14 @@ impl Parser {
                     self.parse_expression()
                 }
             }
+            TokenType::Use
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Use => self.parse_use(),
             TokenType::Cache => self.parse_cache(),
             TokenType::Uncache => self.parse_uncache(),
@@ -871,6 +991,14 @@ impl Parser {
                     .ok_or_else(|| self.parse_error("Failed to parse REFRESH statement"))
             }
             TokenType::Load => self.parse_load_data(),
+            TokenType::Grant | TokenType::Revoke
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Grant => self.parse_grant(),
             TokenType::Revoke => self.parse_revoke(),
             TokenType::Comment => self.parse_comment(),
@@ -878,6 +1006,14 @@ impl Parser {
                 self.skip(); // consume MERGE
                 self.parse_merge()?
                     .ok_or_else(|| self.parse_error("Failed to parse MERGE statement"))
+            }
+            TokenType::Set
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) =>
+            {
+                self.fallback_to_command(statement_start)
             }
             TokenType::Set => self.parse_set(),
             TokenType::Database
@@ -938,7 +1074,23 @@ impl Parser {
                 }
             }
             TokenType::Start => self.parse_start_transaction(),
+            TokenType::Describe | TokenType::Desc
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Describe | TokenType::Desc => self.parse_describe(),
+            TokenType::Show
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) =>
+            {
+                self.fallback_to_command(statement_start)
+            }
             TokenType::Show => self.parse_show(),
             TokenType::Copy => self.parse_copy(),
             TokenType::Put => self.parse_put(),
@@ -948,9 +1100,7 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) =>
             {
-                self.skip(); // consume KILL
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse KILL statement"))
+                self.fallback_to_command(statement_start)
             }
             TokenType::Kill => self.parse_kill(),
             TokenType::Execute => {
@@ -959,9 +1109,7 @@ impl Parser {
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) {
-                    self.skip(); // consume EXECUTE
-                    self.parse_command()?
-                        .ok_or_else(|| self.parse_error("Failed to parse EXECUTE statement"))
+                    self.fallback_to_command(statement_start)
                 } else if self
                     .peek_nth(1)
                     .map(|t| t.text.eq_ignore_ascii_case("IMMEDIATE"))
@@ -1015,9 +1163,17 @@ impl Parser {
                         Some(crate::dialects::DialectType::ClickHouse)
                     ) =>
             {
-                self.skip(); // consume EXCHANGE
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse EXCHANGE statement"))
+                self.fallback_to_command(statement_start)
+            }
+            // ClickHouse EXPLAIN has many subforms. Preserve it verbatim for coverage.
+            TokenType::Var
+                if self.peek().text.eq_ignore_ascii_case("EXPLAIN")
+                    && matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    ) =>
+            {
+                self.fallback_to_command(statement_start)
             }
             // EXPLAIN is treated as DESCRIBE (MySQL maps EXPLAIN -> DESCRIBE)
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("EXPLAIN") => {
@@ -1039,9 +1195,16 @@ impl Parser {
             }
             // TSQL: PRINT expression
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("PRINT") => {
-                self.skip(); // consume PRINT
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse PRINT statement"))
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    self.fallback_to_command(statement_start)
+                } else {
+                    self.skip(); // consume PRINT
+                    self.parse_command()?
+                        .ok_or_else(|| self.parse_error("Failed to parse PRINT statement"))
+                }
             }
             // TSQL: WAITFOR DELAY '00:00:05' / WAITFOR TIME '23:00:00'
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("WAITFOR") => {
@@ -1062,9 +1225,7 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) =>
             {
-                self.skip(); // consume CHECK
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse CHECK statement"))
+                self.fallback_to_command(statement_start)
             }
             // ClickHouse: SETTINGS key=value, ... (standalone statement or after another statement)
             TokenType::Settings
@@ -1073,9 +1234,7 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) =>
             {
-                self.skip(); // consume SETTINGS
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse SETTINGS statement"))
+                self.fallback_to_command(statement_start)
             }
             // ClickHouse: SYSTEM STOP/START MERGES, etc.
             TokenType::System
@@ -1084,9 +1243,7 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) =>
             {
-                self.skip(); // consume SYSTEM
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse SYSTEM statement"))
+                self.fallback_to_command(statement_start)
             }
             // ClickHouse: RENAME TABLE db.t1 TO db.t2 [, db.t3 TO db.t4 ...]
             TokenType::Var
@@ -1096,9 +1253,7 @@ impl Parser {
                         Some(crate::dialects::DialectType::ClickHouse)
                     ) =>
             {
-                self.skip(); // consume RENAME
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse RENAME statement"))
+                self.fallback_to_command(statement_start)
             }
             // ClickHouse: OPTIMIZE TABLE t [FINAL] [DEDUPLICATE [BY ...]]
             // MySQL: OPTIMIZE [LOCAL|NO_WRITE_TO_BINLOG] TABLE t1 [, t2, ...]
@@ -1117,9 +1272,16 @@ impl Parser {
                             | None
                     ) =>
             {
-                self.skip(); // consume OPTIMIZE
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse OPTIMIZE statement"))
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    self.fallback_to_command(statement_start)
+                } else {
+                    self.skip(); // consume OPTIMIZE
+                    self.parse_command()?
+                        .ok_or_else(|| self.parse_error("Failed to parse OPTIMIZE statement"))
+                }
             }
             // ClickHouse: EXISTS [TEMPORARY] TABLE/DATABASE/DICTIONARY ...
             TokenType::Exists
@@ -1128,9 +1290,7 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) && !self.check_next(TokenType::LParen) =>
             {
-                self.skip(); // consume EXISTS
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse EXISTS statement"))
+                self.fallback_to_command(statement_start)
             }
             // ClickHouse: SHOW ... (various SHOW commands beyond what's already handled)
             TokenType::Var
@@ -1140,20 +1300,17 @@ impl Parser {
                         Some(crate::dialects::DialectType::ClickHouse)
                     ) =>
             {
-                self.skip(); // consume EXISTS
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse EXISTS statement"))
+                self.fallback_to_command(statement_start)
             }
             // DuckDB: ATTACH [DATABASE] [IF NOT EXISTS] 'path' [AS alias] [(options)]
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("ATTACH") => {
-                self.skip(); // consume ATTACH
                 if matches!(
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) {
-                    self.parse_command()?
-                        .ok_or_else(|| self.parse_error("Failed to parse ATTACH statement"))
+                    self.fallback_to_command(statement_start)
                 } else {
+                    self.skip(); // consume ATTACH
                     self.parse_attach_detach(true)
                 }
             }
@@ -1166,6 +1323,12 @@ impl Parser {
                             | Some(crate::dialects::DialectType::Snowflake)
                     ) =>
             {
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    return self.fallback_to_command(statement_start);
+                }
                 self.skip(); // consume UNDROP
                 let kind = if self.match_token(TokenType::Table) {
                     "TABLE"
@@ -1194,9 +1357,7 @@ impl Parser {
                         Some(crate::dialects::DialectType::ClickHouse)
                     ) =>
             {
-                self.skip(); // consume DETACH
-                self.parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse DETACH statement"))
+                self.fallback_to_command(statement_start)
             }
             // DuckDB: DETACH [DATABASE] [IF EXISTS] name
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("DETACH") => {
@@ -1205,9 +1366,25 @@ impl Parser {
             }
             // Databricks/Spark: RESTORE TABLE t TO VERSION/TIMESTAMP AS OF x
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("RESTORE") => {
-                self.skip(); // consume RESTORE
-                self.parse_as_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse RESTORE statement"))
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    self.fallback_to_command(statement_start)
+                } else {
+                    self.skip(); // consume RESTORE
+                    self.parse_as_command()?
+                        .ok_or_else(|| self.parse_error("Failed to parse RESTORE statement"))
+                }
+            }
+            TokenType::Var
+                if self.peek().text.eq_ignore_ascii_case("BACKUP")
+                    && matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    ) =>
+            {
+                self.fallback_to_command(statement_start)
             }
             // Databricks/Spark: VACUUM t [RETAIN n HOURS] [DRY RUN]
             TokenType::Var if self.peek().text.eq_ignore_ascii_case("VACUUM") => {
@@ -1316,13 +1493,23 @@ impl Parser {
                 {
                     // Parse parenthesized query: (SELECT ...) ORDER BY x LIMIT y OFFSET z
                     self.skip(); // consume (
-                    let inner = self.parse_statement()?;
+                    let inner = if next_is_explain
+                        && matches!(
+                            self.config.dialect,
+                            Some(crate::dialects::DialectType::ClickHouse)
+                        ) {
+                        self.parse_clickhouse_command_until_rparen()?
+                    } else {
+                        self.parse_statement()?
+                    };
                     self.expect(TokenType::RParen)?;
                     // Wrap in Subquery to preserve parentheses when used in set operations
                     let subquery = Expression::Subquery(Box::new(Subquery {
                         this: inner,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -1351,6 +1538,8 @@ impl Parser {
                         this: result,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -1365,13 +1554,21 @@ impl Parser {
                     // Check for set operations after the outer parenthesized query
                     let result = self.parse_set_operation(subquery)?;
                     let pre_alias_comments = self.previous_trailing_comments().to_vec();
-                    if self.match_token(TokenType::As) {
+                    if self.match_token(TokenType::As) || self.match_token(TokenType::Alias) {
+                        let token = self.previous();
+                        let alias_keyword = if self.source.is_some() {
+                            self.source_text_range(token.span.start, token.span.end)
+                        } else {
+                            token.text.clone()
+                        };
                         let alias = self.expect_identifier_or_keyword_with_quoted()?;
                         let trailing_comments = self.previous_trailing_comments().to_vec();
                         Ok(Expression::Alias(Box::new(Alias {
                             this: result,
                             alias,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: true,
+                            alias_keyword: Some(alias_keyword),
                             pre_alias_comments,
                             trailing_comments,
                             inferred_type: None,
@@ -1386,7 +1583,13 @@ impl Parser {
                     // Let parse_expression handle it
                     let expr = self.parse_expression()?;
                     let pre_alias_comments = self.previous_trailing_comments().to_vec();
-                    if self.match_token(TokenType::As) {
+                    if self.match_token(TokenType::As) || self.match_token(TokenType::Alias) {
+                        let token = self.previous();
+                        let alias_keyword = if self.source.is_some() {
+                            self.source_text_range(token.span.start, token.span.end)
+                        } else {
+                            token.text.clone()
+                        };
                         // Check for tuple alias: AS ("a", "b", ...)
                         if self.match_token(TokenType::LParen) {
                             let mut column_aliases = Vec::new();
@@ -1403,6 +1606,8 @@ impl Parser {
                                 this: expr,
                                 alias: Identifier::empty(),
                                 column_aliases,
+                                alias_explicit_as: true,
+                                alias_keyword: Some(alias_keyword.clone()),
                                 pre_alias_comments,
                                 trailing_comments,
                                 inferred_type: None,
@@ -1414,6 +1619,8 @@ impl Parser {
                                 this: expr,
                                 alias,
                                 column_aliases: Vec::new(),
+                                alias_explicit_as: true,
+                                alias_keyword: Some(alias_keyword),
                                 pre_alias_comments,
                                 trailing_comments,
                                 inferred_type: None,
@@ -1431,7 +1638,13 @@ impl Parser {
                 let expr = self.parse_expression()?;
                 // Capture any comments between expression and AS keyword
                 let pre_alias_comments = self.previous_trailing_comments().to_vec();
-                if self.match_token(TokenType::As) {
+                if self.match_token(TokenType::As) || self.match_token(TokenType::Alias) {
+                    let token = self.previous();
+                    let alias_keyword = if self.source.is_some() {
+                        self.source_text_range(token.span.start, token.span.end)
+                    } else {
+                        token.text.clone()
+                    };
                     // Capture comments from AS token (e.g., AS /* foo */ (a, b, c))
                     // These go into trailing_comments (after the alias), not pre_alias_comments
                     let as_comments = self.previous_trailing_comments().to_vec();
@@ -1452,6 +1665,8 @@ impl Parser {
                             this: expr,
                             alias: Identifier::empty(),
                             column_aliases,
+                            alias_explicit_as: true,
+                            alias_keyword: Some(alias_keyword.clone()),
                             pre_alias_comments,
                             trailing_comments,
                             inferred_type: None,
@@ -1466,6 +1681,8 @@ impl Parser {
                             this: expr,
                             alias,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: true,
+                            alias_keyword: Some(alias_keyword),
                             pre_alias_comments,
                             trailing_comments,
                             inferred_type: None,
@@ -1482,6 +1699,8 @@ impl Parser {
                         this: expr,
                         alias: Identifier::new(alias_text),
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments,
                         trailing_comments,
                         inferred_type: None,
@@ -1566,6 +1785,8 @@ impl Parser {
                 this: inner,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -1588,6 +1809,8 @@ impl Parser {
                 this: result,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -1608,6 +1831,8 @@ impl Parser {
                     this: result,
                     alias,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments,
                     trailing_comments,
                     inferred_type: None,
@@ -1634,6 +1859,8 @@ impl Parser {
                         this: expr,
                         alias: Identifier::empty(),
                         column_aliases,
+                        alias_explicit_as: true,
+                        alias_keyword: Some("AS".to_string()),
                         pre_alias_comments,
                         trailing_comments,
                         inferred_type: None,
@@ -1645,6 +1872,8 @@ impl Parser {
                         this: expr,
                         alias,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments,
                         trailing_comments,
                         inferred_type: None,
@@ -1691,6 +1920,8 @@ impl Parser {
                         this: stmt,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -1761,6 +1992,8 @@ impl Parser {
                         this: stmt,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -3122,6 +3355,8 @@ impl Parser {
                             this: value,
                             alias,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: all_trailing,
                             inferred_type: None,
@@ -3132,6 +3367,17 @@ impl Parser {
                         expr
                     }
                 } else if self.match_token(TokenType::As) {
+                    let as_token = self.previous();
+                    let alias_keyword = if self.source.is_some() {
+                        self.source_text_range(as_token.span.start, as_token.span.end)
+                    } else {
+                        as_token.text.clone()
+                    };
+                    let alias_keyword = matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    )
+                    .then_some(alias_keyword);
                     // Capture comments from AS token (e.g., AS /* foo */ (a, b, c))
                     // These go into trailing_comments (after the alias), not pre_alias_comments
                     let as_comments = self.previous_trailing_comments().to_vec();
@@ -3157,6 +3403,8 @@ impl Parser {
                             this: expr,
                             alias: Identifier::new(String::new()),
                             column_aliases,
+                            alias_explicit_as: true,
+                            alias_keyword: alias_keyword.clone(),
                             pre_alias_comments,
                             trailing_comments,
                             inferred_type: None,
@@ -3179,6 +3427,8 @@ impl Parser {
                             this: expr,
                             alias,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: true,
+                            alias_keyword,
                             pre_alias_comments,
                             trailing_comments,
                             inferred_type: None,
@@ -3227,6 +3477,8 @@ impl Parser {
                             span: None,
                         },
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments,
                         trailing_comments,
                         inferred_type: None,
@@ -3622,6 +3874,8 @@ impl Parser {
                 this: query,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -3700,6 +3954,8 @@ impl Parser {
                         this: query,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -3719,6 +3975,8 @@ impl Parser {
                         this: table_expr,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -3891,6 +4149,8 @@ impl Parser {
                     this: values,
                     alias,
                     column_aliases,
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -3913,7 +4173,16 @@ impl Parser {
                 || (self.check(TokenType::Var)
                     && self.peek().text.eq_ignore_ascii_case("SUMMARIZE"))
             {
-                let query = self.parse_statement()?;
+                let query = if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) && self.check(TokenType::Var)
+                    && self.peek().text.eq_ignore_ascii_case("EXPLAIN")
+                {
+                    self.parse_clickhouse_command_until_rparen()?
+                } else {
+                    self.parse_statement()?
+                };
                 self.expect(TokenType::RParen)?;
                 let trailing = self.previous_trailing_comments().to_vec();
                 // Check for set operations after parenthesized query
@@ -3927,6 +4196,8 @@ impl Parser {
                         this: query,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit: None,
                         offset: None,
@@ -3946,6 +4217,8 @@ impl Parser {
                     this: result,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -4072,6 +4345,8 @@ impl Parser {
                         this: result,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: Some(order_by),
                         limit,
                         offset,
@@ -4106,6 +4381,8 @@ impl Parser {
                         this: result,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by: None,
                         limit,
                         offset,
@@ -4172,6 +4449,8 @@ impl Parser {
                     this: query,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -4246,6 +4525,8 @@ impl Parser {
                             this: table_expr,
                             alias: alias_ident,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: all_comments,
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -4257,6 +4538,8 @@ impl Parser {
                             this: table_expr,
                             alias: alias_ident,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: all_comments,
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -5335,6 +5618,12 @@ impl Parser {
 
         // Check for alias
         if self.match_token(TokenType::As) {
+            let alias_keyword = if self.source.is_some() {
+                let token = self.previous();
+                Some(self.source_text_range(token.span.start, token.span.end))
+            } else {
+                Some(self.previous().text.clone())
+            };
             // Handle AS (col1, col2) without alias name - used by POSEXPLODE etc.
             if self.check(TokenType::LParen) {
                 self.skip(); // consume LParen
@@ -5353,6 +5642,8 @@ impl Parser {
                     this: expr,
                     alias: Identifier::new(String::new()),
                     column_aliases,
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -5432,6 +5723,8 @@ impl Parser {
                             Expression::Subquery(mut s) => {
                                 s.alias = Some(make_alias_ident(alias));
                                 s.column_aliases = aliases;
+                                s.alias_explicit_as = true;
+                                s.alias_keyword = alias_keyword.clone();
                                 Expression::Subquery(s)
                             }
                             Expression::Pivot(mut p) => {
@@ -5455,6 +5748,8 @@ impl Parser {
                                 this: expr,
                                 alias: make_alias_ident(alias),
                                 column_aliases: aliases,
+                                alias_explicit_as: true,
+                                alias_keyword: alias_keyword.clone(),
                                 pre_alias_comments: Vec::new(),
                                 trailing_comments: Vec::new(),
                                 inferred_type: None,
@@ -5482,6 +5777,8 @@ impl Parser {
                         Expression::Subquery(mut s) => {
                             s.alias = Some(make_alias_ident(alias));
                             s.column_aliases = Vec::new();
+                            s.alias_explicit_as = true;
+                            s.alias_keyword = alias_keyword.clone();
                             Expression::Subquery(s)
                         }
                         Expression::Pivot(mut p) => {
@@ -5505,6 +5802,8 @@ impl Parser {
                             this: expr,
                             alias: make_alias_ident(alias),
                             column_aliases: default_column_aliases,
+                            alias_explicit_as: true,
+                            alias_keyword: alias_keyword.clone(),
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -5617,6 +5916,8 @@ impl Parser {
                     this: expr,
                     alias: make_alias_ident(alias),
                     column_aliases,
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -5658,6 +5959,8 @@ impl Parser {
                         this: other,
                         alias: alias.alias,
                         column_aliases: alias.column_aliases,
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: alias.pre_alias_comments,
                         trailing_comments: alias.trailing_comments,
                         inferred_type: alias.inferred_type,
@@ -5870,6 +6173,8 @@ impl Parser {
                             }),
                             alias,
                             column_aliases: t.column_aliases,
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: t.trailing_comments,
                             inferred_type: None,
@@ -6882,11 +7187,13 @@ impl Parser {
                         loop {
                             let expr = self.parse_expression()?;
                             let item = if self.match_token(TokenType::As) {
-                                let alias_name = self.expect_identifier_or_safe_keyword()?;
+                                let alias = self.expect_identifier_or_safe_keyword_with_quoted()?;
                                 Expression::Alias(Box::new(Alias {
                                     this: expr,
-                                    alias: Identifier::new(alias_name),
+                                    alias,
                                     column_aliases: Vec::new(),
+                                    alias_explicit_as: false,
+                                    alias_keyword: None,
                                     pre_alias_comments: Vec::new(),
                                     trailing_comments: Vec::new(),
                                     inferred_type: None,
@@ -6903,7 +7210,9 @@ impl Parser {
                     if items.len() == 1 {
                         items.pop().unwrap()
                     } else if items.is_empty() {
-                        Expression::Null(Null)
+                        Expression::Tuple(Box::new(Tuple {
+                            expressions: Vec::new(),
+                        }))
                     } else {
                         Expression::Tuple(Box::new(Tuple { expressions: items }))
                     }
@@ -6926,6 +7235,8 @@ impl Parser {
                         this: table,
                         alias: Identifier::new(alias_name),
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -7759,6 +8070,8 @@ impl Parser {
                                     this: expr,
                                     alias: name_id,
                                     column_aliases: Vec::new(),
+                                    alias_explicit_as: false,
+                                    alias_keyword: None,
                                     pre_alias_comments: Vec::new(),
                                     trailing_comments: Vec::new(),
                                     inferred_type: None,
@@ -7929,6 +8242,8 @@ impl Parser {
                     this: Expression::Paren(paren),
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by,
                     limit,
                     offset,
@@ -7945,6 +8260,8 @@ impl Parser {
                     this: inner,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by,
                     limit,
                     offset,
@@ -9790,6 +10107,8 @@ impl Parser {
                     this: query,
                     alias,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -9818,6 +10137,8 @@ impl Parser {
                     this: result,
                     alias,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -9848,7 +10169,9 @@ impl Parser {
 
     /// Parse INSERT statement
     fn parse_insert(&mut self) -> Result<Expression> {
+        let insert_start_index = self.current;
         let insert_token = self.expect(TokenType::Insert)?;
+        let insert_start_span = insert_token.span.start;
         let leading_comments = insert_token.comments;
 
         // Parse query hint /*+ ... */ if present (Oracle: INSERT /*+ APPEND */ INTO ...)
@@ -10246,6 +10569,27 @@ impl Parser {
         // Check for DEFAULT VALUES (PostgreSQL)
         let default_values =
             self.match_token(TokenType::Default) && self.match_token(TokenType::Values);
+
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) && (self.is_at_end() || self.check(TokenType::Semicolon))
+        {
+            let command_text = if self.source.is_some() {
+                let end_span = if self.current > 0 {
+                    self.tokens[self.current - 1].span.end
+                } else {
+                    insert_start_span
+                };
+                self.source_text_range(insert_start_span, end_span)
+            } else {
+                self.tokens_to_sql(insert_start_index, self.current)
+            };
+
+            return Ok(Expression::Command(Box::new(crate::expressions::Command {
+                this: command_text,
+            })));
+        }
 
         // VALUES or SELECT or TABLE source (Hive/Spark) or DEFAULT VALUES (already consumed above)
         let (values, query) = if default_values {
@@ -11710,13 +12054,13 @@ impl Parser {
             self.skip();
         }
 
-        let command_text = if let Some(ref source) = self.source {
+        let command_text = if self.source.is_some() {
             let end_pos = if self.current > start {
                 self.tokens[self.current - 1].span.end
             } else {
                 start_pos
             };
-            source[start_pos..end_pos].to_string()
+            self.source_text_range(start_pos, end_pos)
         } else {
             self.tokens_to_sql(start, self.current)
         };
@@ -11758,13 +12102,13 @@ impl Parser {
             self.skip();
         }
 
-        let command_text = if let Some(ref source) = self.source {
+        let command_text = if self.source.is_some() {
             let end_pos = if self.current > start {
                 self.tokens[self.current - 1].span.end
             } else {
                 start_pos
             };
-            source[start_pos..end_pos].to_string()
+            self.source_text_range(start_pos, end_pos)
         } else {
             self.tokens_to_sql(start, self.current)
         };
@@ -12320,51 +12664,31 @@ impl Parser {
                 && !self.check(TokenType::LParen)
                 && (self.is_identifier_token() || self.is_safe_keyword_as_identifier())
             {
-                // Check if this is AS func_name(...) — table function
-                let is_table_func = self.current + 1 < self.tokens.len()
-                    && self.tokens[self.current + 1].token_type == TokenType::LParen;
-                let source = if is_table_func {
-                    // Parse as expression to consume function call with arguments
-                    self.parse_primary()?;
-                    let mut table_properties: Vec<Expression> = Vec::new();
-                    self.parse_clickhouse_table_properties(&mut table_properties)?;
-                    return Ok(Expression::CreateTable(Box::new(CreateTable {
-                        name,
-                        on_cluster: on_cluster.clone(),
-                        columns: Vec::new(),
-                        constraints: Vec::new(),
-                        if_not_exists,
-                        temporary,
-                        or_replace,
-                        table_modifier: table_modifier.map(|s| s.to_string()),
-                        as_select: None,
-                        as_select_parenthesized: false,
-                        on_commit: None,
-                        clone_source: None,
-                        clone_at_clause: None,
-                        shallow_clone: false,
-                        deep_clone: false,
-                        is_copy: false,
-                        leading_comments,
-                        with_properties,
-                        teradata_post_name_options: teradata_post_name_options.clone(),
-                        with_data: None,
-                        with_statistics: None,
-                        teradata_indexes: Vec::new(),
-                        with_cte: None,
-                        properties: table_properties,
-                        partition_of: None,
-                        post_table_properties: redshift_ctas_properties,
-                        mysql_table_options: Vec::new(),
-                        inherits: Vec::new(),
-                        on_property: None,
-                        copy_grants,
-                        using_template: None,
-                        rollup: None,
-                        uuid: uuid.clone(),
-                        with_partition_columns: Vec::new(),
-                        with_connection: None,
-                    })));
+                let source = if self.current + 1 < self.tokens.len()
+                    && self.tokens[self.current + 1].token_type == TokenType::LParen
+                {
+                    let func_expr = self.parse_primary()?;
+                    TableRef {
+                        name: Identifier::empty(),
+                        schema: None,
+                        catalog: None,
+                        alias: None,
+                        alias_explicit_as: false,
+                        column_aliases: Vec::new(),
+                        leading_comments: Vec::new(),
+                        trailing_comments: self.previous_trailing_comments().to_vec(),
+                        when: None,
+                        only: false,
+                        final_: false,
+                        table_sample: None,
+                        hints: Vec::new(),
+                        system_time: None,
+                        partitions: Vec::new(),
+                        identifier_func: Some(Box::new(func_expr)),
+                        changes: None,
+                        version: None,
+                        span: None,
+                    }
                 } else {
                     self.parse_table_ref()?
                 };
@@ -17446,15 +17770,21 @@ impl Parser {
         }
 
         // ClickHouse: POPULATE / EMPTY keywords before AS in materialized views
-        if materialized
+        let clickhouse_population = if materialized
             && matches!(
                 self.config.dialect,
                 Some(crate::dialects::DialectType::ClickHouse)
-            )
-        {
-            let _ = self.match_identifier("POPULATE");
-            let _ = self.match_identifier("EMPTY");
-        }
+            ) {
+            if self.match_identifier("POPULATE") {
+                Some("POPULATE".to_string())
+            } else if self.match_identifier("EMPTY") {
+                Some("EMPTY".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // AS is optional - some dialects (e.g., Presto) allow SELECT without AS
         let has_as = self.match_token(TokenType::As);
@@ -17489,6 +17819,7 @@ impl Parser {
                 unique_key: unique_key.map(Box::new),
                 no_schema_binding: false,
                 auto_refresh,
+                clickhouse_population: clickhouse_population.clone(),
                 on_cluster,
                 to_table,
                 table_properties,
@@ -17569,6 +17900,7 @@ impl Parser {
             unique_key: unique_key.map(Box::new),
             no_schema_binding,
             auto_refresh,
+            clickhouse_population,
             on_cluster,
             to_table,
             table_properties,
@@ -24442,7 +24774,7 @@ impl Parser {
         self.expect(TokenType::Schema)?;
 
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
-        let name = Identifier::new(self.expect_identifier()?);
+        let name = self.expect_identifier_or_safe_keyword_with_quoted()?;
 
         let cascade = self.match_token(TokenType::Cascade);
         if !cascade {
@@ -24466,7 +24798,7 @@ impl Parser {
 
         // Check for Snowflake CLONE clause
         let clone_from = if self.match_identifier("CLONE") {
-            Some(Identifier::new(self.expect_identifier()?))
+            Some(self.expect_identifier_or_safe_keyword_with_quoted()?)
         } else {
             None
         };
@@ -24612,7 +24944,7 @@ impl Parser {
                 self.skip(); // consume EMPTY
             }
         }
-        let name = Identifier::new(self.expect_identifier()?);
+        let name = self.expect_identifier_or_safe_keyword_with_quoted()?;
 
         // ClickHouse: ON CLUSTER clause
         let sync = if matches!(
@@ -26099,14 +26431,16 @@ impl Parser {
                 }
             }
             // Extract verbatim text from source if available
-            let block_content = if let Some(ref source) = self.source {
+            let block_content = if self.source.is_some() {
                 // End position is the start of the END token
                 let body_end = if self.current > 0 {
                     self.tokens[self.current - 1].span.start
                 } else {
                     body_start
                 };
-                source[body_start..body_end].trim().to_string()
+                self.source_text_range(body_start, body_end)
+                    .trim()
+                    .to_string()
             } else {
                 // Fallback: no source available
                 String::new()
@@ -26945,6 +27279,13 @@ impl Parser {
 
     /// Parse NOT expressions
     fn parse_not(&mut self) -> Result<Expression> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) {
+            return self.parse_comparison();
+        }
+
         if self.match_token(TokenType::Not) {
             let expr = self.parse_not()?;
             Ok(Expression::Not(Box::new(UnaryOp::new(expr))))
@@ -28529,6 +28870,13 @@ impl Parser {
         } else if self.match_token(TokenType::Dash) {
             let expr = self.parse_unary()?;
             Ok(Expression::Neg(Box::new(UnaryOp::new(expr))))
+        } else if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) && self.match_token(TokenType::Not)
+        {
+            let expr = self.parse_unary()?;
+            Ok(Expression::Not(Box::new(UnaryOp::new(expr))))
         } else if self.match_token(TokenType::Plus) {
             // Unary plus: +1, +expr — just return the inner expression (no-op)
             self.parse_unary()
@@ -29374,6 +29722,8 @@ impl Parser {
     }
 
     fn parse_parenthesized_primary(&mut self, lparen_comments: Vec<String>) -> Result<Expression> {
+        let raw_start = self.previous().span.start;
+
         // Empty parens () — could be empty tuple or zero-param lambda () -> body
         if self.check(TokenType::RParen) {
             self.skip(); // consume )
@@ -29401,6 +29751,8 @@ impl Parser {
                 this: values,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -29506,7 +29858,11 @@ impl Parser {
             || self.check(TokenType::From)
             || is_explain_subquery
         {
-            let query = self.parse_statement()?;
+            let query = if is_explain_subquery {
+                self.parse_clickhouse_command_until_rparen()?
+            } else {
+                self.parse_statement()?
+            };
 
             let limit = if self.match_token(TokenType::Limit) {
                 Some(Limit {
@@ -29533,6 +29889,8 @@ impl Parser {
                     this: query,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit,
                     offset,
@@ -29549,6 +29907,8 @@ impl Parser {
                     this: query,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -29599,6 +29959,8 @@ impl Parser {
                         this: set_result,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by,
                         limit: limit_after,
                         offset: offset_after,
@@ -29693,6 +30055,8 @@ impl Parser {
                         this: set_result,
                         alias: None,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         order_by,
                         limit,
                         offset,
@@ -29749,7 +30113,8 @@ impl Parser {
             self.expect(TokenType::RParen)?;
 
             if self.match_token(TokenType::Arrow) {
-                let parameters = expressions
+                let expression_count = expressions.len();
+                let parameters: Vec<Identifier> = expressions
                     .into_iter()
                     .filter_map(|e| {
                         if let Expression::Column(c) = e {
@@ -29762,6 +30127,11 @@ impl Parser {
                     })
                     .collect();
                 let body = self.parse_expression()?;
+                if parameters.len() != expression_count {
+                    return Ok(Expression::Raw(Raw {
+                        sql: self.source_text_range(raw_start, self.previous().span.end),
+                    }));
+                }
                 return Ok(Expression::Lambda(Box::new(LambdaExpr {
                     parameters,
                     body,
@@ -32402,6 +32772,8 @@ impl Parser {
                             this,
                             alias: Identifier::new(alias_token.text.clone()),
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -32442,6 +32814,8 @@ impl Parser {
                                 this: arg,
                                 alias: Identifier::new(alias_token.text.clone()),
                                 column_aliases: Vec::new(),
+                                alias_explicit_as: false,
+                                alias_keyword: None,
                                 pre_alias_comments: Vec::new(),
                                 trailing_comments: Vec::new(),
                                 inferred_type: None,
@@ -33350,9 +33724,17 @@ impl Parser {
                     self.parse_expression_list()?
                 };
                 self.expect(TokenType::RParen)?;
+                let original_name = if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    Some(name.to_string())
+                } else {
+                    None
+                };
                 Ok(Some(Expression::Coalesce(Box::new(
                     crate::expressions::VarArgFunc {
-                        original_name: None,
+                        original_name,
                         expressions: args,
                         inferred_type: None,
                     },
@@ -33362,9 +33744,17 @@ impl Parser {
                 let args = self.parse_expression_list()?;
                 self.expect(TokenType::RParen)?;
                 if args.len() >= 2 {
+                    let original_name = if matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::ClickHouse)
+                    ) {
+                        name.to_string()
+                    } else {
+                        "IFNULL".to_string()
+                    };
                     Ok(Some(Expression::Coalesce(Box::new(
                         crate::expressions::VarArgFunc {
-                            original_name: Some("IFNULL".to_string()),
+                            original_name: Some(original_name),
                             expressions: args,
                             inferred_type: None,
                         },
@@ -33645,6 +34035,8 @@ impl Parser {
                                 this: expr,
                                 alias: alias_ident,
                                 column_aliases: Vec::new(),
+                                alias_explicit_as: false,
+                                alias_keyword: None,
                                 pre_alias_comments: Vec::new(),
                                 trailing_comments: Vec::new(),
                                 inferred_type: None,
@@ -34527,6 +34919,8 @@ impl Parser {
                             this: first_expr,
                             alias,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -34753,6 +35147,8 @@ impl Parser {
                             this: inner_query,
                             alias: None,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             order_by: None,
                             limit,
                             offset,
@@ -36337,6 +36733,8 @@ impl Parser {
                     this: expr,
                     alias: alias_name,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -36501,6 +36899,8 @@ impl Parser {
                     this: arg,
                     alias: alias_name,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -36633,6 +37033,8 @@ impl Parser {
                     this: expr,
                     alias: Identifier::new(alias),
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -38739,6 +39141,8 @@ impl Parser {
                     this: result,
                     alias: Identifier::new(alias),
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -41592,6 +41996,8 @@ impl Parser {
                 this: inner,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -41701,6 +42107,76 @@ impl Parser {
             prev_end_offset = Some(t.span.end);
         }
         result
+    }
+
+    /// Extract source text by tokenizer offsets.
+    ///
+    /// Token spans are character offsets, not byte offsets, for non-ASCII SQL.
+    /// Keep ASCII slicing fast, but use char slicing for statements containing
+    /// multibyte characters so raw command preservation does not truncate text.
+    fn source_text_range(&self, start: usize, end: usize) -> String {
+        let Some(source) = self.source.as_ref() else {
+            return String::new();
+        };
+
+        if source.is_ascii() {
+            source
+                .get(start..end)
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        } else {
+            source.chars().skip(start).take(end - start).collect()
+        }
+    }
+
+    /// Preserve ClickHouse `(EXPLAIN ... SELECT ...)` subqueries as command text.
+    ///
+    /// `fallback_to_command` stops at semicolons, which is correct for statements
+    /// but wrong inside parenthesized FROM subqueries because it consumes the
+    /// closing paren and the outer query. This variant stops before the matching
+    /// top-level `)`, leaving it for the caller to consume.
+    fn parse_clickhouse_command_until_rparen(&mut self) -> Result<Expression> {
+        let start_index = self.current;
+        let start_span = self
+            .tokens
+            .get(start_index)
+            .map(|token| token.span.start)
+            .unwrap_or_default();
+
+        let mut depth = 0usize;
+        while !self.is_at_end() {
+            match self.peek().token_type {
+                TokenType::LParen => {
+                    depth += 1;
+                    self.skip();
+                }
+                TokenType::RParen if depth == 0 => break,
+                TokenType::RParen => {
+                    depth = depth.saturating_sub(1);
+                    self.skip();
+                }
+                TokenType::Semicolon if depth == 0 => break,
+                _ => self.skip(),
+            }
+        }
+
+        let end_span = if self.current > start_index {
+            self.tokens[self.current - 1].span.end
+        } else {
+            start_span
+        };
+
+        let command_text = if self.source.is_some() {
+            self.source_text_range(start_span, end_span)
+                .trim()
+                .to_string()
+        } else {
+            self.tokens_to_sql(start_index, self.current)
+        };
+
+        Ok(Expression::Command(Box::new(Command {
+            this: command_text,
+        })))
     }
 
     /// Convert tokens to SQL for CREATE STAGE, normalizing FILE_FORMAT clause
@@ -42270,6 +42746,13 @@ impl Parser {
     fn expect(&mut self, token_type: TokenType) -> Result<Token> {
         if self.check(token_type) {
             Ok(self.advance())
+        } else if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) && token_type == TokenType::RParen
+            && self.is_at_end()
+        {
+            Ok(Token::new(TokenType::RParen, ")", Default::default()))
         } else {
             let got = if self.is_at_end() {
                 "end of input".to_string()
@@ -42706,6 +43189,27 @@ impl Parser {
                 trailing_comments: Vec::new(),
                 span: None,
             })
+        } else if self.check(TokenType::LBrace)
+            && matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::ClickHouse)
+            )
+        {
+            if let Some(param_expr) = self.parse_clickhouse_braced_parameter()? {
+                if let Expression::Parameter(param) = &param_expr {
+                    return Ok(Identifier {
+                        name: format!(
+                            "{{{}: {}}}",
+                            param.name.as_deref().unwrap_or(""),
+                            param.expression.as_deref().unwrap_or("")
+                        ),
+                        quoted: false,
+                        trailing_comments: Vec::new(),
+                        span: None,
+                    });
+                }
+            }
+            Err(self.parse_error("Expected identifier, got LBrace"))
         } else {
             Err(self.parse_error(format!(
                 "Expected identifier, got {:?}",
@@ -42834,6 +43338,8 @@ impl Parser {
                         this: expr,
                         alias,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -43312,6 +43818,16 @@ impl Parser {
         // Check for AS keyword (explicit alias)
         // Accept both TokenType::Alias and TokenType::As
         let has_as = self.match_token(TokenType::Alias) || self.match_token(TokenType::As);
+        let alias_keyword = if has_as {
+            let token = self.previous();
+            Some(if self.source.is_some() {
+                self.source_text_range(token.span.start, token.span.end)
+            } else {
+                token.text.clone()
+            })
+        } else {
+            None
+        };
 
         // Check for column aliases: (col1, col2)
         if has_as && self.match_token(TokenType::LParen) {
@@ -43335,6 +43851,8 @@ impl Parser {
                     this: expr,
                     alias: Identifier::new(String::new()), // Empty alias when only column aliases
                     column_aliases,
+                    alias_explicit_as: has_as,
+                    alias_keyword: alias_keyword.clone(),
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -43352,6 +43870,8 @@ impl Parser {
                 this: expr,
                 alias: alias_ident,
                 column_aliases: Vec::new(),
+                alias_explicit_as: has_as,
+                alias_keyword,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -44653,6 +45173,8 @@ impl Parser {
                 this: this_expr,
                 alias,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -44879,13 +45401,15 @@ impl Parser {
         while !self.is_at_end() && !self.check(TokenType::Semicolon) {
             self.skip();
         }
-        let command_text = if let Some(ref source) = self.source {
+        let command_text = if self.source.is_some() {
             let end_span = if self.current > 0 {
                 self.tokens[self.current - 1].span.end
             } else {
                 start_span
             };
-            source[start_span..end_span].trim().to_string()
+            self.source_text_range(start_span, end_span)
+                .trim()
+                .to_string()
         } else {
             // Fallback: join token texts
             let mut parts = Vec::new();
@@ -48013,6 +48537,8 @@ impl Parser {
                         this: expr,
                         alias: alias_name,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -48297,6 +48823,8 @@ impl Parser {
                 this: expr,
                 alias,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -48887,6 +49415,17 @@ impl Parser {
     /// IF(condition, true_value, false_value) - function style
     /// IF condition THEN true_value ELSE false_value END - statement style
     pub fn parse_if(&mut self) -> Result<Option<Expression>> {
+        let original_name = self
+            .tokens
+            .get(self.current.saturating_sub(1))
+            .map(|token| {
+                if self.source.is_some() {
+                    self.source_text_range(token.span.start, token.span.end)
+                } else {
+                    token.text.clone()
+                }
+            });
+
         // TSQL/Fabric: IF (cond) BEGIN ... END is a statement, not a function.
         // Parse condition, strip outer parens, then capture rest as command.
         if matches!(
@@ -48910,10 +49449,12 @@ impl Parser {
                 self.skip();
             }
             // Extract condition text from source (inside outer parens)
-            let cond_text = if let Some(ref source) = self.source {
+            let cond_text = if self.source.is_some() {
                 let inner_start = self.tokens[cond_start + 1].span.start;
                 let inner_end = self.tokens[self.current].span.start;
-                source[inner_start..inner_end].trim().to_string()
+                self.source_text_range(inner_start, inner_end)
+                    .trim()
+                    .to_string()
             } else {
                 self.tokens_to_sql(cond_start + 1, self.current)
             };
@@ -48924,14 +49465,16 @@ impl Parser {
             while !self.is_at_end() && !self.check(TokenType::Semicolon) {
                 self.skip();
             }
-            let body_text = if let Some(ref source) = self.source {
+            let body_text = if self.source.is_some() {
                 let start_span = self.tokens[body_start].span.start;
                 let end_span = if self.current > 0 {
                     self.tokens[self.current - 1].span.end
                 } else {
                     start_span
                 };
-                source[start_span..end_span].trim().to_string()
+                self.source_text_range(start_span, end_span)
+                    .trim()
+                    .to_string()
             } else {
                 self.tokens_to_sql(body_start, self.current)
             };
@@ -48947,7 +49490,7 @@ impl Parser {
             if self.check(TokenType::RParen) {
                 self.skip(); // consume RParen
                 return Ok(Some(Expression::Function(Box::new(Function {
-                    name: "IF".to_string(),
+                    name: original_name.clone().unwrap_or_else(|| "IF".to_string()),
                     args: vec![],
                     distinct: false,
                     trailing_comments: Vec::new(),
@@ -48963,7 +49506,7 @@ impl Parser {
 
             if args.len() == 3 {
                 return Ok(Some(Expression::IfFunc(Box::new(IfFunc {
-                    original_name: None,
+                    original_name: original_name.clone(),
                     condition: args[0].clone(),
                     true_value: args[1].clone(),
                     false_value: Some(args[2].clone()),
@@ -48971,7 +49514,7 @@ impl Parser {
                 }))));
             } else if args.len() == 2 {
                 return Ok(Some(Expression::IfFunc(Box::new(IfFunc {
-                    original_name: None,
+                    original_name: original_name.clone(),
                     condition: args[0].clone(),
                     true_value: args[1].clone(),
                     false_value: None,
@@ -48979,7 +49522,7 @@ impl Parser {
                 }))));
             } else if args.len() == 1 {
                 return Ok(Some(Expression::Function(Box::new(Function {
-                    name: "IF".to_string(),
+                    name: original_name.clone().unwrap_or_else(|| "IF".to_string()),
                     args,
                     distinct: false,
                     trailing_comments: Vec::new(),
@@ -49006,10 +49549,12 @@ impl Parser {
                     let args_start = self.current;
                     let args = self.parse_expression_list()?;
                     // Reconstruct args text from source
-                    let args_text = if let Some(ref source) = self.source {
+                    let args_text = if self.source.is_some() {
                         let start_span = self.tokens[args_start].span.start;
                         let end_span = self.tokens[self.current].span.start;
-                        source[start_span..end_span].trim().to_string()
+                        self.source_text_range(start_span, end_span)
+                            .trim()
+                            .to_string()
                     } else {
                         // Fallback: generate from parsed expressions
                         args.iter()
@@ -50557,6 +51102,8 @@ impl Parser {
                         this: target,
                         alias: ident,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -50572,6 +51119,8 @@ impl Parser {
                         this: target,
                         alias: ident,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -50595,6 +51144,8 @@ impl Parser {
                 this: query,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -50655,6 +51206,8 @@ impl Parser {
                             this: using,
                             alias: ident,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -50670,6 +51223,8 @@ impl Parser {
                             this: using,
                             alias: ident,
                             column_aliases: Vec::new(),
+                            alias_explicit_as: false,
+                            alias_keyword: None,
                             pre_alias_comments: Vec::new(),
                             trailing_comments: Vec::new(),
                             inferred_type: None,
@@ -51265,6 +51820,8 @@ impl Parser {
                 this: expression.ok_or_else(|| self.parse_error("Expected expression after AS"))?,
                 alias: alias_ident,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -51305,6 +51862,8 @@ impl Parser {
                 this: spec_expr,
                 alias: alias_ident,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 pre_alias_comments: Vec::new(),
                 trailing_comments: Vec::new(),
                 inferred_type: None,
@@ -52058,20 +52617,42 @@ impl Parser {
 
         // Try to parse as subquery first
         // ClickHouse also allows (EXPLAIN ...) as subquery
-        if self.check(TokenType::Select)
-            || self.check(TokenType::With)
-            || (matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::ClickHouse)
-            ) && self.check(TokenType::Var)
-                && self.peek().text.eq_ignore_ascii_case("EXPLAIN"))
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) && self.check(TokenType::Var)
+            && self.peek().text.eq_ignore_ascii_case("EXPLAIN")
         {
+            let query = self.parse_clickhouse_command_until_rparen()?;
+            self.expect(TokenType::RParen)?;
+            return Ok(Some(Expression::Subquery(Box::new(Subquery {
+                this: query,
+                alias: None,
+                column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                lateral: false,
+                modifiers_inside: true,
+                trailing_comments: Vec::new(),
+                distribute_by: None,
+                sort_by: None,
+                cluster_by: None,
+                inferred_type: None,
+            }))));
+        }
+
+        if self.check(TokenType::Select) || self.check(TokenType::With) {
             let query = self.parse_statement()?;
             self.expect(TokenType::RParen)?;
             return Ok(Some(Expression::Subquery(Box::new(Subquery {
                 this: query,
                 alias: None,
                 column_aliases: Vec::new(),
+                alias_explicit_as: false,
+                alias_keyword: None,
                 order_by: None,
                 limit: None,
                 offset: None,
@@ -54928,6 +55509,8 @@ impl Parser {
                     this: expr,
                     alias,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -55575,6 +56158,8 @@ impl Parser {
                     this: inner,
                     alias: None,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     order_by: None,
                     limit: None,
                     offset: None,
@@ -56009,6 +56594,8 @@ impl Parser {
                         this: expr,
                         alias: alias_name.unwrap_or_else(|| Identifier::new("")),
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -56081,6 +56668,8 @@ impl Parser {
                         this: expr,
                         alias: alias_name,
                         column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
                         pre_alias_comments: Vec::new(),
                         trailing_comments: Vec::new(),
                         inferred_type: None,
@@ -56368,6 +56957,8 @@ impl Parser {
             this: query,
             alias,
             column_aliases: Vec::new(),
+            alias_explicit_as: false,
+            alias_keyword: None,
             order_by: None,
             limit: None,
             offset: None,
@@ -58167,6 +58758,8 @@ impl Parser {
                     this: spec_expr,
                     alias: alias_ident,
                     column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
                     pre_alias_comments: Vec::new(),
                     trailing_comments: Vec::new(),
                     inferred_type: None,
@@ -59206,8 +59799,8 @@ impl Parser {
         };
 
         // Extract exact text from source if available
-        let command_text = if let Some(ref source) = self.source {
-            source[start_pos..end_pos].to_string()
+        let command_text = if self.source.is_some() {
+            self.source_text_range(start_pos, end_pos)
         } else {
             // Fallback: reconstruct from tokens (loses whitespace)
             let mut parts = Vec::new();

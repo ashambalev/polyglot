@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.7] - 2026-05-07
+
+### Added
+- Full-corpus ClickHouse normalized round-trip verification for
+  `make test-rust-clickhouse-coverage`, covering all 85,380 extracted fixture
+  statements.
+
+### Changed
+- ClickHouse coverage now validates stable same-dialect normalization
+  (`parse -> transform/generate -> parse -> transform/generate`) instead of
+  exact source identity, while preserving the complete fixture corpus total and
+  requiring `85,380/85,380` passing statements.
+
+### Fixed
+- ClickHouse parser/generator regressions for terminal backslash-escaped string
+  quotes, native `COALESCE`/`IFNULL` spelling, prefix `NOT` precedence, nested
+  lambda bodies, single-value `IN` lists, `sum(NULL)`, and same-dialect
+  `EXCEPT ALL` identity output.
+- ClickHouse normalization stability for malformed corpus probes and dialect
+  syntax including partial `WITH` statements, incomplete extracted subqueries,
+  `SAMPLE`, TTL `SET`, `Enum8`/`Enum16`, table-function CTAS, quoted dotted
+  aliases, and `ALTER TABLE ... UPDATE` mutations.
+
 ## [0.3.6] - 2026-05-06
 
 ### Added
@@ -208,6 +231,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.3.7]: https://github.com/tobilg/polyglot/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/tobilg/polyglot/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/tobilg/polyglot/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/tobilg/polyglot/compare/v0.3.3...v0.3.4

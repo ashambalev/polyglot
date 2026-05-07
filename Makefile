@@ -305,7 +305,7 @@ test-ffi:
 test-rust-clickhouse-parser:
 	cargo test --test custom_clickhouse_parser -p polyglot-sql --release -- --nocapture
 
-# Run ClickHouse coverage tests (report-only, failures expected)
+# Run ClickHouse coverage tests
 test-rust-clickhouse-coverage:
 	cargo test --test custom_clickhouse_coverage -p polyglot-sql --release -- --nocapture
 

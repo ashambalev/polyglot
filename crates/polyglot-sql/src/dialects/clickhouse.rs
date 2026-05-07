@@ -42,6 +42,10 @@ impl DialectImpl for ClickHouseDialect {
         config.hex_string_is_integer_type = true;
         // ClickHouse allows underscores as digit separators in numeric literals
         config.numbers_can_be_underscore_separated = true;
+        // SQLGlot tokenizes malformed SHOW LIKE probes such as `'a\' or 1=1`.
+        config.recover_terminal_backslash_quote = true;
+        // The ClickHouse corpus includes partial string probes extracted from shell tests.
+        config.recover_unterminated_string = true;
         config
     }
 
@@ -249,6 +253,12 @@ impl DialectImpl for ClickHouseDialect {
             // IF(cond, true, false) -> CASE WHEN cond THEN true ELSE false END
             Expression::IfFunc(f) => {
                 let f = *f;
+                let has_aliased_arg = matches!(f.condition, Expression::Alias(_))
+                    || matches!(f.true_value, Expression::Alias(_))
+                    || matches!(f.false_value.as_ref(), Some(Expression::Alias(_)));
+                if has_aliased_arg {
+                    return Ok(Expression::IfFunc(Box::new(f)));
+                }
                 Ok(Expression::Case(Box::new(Case {
                     operand: None,
                     whens: vec![(f.condition, f.true_value)],

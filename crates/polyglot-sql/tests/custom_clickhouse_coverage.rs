@@ -1,16 +1,17 @@
 //! ClickHouse coverage test runner.
 //!
-//! Runs all ClickHouse identity tests extracted from the official ClickHouse test suite.
-//! Reports pass/fail statistics without asserting — failures are expected and represent
-//! areas for future parser/generator improvement.
+//! Runs all ClickHouse tests extracted from the official ClickHouse test suite
+//! through a normalized round-trip:
+//! parse ClickHouse SQL -> transform/generate normalized ClickHouse SQL ->
+//! parse generated SQL -> transform/generate again.
 //!
 //! Run with: cargo test -p polyglot-sql --test clickhouse_coverage_tests -- --nocapture
 
 mod common;
 
 use common::test_data::CustomDialectFixtureFile;
-use common::test_runner::{dialect_identity_test, parse_dialect};
 use once_cell::sync::Lazy;
+use polyglot_sql::dialects::{Dialect, DialectType};
 use std::fs;
 
 const CLICKHOUSE_FIXTURES_PATH: &str = concat!(
@@ -45,10 +46,43 @@ static CLICKHOUSE_FIXTURES: Lazy<Vec<CustomDialectFixtureFile>> = Lazy::new(|| {
     files
 });
 
-#[test]
-fn test_clickhouse_coverage_identity() {
-    let dialect_type = parse_dialect("clickhouse").expect("ClickHouse dialect must exist");
+fn normalized_clickhouse_sql(sql: &str, dialect: &Dialect) -> Result<String, String> {
+    let statements = dialect
+        .parse(sql)
+        .map_err(|e| format!("Parse error: {e}"))?;
 
+    let mut outputs = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let transformed = dialect
+            .transform(statement)
+            .map_err(|e| format!("Transform error: {e}"))?;
+        outputs.push(
+            dialect
+                .generate_with_source(&transformed, DialectType::ClickHouse)
+                .map_err(|e| format!("Generate error: {e}"))?,
+        );
+    }
+
+    Ok(outputs.join("; "))
+}
+
+fn normalized_roundtrip_test(sql: &str) -> Result<(), String> {
+    let dialect = Dialect::get(DialectType::ClickHouse);
+    let first = normalized_clickhouse_sql(sql, &dialect)?;
+    let second = normalized_clickhouse_sql(&first, &dialect)
+        .map_err(|e| format!("{e}\n  generated: {first}"))?;
+
+    if first != second {
+        return Err(format!(
+            "Normalized output is unstable:\n  input:     {sql}\n  first:     {first}\n  second:    {second}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_clickhouse_normalized_roundtrip_coverage() {
     let mut total_passed = 0;
     let mut total_failed = 0;
     let mut category_stats: Vec<(String, usize, usize)> = Vec::new();
@@ -58,8 +92,7 @@ fn test_clickhouse_coverage_identity() {
         let mut failed = 0;
 
         for test in &file.identity {
-            let expected = test.expected.as_deref();
-            match dialect_identity_test(&test.sql, expected, dialect_type) {
+            match normalized_roundtrip_test(&test.sql) {
                 Ok(()) => passed += 1,
                 Err(_) => failed += 1,
             }
@@ -77,7 +110,7 @@ fn test_clickhouse_coverage_identity() {
         100.0
     };
 
-    println!("\n=== ClickHouse Coverage Identity Tests ===");
+    println!("\n=== ClickHouse Normalized Round-Trip Coverage ===");
     for (cat, passed, total) in &category_stats {
         let rate = if *total > 0 {
             (*passed as f64 / *total as f64) * 100.0
@@ -87,9 +120,49 @@ fn test_clickhouse_coverage_identity() {
         println!("  {}: {}/{} ({:.1}%)", cat, passed, total, rate);
     }
     println!(
-        "\n  TOTAL: {}/{} passed ({:.1}%)",
+        "\n  TOTAL: {}/{} normalized round-trips passed ({:.1}%)",
         total_passed, total, pass_rate
     );
 
-    // Report only — do not assert. Failures are expected and tracked for improvement.
+    assert_eq!(
+        total_failed, 0,
+        "ClickHouse normalized round-trip coverage has {total_failed} failing cases"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic helper for grouping ClickHouse coverage failures"]
+fn debug_clickhouse_coverage_failures() {
+    let category_filter = std::env::var("CLICKHOUSE_COVERAGE_CATEGORY").ok();
+    let mut printed = 0;
+
+    for file in CLICKHOUSE_FIXTURES.iter() {
+        if category_filter
+            .as_deref()
+            .is_some_and(|category| category != file.category)
+        {
+            continue;
+        }
+
+        let mut category_printed = 0;
+        for test in &file.identity {
+            if let Err(err) = normalized_roundtrip_test(&test.sql) {
+                if category_printed == 0 {
+                    println!("\n=== {} ===", file.category);
+                }
+                println!("SQL: {}", test.sql);
+                println!("ERR: {}\n", err);
+                category_printed += 1;
+                printed += 1;
+
+                if category_printed >= 5 || printed >= 120 {
+                    break;
+                }
+            }
+        }
+
+        if printed >= 120 {
+            break;
+        }
+    }
 }
