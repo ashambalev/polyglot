@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.8] - 2026-05-11
+
+### Added
+- T-SQL regression coverage for structured `BEGIN TRY` / `BEGIN CATCH`
+  parsing, traversal, SQL generation, and table extraction from block bodies.
+- PostgreSQL-to-Fabric TPC-H regression coverage for all 22 benchmark queries.
+- T-SQL regression coverage for multi-statement `DECLARE` batches, including
+  table variables followed by `INSERT` and scalar declarations followed by
+  `SELECT`.
+- AST transform regression coverage for DML statements, including
+  `UPDATE ... FROM/JOIN`, PostgreSQL `DELETE ... USING`, and T-SQL
+  `OUTPUT ... INTO` clauses.
+
+### Fixed
+- T-SQL `BEGIN TRY` / `BEGIN CATCH` blocks now parse into structured AST nodes
+  instead of opaque command text, so traversal, lineage, scope analysis, and
+  generation can inspect the inner statements.
+- T-SQL `DECLARE` parsing now preserves top-level statement boundaries, so
+  batches such as `DECLARE @tmp TABLE (...); INSERT INTO @tmp SELECT ...` parse
+  as separate statements.
+- `transform_recursive`, `rename_tables`, and `replace_by_type` now visit table
+  references and expression fields inside `UPDATE` and `DELETE` statements,
+  including DML targets, `FROM`/`USING` sources, joins, `OUTPUT`, `RETURNING`,
+  `WITH`, `ORDER BY`, and `LIMIT`.
+
 ## [0.3.7] - 2026-05-07
 
 ### Added
@@ -231,6 +256,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.3.8]: https://github.com/tobilg/polyglot/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/tobilg/polyglot/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/tobilg/polyglot/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/tobilg/polyglot/compare/v0.3.4...v0.3.5

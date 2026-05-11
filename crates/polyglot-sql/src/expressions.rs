@@ -114,6 +114,7 @@ pub enum Expression {
     Copy(Box<CopyStmt>),
     Put(Box<PutStmt>),
     StageReference(Box<StageReference>),
+    TryCatch(Box<TryCatch>),
 
     // Expressions
     Alias(Box<Alias>),
@@ -1146,6 +1147,7 @@ impl Expression {
             | Expression::Copy(_)
             | Expression::Put(_)
             | Expression::Merge(_)
+            | Expression::TryCatch(_)
 
             // DDL
             | Expression::CreateTable(_)
@@ -2229,6 +2231,7 @@ impl Expression {
             Expression::Describe(_) => "describe",
             Expression::Show(_) => "show",
             Expression::Command(_) => "command",
+            Expression::TryCatch(_) => "try_catch",
             Expression::Kill(_) => "kill",
             Expression::Execute(_) => "execute",
             Expression::Raw(_) => "raw",
@@ -6001,6 +6004,18 @@ pub enum IntervalUnit {
 pub struct Command {
     /// The command text (e.g., "ROLLBACK", "COMMIT", "BEGIN")
     pub this: String,
+}
+
+/// T-SQL TRY/CATCH block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct TryCatch {
+    /// Statements inside BEGIN TRY ... END TRY.
+    #[serde(default)]
+    pub try_body: Vec<Expression>,
+    /// Statements inside BEGIN CATCH ... END CATCH, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_body: Option<Vec<Expression>>,
 }
 
 /// EXEC/EXECUTE statement (TSQL stored procedure call)

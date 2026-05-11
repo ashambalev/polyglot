@@ -1001,6 +1001,16 @@ impl<'a> WalkInScopeIter<'a> {
                 // Tables don't have child expressions to traverse within scope
                 // (joins are handled at the Select level)
             }
+            Expression::TryCatch(try_catch) => {
+                for stmt in &try_catch.try_body {
+                    children.push(stmt);
+                }
+                if let Some(catch_body) = &try_catch.catch_body {
+                    for stmt in catch_body {
+                        children.push(stmt);
+                    }
+                }
+            }
             Expression::Column(_) | Expression::Literal(_) | Expression::Identifier(_) => {
                 // Leaf nodes - no children
             }

@@ -1,8 +1,9 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 use polyglot_sql::dialects::transform_recursive;
 use polyglot_sql::expressions::{Cast, DataType, Expression, JoinKind, StructField};
-use polyglot_sql::Parser;
+use polyglot_sql::generator::{Generator, GeneratorConfig};
+use polyglot_sql::{parse, rename_tables, replace_by_type, DialectType, Parser};
 
 fn parse_one(sql: &str) -> Expression {
     Parser::parse_sql(sql)
@@ -10,6 +11,25 @@ fn parse_one(sql: &str) -> Expression {
         .into_iter()
         .next()
         .expect("expected one statement")
+}
+
+fn parse_one_dialect(sql: &str, dialect: DialectType) -> Expression {
+    parse(sql, dialect)
+        .unwrap_or_else(|e| panic!("failed to parse {sql:?}: {e}"))
+        .into_iter()
+        .next()
+        .expect("expected one statement")
+}
+
+fn generate_with_dialect(expr: &Expression, dialect: DialectType) -> String {
+    let config = GeneratorConfig {
+        dialect: Some(dialect),
+        ..Default::default()
+    };
+    let mut generator = Generator::with_config(config);
+    generator
+        .generate(expr)
+        .unwrap_or_else(|e| panic!("failed to generate {dialect:?} SQL: {e}"))
 }
 
 fn first_index(order: &[String], target: &str) -> usize {
@@ -137,6 +157,114 @@ fn transform_recursive_preserves_cte_body_when_child_transform_errors() {
     .expect("cte child failure should fall back to original body");
 
     assert_eq!(transformed.sql(), original_sql);
+}
+
+#[test]
+fn transform_recursive_renames_update_target_from_and_join_tables() {
+    let expr = parse_one_dialect(
+        "UPDATE employees e \
+         SET salary = s.new_salary \
+         FROM salary_updates s \
+         JOIN department_updates d ON d.id = s.department_id \
+         WHERE e.id = s.employee_id \
+         RETURNING e.id",
+        DialectType::PostgreSQL,
+    );
+    let mapping = HashMap::from([
+        ("employees".to_string(), "table_1".to_string()),
+        ("salary_updates".to_string(), "table_2".to_string()),
+        ("department_updates".to_string(), "table_3".to_string()),
+    ]);
+
+    let transformed = rename_tables(expr, &mapping);
+    let sql = generate_with_dialect(&transformed, DialectType::PostgreSQL);
+
+    assert!(sql.contains("UPDATE table_1 AS e"), "{sql}");
+    assert!(sql.contains("FROM table_2 AS s"), "{sql}");
+    assert!(sql.contains("JOIN table_3 AS d"), "{sql}");
+    assert!(!sql.contains("employees"), "{sql}");
+    assert!(!sql.contains("salary_updates"), "{sql}");
+    assert!(!sql.contains("department_updates"), "{sql}");
+}
+
+#[test]
+fn replace_by_type_visits_delete_using_and_returning_fields() {
+    let expr = parse_one_dialect(
+        "DELETE FROM employees e \
+         USING salary_updates s \
+         WHERE e.id = s.employee_id \
+         RETURNING e.id",
+        DialectType::PostgreSQL,
+    );
+    let mapping = HashMap::from([
+        ("employees".to_string(), "table_1".to_string()),
+        ("salary_updates".to_string(), "table_2".to_string()),
+    ]);
+
+    let transformed = replace_by_type(
+        expr,
+        |node| {
+            matches!(node, Expression::Table(table) if mapping.contains_key(&table.name.name))
+                || matches!(node, Expression::Column(column) if column.name.name == "id")
+        },
+        |node| match node {
+            Expression::Table(mut table) => {
+                table.name.name = mapping[&table.name.name].clone();
+                Expression::Table(table)
+            }
+            Expression::Column(mut column) => {
+                column.name.name = "employee_id".to_string();
+                Expression::Column(column)
+            }
+            other => other,
+        },
+    );
+    let sql = generate_with_dialect(&transformed, DialectType::PostgreSQL);
+
+    assert!(sql.contains("DELETE FROM table_1 e"), "{sql}");
+    assert!(sql.contains("USING table_2 AS s"), "{sql}");
+    assert!(sql.contains("RETURNING e.employee_id"), "{sql}");
+    assert!(!sql.contains("employees"), "{sql}");
+    assert!(!sql.contains("salary_updates"), "{sql}");
+}
+
+#[test]
+fn replace_by_type_visits_update_output_clause() {
+    let expr = parse_one_dialect(
+        "UPDATE employees \
+         SET salary = 1 \
+         OUTPUT INSERTED.id INTO audit \
+         WHERE id = 1",
+        DialectType::TSQL,
+    );
+
+    let transformed = replace_by_type(
+        expr,
+        |node| {
+            matches!(node, Expression::Table(table) if table.name.name == "employees")
+                || matches!(node, Expression::Column(column) if column.name.name == "audit")
+        },
+        |node| match node {
+            Expression::Table(mut table) => {
+                table.name.name = "table_1".to_string();
+                Expression::Table(table)
+            }
+            Expression::Column(mut column) => {
+                column.name.name = "audit_redacted".to_string();
+                Expression::Column(column)
+            }
+            other => other,
+        },
+    );
+    let sql = generate_with_dialect(&transformed, DialectType::TSQL);
+
+    assert!(sql.contains("UPDATE table_1"), "{sql}");
+    assert!(
+        sql.contains("OUTPUT INSERTED.id INTO audit_redacted"),
+        "{sql}"
+    );
+    assert!(!sql.contains("employees"), "{sql}");
+    assert!(!sql.contains("INTO audit "), "{sql}");
 }
 
 #[test]

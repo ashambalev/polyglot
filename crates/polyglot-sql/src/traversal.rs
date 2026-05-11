@@ -746,6 +746,12 @@ fn iter_children_lists(expr: &Expression) -> Vec<(&'static str, &[Expression])> 
         Expression::Tuple(t) => {
             lists.push(("expressions", t.expressions.as_slice()));
         }
+        Expression::TryCatch(try_catch) => {
+            lists.push(("try_body", try_catch.try_body.as_slice()));
+            if let Some(catch_body) = &try_catch.catch_body {
+                lists.push(("catch_body", catch_body.as_slice()));
+            }
+        }
         // Values.expressions is Vec<Tuple>, handle specially
         Expression::Coalesce(c) => {
             lists.push(("expressions", c.expressions.as_slice()));

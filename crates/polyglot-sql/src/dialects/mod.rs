@@ -158,7 +158,10 @@ pub use trino::TrinoDialect;
 pub use tsql::TSQLDialect;
 
 use crate::error::Result;
-use crate::expressions::{Expression, Function, FunctionBody, Identifier, Null};
+use crate::expressions::{
+    Expression, From, Function, FunctionBody, Identifier, Join, Null, OrderBy, OutputClause,
+    TableRef, With,
+};
 use crate::generator::{Generator, GeneratorConfig};
 use crate::parser::Parser;
 use crate::tokens::{Token, TokenType, Tokenizer, TokenizerConfig};
@@ -1661,6 +1664,122 @@ where
     }
 }
 
+fn transform_table_ref_recursive<F>(table: TableRef, transform_fn: &F) -> Result<TableRef>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    match transform_recursive(Expression::Table(Box::new(table)), transform_fn)? {
+        Expression::Table(table) => Ok(*table),
+        _ => Err(crate::error::Error::parse(
+            "TableRef transformation returned non-table expression",
+            0,
+            0,
+            0,
+            0,
+        )),
+    }
+}
+
+fn transform_from_recursive<F>(from: From, transform_fn: &F) -> Result<From>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    match transform_recursive(Expression::From(Box::new(from)), transform_fn)? {
+        Expression::From(from) => Ok(*from),
+        _ => Err(crate::error::Error::parse(
+            "FROM transformation returned non-FROM expression",
+            0,
+            0,
+            0,
+            0,
+        )),
+    }
+}
+
+fn transform_join_recursive<F>(mut join: Join, transform_fn: &F) -> Result<Join>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    join.this = transform_recursive(join.this, transform_fn)?;
+    if let Some(on) = join.on.take() {
+        join.on = Some(transform_recursive(on, transform_fn)?);
+    }
+    if let Some(match_condition) = join.match_condition.take() {
+        join.match_condition = Some(transform_recursive(match_condition, transform_fn)?);
+    }
+    join.pivots = join
+        .pivots
+        .into_iter()
+        .map(|pivot| transform_recursive(pivot, transform_fn))
+        .collect::<Result<Vec<_>>>()?;
+
+    match transform_fn(Expression::Join(Box::new(join)))? {
+        Expression::Join(join) => Ok(*join),
+        _ => Err(crate::error::Error::parse(
+            "Join transformation returned non-join expression",
+            0,
+            0,
+            0,
+            0,
+        )),
+    }
+}
+
+fn transform_output_clause_recursive<F>(
+    mut output: OutputClause,
+    transform_fn: &F,
+) -> Result<OutputClause>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    output.columns = output
+        .columns
+        .into_iter()
+        .map(|column| transform_recursive(column, transform_fn))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(into_table) = output.into_table.take() {
+        output.into_table = Some(transform_recursive(into_table, transform_fn)?);
+    }
+    Ok(output)
+}
+
+fn transform_with_recursive<F>(mut with: With, transform_fn: &F) -> Result<With>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    with.ctes = with
+        .ctes
+        .into_iter()
+        .map(|mut cte| {
+            cte.this = transform_recursive(cte.this, transform_fn)?;
+            Ok(cte)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(search) = with.search.take() {
+        with.search = Some(Box::new(transform_recursive(*search, transform_fn)?));
+    }
+    Ok(with)
+}
+
+fn transform_order_by_recursive<F>(mut order: OrderBy, transform_fn: &F) -> Result<OrderBy>
+where
+    F: Fn(Expression) -> Result<Expression>,
+{
+    order.expressions = order
+        .expressions
+        .into_iter()
+        .map(|mut ordered| {
+            let original = ordered.this.clone();
+            ordered.this = transform_recursive(ordered.this, transform_fn).unwrap_or(original);
+            match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
+                Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                Ok(_) | Err(_) => Ok(ordered),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(order)
+}
+
 fn transform_recursive_reference<F>(expr: Expression, transform_fn: &F) -> Result<Expression>
 where
     F: Fn(Expression) -> Result<Expression>,
@@ -2377,6 +2496,17 @@ where
             Expression::Insert(ins)
         }
         Expression::Update(mut upd) => {
+            upd.table = transform_table_ref_recursive(upd.table, transform_fn)?;
+            upd.extra_tables = upd
+                .extra_tables
+                .into_iter()
+                .map(|table| transform_table_ref_recursive(table, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            upd.table_joins = upd
+                .table_joins
+                .into_iter()
+                .map(|join| transform_join_recursive(join, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
             upd.set = upd
                 .set
                 .into_iter()
@@ -2385,17 +2515,75 @@ where
                     (id, new_val)
                 })
                 .collect();
+            if let Some(from_clause) = upd.from_clause.take() {
+                upd.from_clause = Some(transform_from_recursive(from_clause, transform_fn)?);
+            }
+            upd.from_joins = upd
+                .from_joins
+                .into_iter()
+                .map(|join| transform_join_recursive(join, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
             if let Some(mut where_clause) = upd.where_clause.take() {
                 where_clause.this = transform_recursive(where_clause.this, transform_fn)?;
                 upd.where_clause = Some(where_clause);
             }
+            upd.returning = upd
+                .returning
+                .into_iter()
+                .map(|expr| transform_recursive(expr, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(output) = upd.output.take() {
+                upd.output = Some(transform_output_clause_recursive(output, transform_fn)?);
+            }
+            if let Some(with) = upd.with.take() {
+                upd.with = Some(transform_with_recursive(with, transform_fn)?);
+            }
+            if let Some(limit) = upd.limit.take() {
+                upd.limit = Some(transform_recursive(limit, transform_fn)?);
+            }
+            if let Some(order_by) = upd.order_by.take() {
+                upd.order_by = Some(transform_order_by_recursive(order_by, transform_fn)?);
+            }
             Expression::Update(upd)
         }
         Expression::Delete(mut del) => {
+            del.table = transform_table_ref_recursive(del.table, transform_fn)?;
+            del.using = del
+                .using
+                .into_iter()
+                .map(|table| transform_table_ref_recursive(table, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
             if let Some(mut where_clause) = del.where_clause.take() {
                 where_clause.this = transform_recursive(where_clause.this, transform_fn)?;
                 del.where_clause = Some(where_clause);
             }
+            if let Some(output) = del.output.take() {
+                del.output = Some(transform_output_clause_recursive(output, transform_fn)?);
+            }
+            if let Some(with) = del.with.take() {
+                del.with = Some(transform_with_recursive(with, transform_fn)?);
+            }
+            if let Some(limit) = del.limit.take() {
+                del.limit = Some(transform_recursive(limit, transform_fn)?);
+            }
+            if let Some(order_by) = del.order_by.take() {
+                del.order_by = Some(transform_order_by_recursive(order_by, transform_fn)?);
+            }
+            del.returning = del
+                .returning
+                .into_iter()
+                .map(|expr| transform_recursive(expr, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            del.tables = del
+                .tables
+                .into_iter()
+                .map(|table| transform_table_ref_recursive(table, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            del.joins = del
+                .joins
+                .into_iter()
+                .map(|join| transform_join_recursive(join, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
             Expression::Delete(del)
         }
 

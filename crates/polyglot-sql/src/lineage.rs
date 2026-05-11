@@ -1658,6 +1658,16 @@ fn collect_column_refs(expr: &Expression, refs: &mut Vec<SimpleColumnRef>) {
             Expression::NamedArgument(n) => {
                 stack.push(&n.value);
             }
+            Expression::TryCatch(t) => {
+                for stmt in &t.try_body {
+                    stack.push(stmt);
+                }
+                if let Some(catch_body) = &t.catch_body {
+                    for stmt in catch_body {
+                        stack.push(stmt);
+                    }
+                }
+            }
             Expression::BracedWildcard(e) | Expression::ReturnStmt(e) => {
                 stack.push(e);
             }

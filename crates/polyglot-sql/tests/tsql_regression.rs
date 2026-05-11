@@ -1,6 +1,9 @@
-//! Regression tests for PostgreSQL → T-SQL transpilation.
+//! Regression tests for T-SQL parsing/generation and PostgreSQL -> T-SQL transpilation.
 
-use polyglot_sql::{transpile, DialectType};
+use polyglot_sql::generator::{Generator, GeneratorConfig};
+use polyglot_sql::{
+    get_all_tables, parse, transpile, DialectType, Expression, ExpressionWalk, Parser,
+};
 
 fn pg_to_tsql(sql: &str) -> String {
     transpile(sql, DialectType::PostgreSQL, DialectType::TSQL)
@@ -8,6 +11,117 @@ fn pg_to_tsql(sql: &str) -> String {
         .into_iter()
         .next()
         .expect("expected at least one statement")
+}
+
+fn generate_tsql(expr: &Expression) -> String {
+    let config = GeneratorConfig {
+        dialect: Some(DialectType::TSQL),
+        ..Default::default()
+    };
+    let mut generator = Generator::with_config(config);
+    generator
+        .generate(expr)
+        .expect("expression should generate as T-SQL")
+}
+
+const TRY_CATCH_SQL: &str = r#"BEGIN TRY
+    INSERT INTO orders (id, amount) VALUES (1, 100.00);
+    UPDATE inventory SET qty = qty - 1 WHERE product_id = 42;
+END TRY
+BEGIN CATCH
+    INSERT INTO error_log (msg) VALUES (ERROR_MESSAGE());
+END CATCH"#;
+
+// ---------------------------------------------------------------------------
+// T-SQL TRY/CATCH structured traversal
+// ---------------------------------------------------------------------------
+
+#[test]
+fn try_catch_parses_structured_bodies_and_generates_sql() {
+    let ast = Parser::parse_sql(TRY_CATCH_SQL).expect("TRY/CATCH should parse");
+    assert_eq!(ast.len(), 1);
+
+    let Expression::TryCatch(try_catch) = &ast[0] else {
+        panic!("expected TRY/CATCH expression, got {:?}", ast[0]);
+    };
+
+    assert_eq!(try_catch.try_body.len(), 2);
+    assert_eq!(try_catch.catch_body.as_ref().map(Vec::len), Some(1));
+
+    let sql = Generator::sql(&ast[0]).expect("TRY/CATCH should generate");
+    assert_eq!(
+        sql,
+        "BEGIN TRY INSERT INTO orders (id, amount) VALUES (1, 100.00); UPDATE inventory SET qty = qty - 1 WHERE product_id = 42; END TRY BEGIN CATCH INSERT INTO error_log (msg) VALUES (ERROR_MESSAGE()); END CATCH"
+    );
+}
+
+#[test]
+fn try_catch_children_include_inner_statements() {
+    let ast = Parser::parse_sql(TRY_CATCH_SQL).expect("TRY/CATCH should parse");
+    let children = ast[0].children();
+
+    assert_eq!(children.len(), 3);
+    assert!(matches!(children[0], Expression::Insert(_)));
+    assert!(matches!(children[1], Expression::Update(_)));
+    assert!(matches!(children[2], Expression::Insert(_)));
+}
+
+#[test]
+fn try_catch_get_all_tables_finds_try_and_catch_tables() {
+    let ast = Parser::parse_sql(TRY_CATCH_SQL).expect("TRY/CATCH should parse");
+    let names: Vec<String> = get_all_tables(&ast[0])
+        .into_iter()
+        .filter_map(|table| match table {
+            Expression::Table(table) => Some(table.name.name),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(names, vec!["orders", "inventory", "error_log"]);
+}
+
+// ---------------------------------------------------------------------------
+// DECLARE statement boundaries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn declare_table_variable_keeps_following_insert_as_second_statement() {
+    let sql = "DECLARE @tmp TABLE (id INT, name VARCHAR(50)); \
+               INSERT INTO @tmp SELECT id, name FROM employees;";
+    let ast = parse(sql, DialectType::TSQL).expect("DECLARE TABLE batch should parse");
+
+    assert_eq!(ast.len(), 2);
+    assert!(matches!(ast[0], Expression::Declare(_)));
+    assert!(matches!(ast[1], Expression::Insert(_)));
+    assert_eq!(
+        generate_tsql(&ast[0]),
+        "DECLARE @tmp TABLE (id INTEGER, name VARCHAR(50))"
+    );
+    assert_eq!(
+        generate_tsql(&ast[1]),
+        "INSERT INTO @tmp SELECT id, name FROM employees"
+    );
+
+    let names: Vec<String> = get_all_tables(&ast[1])
+        .into_iter()
+        .filter_map(|table| match table {
+            Expression::Table(table) => Some(table.name.name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["@tmp", "employees"]);
+}
+
+#[test]
+fn declare_scalar_keeps_following_select_as_second_statement() {
+    let ast = parse("DECLARE @x INT; SELECT @x;", DialectType::TSQL)
+        .expect("DECLARE scalar batch should parse");
+
+    assert_eq!(ast.len(), 2);
+    assert!(matches!(ast[0], Expression::Declare(_)));
+    assert!(matches!(ast[1], Expression::Select(_)));
+    assert_eq!(generate_tsql(&ast[0]), "DECLARE @x INTEGER");
+    assert_eq!(generate_tsql(&ast[1]), "SELECT @x");
 }
 
 // ---------------------------------------------------------------------------

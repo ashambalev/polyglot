@@ -3342,6 +3342,7 @@ impl Generator {
                 Ok(())
             }
             Expression::CreateTask(task) => self.generate_create_task(task),
+            Expression::TryCatch(try_catch) => self.generate_try_catch(try_catch),
             Expression::Command(cmd) => {
                 self.write(&cmd.this);
                 Ok(())
@@ -14106,6 +14107,58 @@ impl Generator {
         self.write_keyword("AS");
         self.write_space();
         self.generate_expression(&task.body)?;
+        Ok(())
+    }
+
+    fn generate_try_catch(&mut self, try_catch: &TryCatch) -> Result<()> {
+        self.write_keyword("BEGIN TRY");
+        self.generate_tsql_block_statements(&try_catch.try_body)?;
+        self.write_keyword("END TRY");
+
+        if let Some(catch_body) = &try_catch.catch_body {
+            if self.config.pretty {
+                self.write_newline();
+                self.write_indent();
+            } else {
+                self.write_space();
+            }
+            self.write_keyword("BEGIN CATCH");
+            self.generate_tsql_block_statements(catch_body)?;
+            self.write_keyword("END CATCH");
+        }
+
+        Ok(())
+    }
+
+    fn generate_tsql_block_statements(&mut self, statements: &[Expression]) -> Result<()> {
+        if statements.is_empty() {
+            self.write_space();
+            return Ok(());
+        }
+
+        if self.config.pretty {
+            self.indent_level += 1;
+            for stmt in statements {
+                self.write_newline();
+                self.write_indent();
+                self.generate_expression(stmt)?;
+                self.write(";");
+            }
+            self.indent_level -= 1;
+            self.write_newline();
+            self.write_indent();
+        } else {
+            self.write_space();
+            for (i, stmt) in statements.iter().enumerate() {
+                if i > 0 {
+                    self.write_space();
+                }
+                self.generate_expression(stmt)?;
+                self.write(";");
+            }
+            self.write_space();
+        }
+
         Ok(())
     }
 

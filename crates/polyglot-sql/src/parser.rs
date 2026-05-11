@@ -21032,66 +21032,17 @@ impl Parser {
 
         if !is_transaction {
             // TSQL: BEGIN TRY ... END TRY [BEGIN CATCH ... END CATCH]
-            // These are block-structured constructs that may contain semicolons,
-            // so we can't use parse_command() which stops at the first semicolon.
-            let is_try = self.check_identifier("TRY");
-            let is_catch = self.check_identifier("CATCH");
-            if is_try || is_catch {
-                let block_kind = if is_try { "TRY" } else { "CATCH" };
-                self.skip(); // consume TRY or CATCH
-                let mut tokens: Vec<(String, TokenType)> = vec![
-                    ("BEGIN".to_string(), TokenType::Begin),
-                    (block_kind.to_string(), TokenType::Var),
-                ];
-                // Collect tokens until matching END TRY / END CATCH
-                while !self.is_at_end() {
-                    if self.check(TokenType::End)
-                        && self.current + 1 < self.tokens.len()
-                        && self.tokens[self.current + 1]
-                            .text
-                            .eq_ignore_ascii_case(block_kind)
-                    {
-                        tokens.push(("END".to_string(), TokenType::End));
-                        self.skip(); // consume END
-                        tokens.push((block_kind.to_string(), TokenType::Var));
-                        self.skip(); // consume TRY/CATCH
-                        break;
-                    }
-                    let token = self.advance();
-                    let text = if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else {
-                        token.text.clone()
-                    };
-                    tokens.push((text, token.token_type));
-                }
-                let mut result = Expression::Command(Box::new(Command {
-                    this: self.join_command_tokens(tokens),
-                }));
-
-                // If this was a TRY block, check for a following BEGIN CATCH block
-                if is_try
-                    && self.check(TokenType::Begin)
-                    && self.current + 1 < self.tokens.len()
-                    && self.tokens[self.current + 1]
-                        .text
-                        .eq_ignore_ascii_case("CATCH")
-                {
-                    // Recursively parse the BEGIN CATCH block
-                    let catch_block = self.parse_transaction()?;
-                    // Combine TRY and CATCH into a single command
-                    if let (Expression::Command(try_cmd), Expression::Command(catch_cmd)) =
-                        (&result, &catch_block)
-                    {
-                        result = Expression::Command(Box::new(Command {
-                            this: format!("{} {}", try_cmd.this, catch_cmd.this),
-                        }));
-                    }
-                }
-
-                return Ok(result);
+            // Parse bodies into statement nodes so traversal can see table refs.
+            if self.check_identifier("TRY") {
+                return self.parse_tsql_try_catch();
+            }
+            if self.check_identifier("CATCH") {
+                self.skip(); // consume CATCH
+                let catch_body = self.parse_tsql_block_body("CATCH")?;
+                return Ok(Expression::TryCatch(Box::new(TryCatch {
+                    try_body: Vec::new(),
+                    catch_body: Some(catch_body),
+                })));
             }
 
             // This is a procedural BEGIN block - parse as Command
@@ -21188,6 +21139,79 @@ impl Parser {
             modes,
             mark,
         })))
+    }
+
+    fn parse_tsql_try_catch(&mut self) -> Result<Expression> {
+        self.skip(); // consume TRY
+        let try_body = self.parse_tsql_block_body("TRY")?;
+        let catch_body = if self.check(TokenType::Begin)
+            && self.current + 1 < self.tokens.len()
+            && self.tokens[self.current + 1]
+                .text
+                .eq_ignore_ascii_case("CATCH")
+        {
+            self.skip(); // consume BEGIN
+            self.skip(); // consume CATCH
+            Some(self.parse_tsql_block_body("CATCH")?)
+        } else {
+            None
+        };
+
+        Ok(Expression::TryCatch(Box::new(TryCatch {
+            try_body,
+            catch_body,
+        })))
+    }
+
+    fn parse_tsql_block_body(&mut self, block_kind: &str) -> Result<Vec<Expression>> {
+        let tokens = self.collect_tsql_block_body_tokens(block_kind)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut parser = Parser::with_config(tokens, self.config.clone());
+        parser.parse()
+    }
+
+    fn collect_tsql_block_body_tokens(&mut self, block_kind: &str) -> Result<Vec<Token>> {
+        let mut tokens = Vec::new();
+        let mut depth = 1usize;
+
+        while !self.is_at_end() {
+            if self.check(TokenType::Begin)
+                && self.current + 1 < self.tokens.len()
+                && self.tokens[self.current + 1]
+                    .text
+                    .eq_ignore_ascii_case(block_kind)
+            {
+                depth += 1;
+                tokens.push(self.advance());
+                tokens.push(self.advance());
+                continue;
+            }
+
+            if self.check(TokenType::End)
+                && self.current + 1 < self.tokens.len()
+                && self.tokens[self.current + 1]
+                    .text
+                    .eq_ignore_ascii_case(block_kind)
+            {
+                depth -= 1;
+                if depth == 0 {
+                    self.skip(); // consume END
+                    self.skip(); // consume TRY/CATCH
+                    return Ok(tokens);
+                }
+
+                tokens.push(self.advance());
+                tokens.push(self.advance());
+                continue;
+            }
+
+            tokens.push(self.advance());
+        }
+
+        Err(self.parse_error(format!("Expected END {}", block_kind)))
     }
 
     /// Parse START TRANSACTION statement
@@ -47359,12 +47383,10 @@ impl Parser {
             } else {
                 break;
             }
-            // Accept comma (TSQL/BigQuery) or semicolon (Snowflake scripting) as separator
-            if self.match_token(TokenType::Comma) || self.match_token(TokenType::Semicolon) {
-                // Stop if next token is BEGIN (end of DECLARE block)
-                if self.check(TokenType::Begin) {
-                    break;
-                }
+            // Accept comma-separated DECLARE items. Statement-level semicolons
+            // are consumed by the top-level parser so batches like
+            // `DECLARE @x INT; SELECT @x` keep their statement boundary.
+            if self.match_token(TokenType::Comma) {
                 continue;
             }
             break;
