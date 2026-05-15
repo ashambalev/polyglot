@@ -189,16 +189,9 @@ impl WasmExpr {
 
     // -- Output --
 
-    /// Generate SQL string (generic dialect).
-    pub fn to_sql(&self) -> Result<String, JsValue> {
-        let config = GeneratorConfig {
-            not_in_style: NotInStyle::Infix,
-            ..Default::default()
-        };
-        let mut generator = Generator::with_config(config);
-        generator
-            .generate(&self.inner.0)
-            .map_err(|e| js_error(format!("Failed to generate SQL for expression: {e}")))
+    /// Generate SQL string for the given dialect.
+    pub fn to_sql(&self, dialect: &str) -> Result<String, JsValue> {
+        generate_sql(&self.inner.0, dialect)
     }
 
     /// Return the expression AST as a JSON value.
@@ -1024,11 +1017,11 @@ impl WasmCaseBuilder {
         Ok(WasmExpr::new(b.build()))
     }
 
-    /// Generate SQL string (generic dialect).
-    pub fn to_sql(&mut self) -> Result<String, JsValue> {
+    /// Generate SQL string for the given dialect.
+    pub fn to_sql(&mut self, dialect: &str) -> Result<String, JsValue> {
         let b = take_owned(&mut self.inner, "CaseBuilder")?;
         let expr = b.build();
-        generate_sql(&expr.0, "generic")
+        generate_sql(&expr.0, dialect)
     }
 }
 
@@ -1134,13 +1127,16 @@ mod tests {
     #[test]
     fn test_wasm_col() {
         let c = wasm_col("users.id");
-        assert_eq!(c.to_sql().unwrap(), "users.id");
+        assert_eq!(c.to_sql("generic").unwrap(), "users.id");
     }
 
     #[test]
     fn test_wasm_col_quotes_unsafe_identifier_tokens() {
         let c = wasm_col("Name; DROP TABLE titanic");
-        assert_eq!(c.to_sql().unwrap(), r#""Name; DROP TABLE titanic""#);
+        assert_eq!(
+            c.to_sql("generic").unwrap(),
+            r#""Name; DROP TABLE titanic""#
+        );
     }
 
     // Note: wasm_lit() uses JsValue which only works on wasm32 targets.
@@ -1148,45 +1144,45 @@ mod tests {
     #[test]
     fn test_wasm_lit_string_via_core() {
         let l = WasmExpr::new(core_builder::lit("hello"));
-        assert_eq!(l.to_sql().unwrap(), "'hello'");
+        assert_eq!(l.to_sql("generic").unwrap(), "'hello'");
     }
 
     #[test]
     fn test_wasm_lit_int_via_core() {
         let l = WasmExpr::new(core_builder::lit(42));
-        assert_eq!(l.to_sql().unwrap(), "42");
+        assert_eq!(l.to_sql("generic").unwrap(), "42");
     }
 
     #[test]
     fn test_wasm_lit_float_via_core() {
         let l = WasmExpr::new(core_builder::lit(3.14));
-        assert_eq!(l.to_sql().unwrap(), "3.14");
+        assert_eq!(l.to_sql("generic").unwrap(), "3.14");
     }
 
     #[test]
     fn test_wasm_lit_bool_via_core() {
         let l = WasmExpr::new(core_builder::boolean(true));
-        assert_eq!(l.to_sql().unwrap(), "TRUE");
+        assert_eq!(l.to_sql("generic").unwrap(), "TRUE");
     }
 
     #[test]
     fn test_wasm_star() {
         let s = wasm_star();
-        assert_eq!(s.to_sql().unwrap(), "*");
+        assert_eq!(s.to_sql("generic").unwrap(), "*");
     }
 
     #[test]
     fn test_wasm_null() {
         let n = wasm_null();
-        assert_eq!(n.to_sql().unwrap(), "NULL");
+        assert_eq!(n.to_sql("generic").unwrap(), "NULL");
     }
 
     #[test]
     fn test_wasm_boolean() {
         let t = wasm_boolean(true);
         let f = wasm_boolean(false);
-        assert_eq!(t.to_sql().unwrap(), "TRUE");
-        assert_eq!(f.to_sql().unwrap(), "FALSE");
+        assert_eq!(t.to_sql("generic").unwrap(), "TRUE");
+        assert_eq!(f.to_sql("generic").unwrap(), "FALSE");
     }
 
     #[test]
@@ -1194,7 +1190,7 @@ mod tests {
         let left = wasm_col("age");
         let right = WasmExpr::new(core_builder::lit(18));
         let result = left.gte(&right);
-        assert_eq!(result.to_sql().unwrap(), "age >= 18");
+        assert_eq!(result.to_sql("generic").unwrap(), "age >= 18");
     }
 
     #[test]
@@ -1206,7 +1202,7 @@ mod tests {
         let left = a.eq(&b);
         let right = c.eq(&d);
         let result = left.and_(&right);
-        assert_eq!(result.to_sql().unwrap(), "x = 1 AND y = 2");
+        assert_eq!(result.to_sql("generic").unwrap(), "x = 1 AND y = 2");
     }
 
     #[test]
@@ -1214,29 +1210,38 @@ mod tests {
         let a = wasm_col("price");
         let b = wasm_col("qty");
         let result = a.mul(&b);
-        assert_eq!(result.to_sql().unwrap(), "price * qty");
+        assert_eq!(result.to_sql("generic").unwrap(), "price * qty");
     }
 
     #[test]
     fn test_wasm_expr_alias() {
         let e = wasm_col("name");
         let aliased = e.alias("n");
-        assert_eq!(aliased.to_sql().unwrap(), "name AS n");
+        assert_eq!(aliased.to_sql("generic").unwrap(), "name AS n");
     }
 
     #[test]
     fn test_wasm_expr_cast() {
         let e = wasm_col("id");
         let casted = e.cast("VARCHAR");
-        assert_eq!(casted.to_sql().unwrap(), "CAST(id AS VARCHAR)");
+        assert_eq!(casted.to_sql("generic").unwrap(), "CAST(id AS VARCHAR)");
+    }
+
+    #[test]
+    #[cfg(all(feature = "dialect-tsql", feature = "dialect-fabric"))]
+    fn test_wasm_expr_to_sql_uses_dialect() {
+        let casted = wasm_col("x").cast("NVARCHAR(MAX)");
+
+        assert_eq!(casted.to_sql("tsql").unwrap(), "CAST(x AS NVARCHAR(MAX))");
+        assert_eq!(casted.to_sql("fabric").unwrap(), "CAST(x AS VARCHAR(MAX))");
     }
 
     #[test]
     fn test_wasm_expr_asc_desc() {
         let a = wasm_col("name").asc();
         let d = wasm_col("age").desc();
-        assert_eq!(a.to_sql().unwrap(), "name ASC");
-        assert_eq!(d.to_sql().unwrap(), "age DESC");
+        assert_eq!(a.to_sql("generic").unwrap(), "name ASC");
+        assert_eq!(d.to_sql("generic").unwrap(), "age DESC");
     }
 
     #[test]
@@ -1244,19 +1249,19 @@ mod tests {
         let e = wasm_col("name");
         let p = WasmExpr::new(core_builder::lit("%test%"));
         let result = e.like(&p);
-        assert_eq!(result.to_sql().unwrap(), "name LIKE '%test%'");
+        assert_eq!(result.to_sql("generic").unwrap(), "name LIKE '%test%'");
     }
 
     #[test]
     fn test_wasm_expr_is_null() {
         let e = wasm_col("x");
-        assert_eq!(e.is_null().to_sql().unwrap(), "x IS NULL");
+        assert_eq!(e.is_null().to_sql("generic").unwrap(), "x IS NULL");
     }
 
     #[test]
     fn test_wasm_expr_is_not_null() {
         let e = wasm_col("x");
-        assert_eq!(e.is_not_null().to_sql().unwrap(), "NOT x IS NULL");
+        assert_eq!(e.is_not_null().to_sql("generic").unwrap(), "NOT x IS NULL");
     }
 
     #[test]
@@ -1265,7 +1270,7 @@ mod tests {
         let low = WasmExpr::new(core_builder::lit(18));
         let high = WasmExpr::new(core_builder::lit(65));
         let result = e.between(&low, &high);
-        assert_eq!(result.to_sql().unwrap(), "age BETWEEN 18 AND 65");
+        assert_eq!(result.to_sql("generic").unwrap(), "age BETWEEN 18 AND 65");
     }
 
     #[test]
@@ -1275,7 +1280,10 @@ mod tests {
         arr.push_str("active");
         arr.push_str("pending");
         let result = e.in_list(&arr);
-        assert_eq!(result.to_sql().unwrap(), "status IN ('active', 'pending')");
+        assert_eq!(
+            result.to_sql("generic").unwrap(),
+            "status IN ('active', 'pending')"
+        );
     }
 
     #[test]
@@ -1283,7 +1291,7 @@ mod tests {
         let mut args = WasmExprArray::new();
         args.push(&wasm_col("name"));
         let result = wasm_func("UPPER", &args);
-        assert_eq!(result.to_sql().unwrap(), "UPPER(name)");
+        assert_eq!(result.to_sql("generic").unwrap(), "UPPER(name)");
     }
 
     #[test]
@@ -1466,11 +1474,23 @@ mod tests {
         b.when(&cond, &result);
         let else_result = WasmExpr::new(core_builder::lit("non-positive"));
         b.else_(&else_result);
-        let sql = b.to_sql().unwrap();
+        let sql = b.to_sql("generic").unwrap();
         assert_eq!(
             sql,
             "CASE WHEN x > 0 THEN 'positive' ELSE 'non-positive' END"
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "dialect-tsql", feature = "dialect-fabric"))]
+    fn test_wasm_case_builder_to_sql_uses_dialect() {
+        let mut b = WasmCaseBuilder::new();
+        let cond = wasm_col("kind").eq(&WasmExpr::new(core_builder::lit("n")));
+        let result = wasm_col("x").cast("NVARCHAR(MAX)");
+        b.when(&cond, &result);
+
+        let sql = b.to_sql("fabric").unwrap();
+        assert_eq!(sql, "CASE WHEN kind = 'n' THEN CAST(x AS VARCHAR(MAX)) END");
     }
 
     #[test]
@@ -1485,7 +1505,7 @@ mod tests {
             &WasmExpr::new(core_builder::lit(0)),
             &WasmExpr::new(core_builder::lit("inactive")),
         );
-        let sql = b.to_sql().unwrap();
+        let sql = b.to_sql("generic").unwrap();
         assert_eq!(
             sql,
             "CASE status WHEN 1 THEN 'active' WHEN 0 THEN 'inactive' END"
@@ -1538,7 +1558,7 @@ mod tests {
     fn test_wasm_expr_not() {
         let e = wasm_col("active");
         let result = e.not();
-        assert_eq!(result.to_sql().unwrap(), "NOT active");
+        assert_eq!(result.to_sql("generic").unwrap(), "NOT active");
     }
 
     #[test]
@@ -1546,7 +1566,7 @@ mod tests {
         let a = wasm_col("a");
         let b = wasm_col("b");
         let result = a.xor(&b);
-        assert_eq!(result.to_sql().unwrap(), "a XOR b");
+        assert_eq!(result.to_sql("generic").unwrap(), "a XOR b");
     }
 
     #[test]
@@ -1557,25 +1577,28 @@ mod tests {
         arr.push_int(2);
         arr.push_int(3);
         let result = e.not_in(&arr);
-        assert_eq!(result.to_sql().unwrap(), "x NOT IN (1, 2, 3)");
+        assert_eq!(result.to_sql("generic").unwrap(), "x NOT IN (1, 2, 3)");
     }
 
     #[test]
     fn test_wasm_sql_expr() {
         let e = wasm_sql_expr("COALESCE(a, b, 0)");
-        assert_eq!(e.to_sql().unwrap(), "COALESCE(a, b, 0)");
+        assert_eq!(e.to_sql("generic").unwrap(), "COALESCE(a, b, 0)");
     }
 
     #[test]
     fn test_wasm_count_distinct() {
         let e = wasm_count_distinct(&wasm_col("x"));
-        assert_eq!(e.to_sql().unwrap(), "COUNT(DISTINCT x)");
+        assert_eq!(e.to_sql("generic").unwrap(), "COUNT(DISTINCT x)");
     }
 
     #[test]
     fn test_wasm_extract() {
         let e = wasm_extract("YEAR", &wasm_col("created_at"));
-        assert_eq!(e.to_sql().unwrap(), "EXTRACT(YEAR FROM created_at)");
+        assert_eq!(
+            e.to_sql("generic").unwrap(),
+            "EXTRACT(YEAR FROM created_at)"
+        );
     }
 
     #[test]
@@ -1604,18 +1627,18 @@ mod tests {
     #[test]
     fn test_wasm_free_functions() {
         let and_result = wasm_and(&wasm_col("a"), &wasm_col("b"));
-        assert_eq!(and_result.to_sql().unwrap(), "a AND b");
+        assert_eq!(and_result.to_sql("generic").unwrap(), "a AND b");
 
         let or_result = wasm_or(&wasm_col("a"), &wasm_col("b"));
-        assert_eq!(or_result.to_sql().unwrap(), "a OR b");
+        assert_eq!(or_result.to_sql("generic").unwrap(), "a OR b");
 
         let not_result = wasm_not(&wasm_col("a"));
-        assert_eq!(not_result.to_sql().unwrap(), "NOT a");
+        assert_eq!(not_result.to_sql("generic").unwrap(), "NOT a");
 
         let cast_result = wasm_cast(&wasm_col("x"), "INT");
-        assert_eq!(cast_result.to_sql().unwrap(), "CAST(x AS INT)");
+        assert_eq!(cast_result.to_sql("generic").unwrap(), "CAST(x AS INT)");
 
         let alias_result = wasm_alias(&wasm_col("x"), "y");
-        assert_eq!(alias_result.to_sql().unwrap(), "x AS y");
+        assert_eq!(alias_result.to_sql("generic").unwrap(), "x AS y");
     }
 }

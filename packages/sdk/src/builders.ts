@@ -215,9 +215,9 @@ export class Expr {
 
   // -- Output --
 
-  /** Generate SQL string (generic dialect). */
-  toSql(): string {
-    return this._w.to_sql();
+  /** Generate SQL string. Defaults to generic dialect. */
+  toSql(dialect: string = 'generic'): string {
+    return this._w.to_sql(dialect);
   }
   /** Return the expression AST as a plain JS object. */
   toJSON(): any {
@@ -1027,9 +1027,9 @@ export class CaseBuilder {
     return new Expr(this._w.build_expr());
   }
 
-  /** Generate SQL string (generic dialect). */
-  toSql(): string {
-    return this._w.to_sql();
+  /** Generate SQL string. Defaults to generic dialect. */
+  toSql(dialect: string = 'generic'): string {
+    return this._w.to_sql(dialect);
   }
 }
 

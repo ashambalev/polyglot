@@ -98,6 +98,32 @@ fn test_snowflake_timestamp_cast_roundtrip() {
     );
 }
 
+#[test]
+fn test_snowflake_timestamp_variant_casts_generate_sqlglot_aliases() {
+    let cases = [
+        (
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP_NTZ)",
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPNTZ)",
+        ),
+        (
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP_LTZ)",
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPLTZ)",
+        ),
+        (
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMP_TZ)",
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPTZ)",
+        ),
+        (
+            "SELECT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ",
+            "SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPNTZ)",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(parse_and_generate(sql), expected);
+    }
+}
+
 // =====================================================================
 // Category 2: PUT file upload commands
 // =====================================================================

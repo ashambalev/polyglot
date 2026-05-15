@@ -100,7 +100,6 @@ fn run_dialect_transpilation_tests(source_dialect: &str) -> TestResults {
 
             if known.contains(&test_id) {
                 results.known_failures += 1;
-                results.failed += 1;
                 continue;
             }
 

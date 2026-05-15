@@ -33,6 +33,33 @@ def test_postgres_to_snowflake_cast_text():
     assert out == ["SELECT CAST(x AS VARCHAR) FROM t"]
 
 
+def test_tsql_identity_preserves_nvarchar():
+    out = polyglot_sql.transpile(
+        "SELECT CAST(x AS NVARCHAR(MAX))",
+        read="tsql",
+        write="tsql",
+    )
+    assert out == ["SELECT CAST(x AS NVARCHAR(MAX))"]
+
+
+def test_tsql_to_fabric_maps_nvarchar_to_varchar():
+    out = polyglot_sql.transpile(
+        "SELECT CAST(x AS NVARCHAR(MAX))",
+        read="tsql",
+        write="fabric",
+    )
+    assert out == ["SELECT CAST(x AS VARCHAR(MAX))"]
+
+
+def test_snowflake_timestamp_variant_names_match_sqlglot_aliases():
+    out = polyglot_sql.transpile(
+        "SELECT CURRENT_TIMESTAMP()::TIMESTAMPNTZ",
+        read="snowflake",
+        write="snowflake",
+    )
+    assert out == ["SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPNTZ)"]
+
+
 def test_multi_statement_transpile_returns_multiple_entries():
     out = polyglot_sql.transpile(
         "SELECT 1; SELECT 2",

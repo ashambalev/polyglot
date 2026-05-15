@@ -40661,6 +40661,7 @@ impl Parser {
                 DataType::Double { precision, scale }
             }
             "BPCHAR" | "CHARACTER" | "CHAR" | "NCHAR" => {
+                let is_nchar = name == "NCHAR";
                 // Handle CHARACTER VARYING / CHAR VARYING
                 if self.match_identifier("VARYING") {
                     let length = if self.match_token(TokenType::LParen) {
@@ -40670,9 +40671,18 @@ impl Parser {
                     } else {
                         None
                     };
-                    DataType::VarChar {
-                        length,
-                        parenthesized_length: false,
+                    if is_nchar {
+                        let name = if let Some(len) = length {
+                            format!("NVARCHAR({})", len)
+                        } else {
+                            "NVARCHAR".to_string()
+                        };
+                        DataType::Custom { name }
+                    } else {
+                        DataType::VarChar {
+                            length,
+                            parenthesized_length: false,
+                        }
                     }
                 } else {
                     let length = if self.match_token(TokenType::LParen) {
@@ -40690,7 +40700,16 @@ impl Parser {
                         let charset = self.expect_identifier_or_keyword()?;
                         return Ok(DataType::CharacterSet { name: charset });
                     }
-                    DataType::Char { length }
+                    if is_nchar {
+                        let name = if let Some(len) = length {
+                            format!("NCHAR({})", len)
+                        } else {
+                            "NCHAR".to_string()
+                        };
+                        DataType::Custom { name }
+                    } else {
+                        DataType::Char { length }
+                    }
                 }
             }
             "TIME" => {
@@ -40852,9 +40871,15 @@ impl Parser {
                 if self.match_token(TokenType::LParen) {
                     if self.check(TokenType::RParen) {
                         self.skip();
-                        DataType::VarChar {
-                            length: None,
-                            parenthesized_length: false,
+                        if is_nvarchar {
+                            DataType::Custom {
+                                name: "NVARCHAR".to_string(),
+                            }
+                        } else {
+                            DataType::VarChar {
+                                length: None,
+                                parenthesized_length: false,
+                            }
                         }
                     } else if self.check_identifier("MAX") {
                         self.skip();
@@ -40870,15 +40895,27 @@ impl Parser {
                     } else {
                         let n = self.expect_number()? as u32;
                         self.expect(TokenType::RParen)?;
-                        DataType::VarChar {
-                            length: Some(n),
-                            parenthesized_length: false,
+                        if is_nvarchar {
+                            DataType::Custom {
+                                name: format!("NVARCHAR({})", n),
+                            }
+                        } else {
+                            DataType::VarChar {
+                                length: Some(n),
+                                parenthesized_length: false,
+                            }
                         }
                     }
                 } else {
-                    DataType::VarChar {
-                        length: None,
-                        parenthesized_length: false,
+                    if is_nvarchar {
+                        DataType::Custom {
+                            name: "NVARCHAR".to_string(),
+                        }
+                    } else {
+                        DataType::VarChar {
+                            length: None,
+                            parenthesized_length: false,
+                        }
                     }
                 }
             }

@@ -203,13 +203,12 @@ pub fn identity_known_failures() -> HashSet<String> {
     HashSet::new()
 }
 
-/// Load dialect identity test known failures
+/// Load dialect identity tests that should be skipped for now.
 pub fn dialect_identity_known_failures(_dialect: &str) -> HashSet<String> {
-    // Start with an empty set - failures will be added per dialect
     HashSet::new()
 }
 
-/// Load transpilation test known failures
+/// Load transpilation tests that should be skipped for now.
 pub fn transpilation_known_failures(_source: &str, _target: &str) -> HashSet<String> {
     HashSet::new()
 }

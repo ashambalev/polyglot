@@ -371,6 +371,7 @@ impl FabricDialect {
                 // Parse out precision and scale if present: "TYPENAME(n)" or "TYPENAME(n, m)"
                 let (base_name, precision, scale) =
                     TSQLDialect::parse_type_precision_and_scale(&upper);
+                let has_max_length = upper.contains("(MAX)");
 
                 match base_name.as_str() {
                     // DATETIME -> DATETIME2(6)
@@ -445,7 +446,11 @@ impl FabricDialect {
 
                     // NCHAR -> CHAR (with length preserved)
                     "NCHAR" => {
-                        if let Some(len) = precision {
+                        if has_max_length {
+                            DataType::Custom {
+                                name: "CHAR(MAX)".to_string(),
+                            }
+                        } else if let Some(len) = precision {
                             DataType::Custom {
                                 name: format!("CHAR({})", len),
                             }
@@ -458,7 +463,11 @@ impl FabricDialect {
 
                     // NVARCHAR -> VARCHAR (with length preserved)
                     "NVARCHAR" => {
-                        if let Some(len) = precision {
+                        if has_max_length {
+                            DataType::Custom {
+                                name: "VARCHAR(MAX)".to_string(),
+                            }
+                        } else if let Some(len) = precision {
                             DataType::Custom {
                                 name: format!("VARCHAR({})", len),
                             }

@@ -148,6 +148,13 @@ describe('Expression helpers', () => {
     expect(cast(col('id'), 'VARCHAR').toSql()).toBe('CAST(id AS VARCHAR)');
   });
 
+  it('cast() expression generation honors dialect', () => {
+    const expr = cast(col('x'), 'NVARCHAR(MAX)');
+
+    expect(expr.toSql('tsql')).toBe('CAST(x AS NVARCHAR(MAX))');
+    expect(expr.toSql('fabric')).toBe('CAST(x AS VARCHAR(MAX))');
+  });
+
   it('alias() creates AS expression', () => {
     expect(alias(col('name'), 'n').toSql()).toBe('name AS n');
   });
@@ -562,6 +569,16 @@ describe('CaseBuilder', () => {
       .toSql();
     expect(sql).toBe(
       "CASE status WHEN 1 THEN 'active' WHEN 0 THEN 'inactive' END",
+    );
+  });
+
+  it('toSql() honors dialect', () => {
+    const sql = caseWhen()
+      .when(col('kind').eq(lit('n')), cast(col('x'), 'NVARCHAR(MAX)'))
+      .toSql('fabric');
+
+    expect(sql).toBe(
+      "CASE WHEN kind = 'n' THEN CAST(x AS VARCHAR(MAX)) END",
     );
   });
 

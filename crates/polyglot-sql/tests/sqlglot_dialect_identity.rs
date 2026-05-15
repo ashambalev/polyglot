@@ -109,6 +109,10 @@ fn run_dialect_identity_tests_impl(dialect_name: &str) -> TestResults {
 
     for (i, test) in fixture.identity.iter().enumerate() {
         let test_id = format!("{}:identity:{}", dialect_name, i);
+        if known.contains(&test_id) {
+            results.known_failures += 1;
+            continue;
+        }
         let result = dialect_identity_test(&test.sql, test.expected.as_deref(), dialect_type);
         results.record_with_sql(&test_id, &test.sql, i, result);
     }

@@ -62,6 +62,51 @@ fn test_transpile_happy_path() {
 }
 
 #[test]
+fn test_transpile_tsql_identity_preserves_nvarchar() {
+    let sql = c("SELECT CAST(x AS NVARCHAR(MAX))");
+    let from = c("tsql");
+    let to = c("tsql");
+
+    let (status, data, error) =
+        consume_result(polyglot_transpile(sql.as_ptr(), from.as_ptr(), to.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let statements: Vec<String> =
+        serde_json::from_str(&data.expect("missing data")).expect("invalid JSON");
+    assert_eq!(statements, vec!["SELECT CAST(x AS NVARCHAR(MAX))"]);
+}
+
+#[test]
+fn test_transpile_tsql_to_fabric_maps_nvarchar_to_varchar() {
+    let sql = c("SELECT CAST(x AS NVARCHAR(MAX))");
+    let from = c("tsql");
+    let to = c("fabric");
+
+    let (status, data, error) =
+        consume_result(polyglot_transpile(sql.as_ptr(), from.as_ptr(), to.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let statements: Vec<String> =
+        serde_json::from_str(&data.expect("missing data")).expect("invalid JSON");
+    assert_eq!(statements, vec!["SELECT CAST(x AS VARCHAR(MAX))"]);
+}
+
+#[test]
+fn test_transpile_snowflake_timestamp_variant_names_match_sqlglot_aliases() {
+    let sql = c("SELECT CURRENT_TIMESTAMP()::TIMESTAMPNTZ");
+    let from = c("snowflake");
+    let to = c("snowflake");
+
+    let (status, data, error) =
+        consume_result(polyglot_transpile(sql.as_ptr(), from.as_ptr(), to.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let statements: Vec<String> =
+        serde_json::from_str(&data.expect("missing data")).expect("invalid JSON");
+    assert_eq!(
+        statements,
+        vec!["SELECT CAST(CURRENT_TIMESTAMP() AS TIMESTAMPNTZ)"]
+    );
+}
+
+#[test]
 fn test_transpile_invalid_sql() {
     let sql = c("SELECT FROM");
     let from = c("mysql");

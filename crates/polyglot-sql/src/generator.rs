@@ -24029,6 +24029,12 @@ impl Generator {
             } => {
                 // Dialect-specific timestamp type mappings
                 match self.config.dialect {
+                    Some(DialectType::Snowflake) if *timezone => {
+                        self.write_keyword("TIMESTAMPTZ");
+                        if let Some(p) = precision {
+                            self.write(&format!("({})", p));
+                        }
+                    }
                     Some(DialectType::ClickHouse) => {
                         self.write("DateTime");
                         if let Some(p) = precision {
@@ -24596,6 +24602,52 @@ impl Generator {
                     {
                         // MySQL doesn't support TIMESTAMPTZ/TIMESTAMPLTZ, use TIMESTAMP
                         self.write_keyword("TIMESTAMP");
+                    }
+                    Some(DialectType::Snowflake) => {
+                        let (base_upper, suffix) = if let Some(idx) = name.find('(') {
+                            (name_upper[..idx].to_string(), &name[idx..])
+                        } else {
+                            (name_upper.clone(), "")
+                        };
+
+                        match base_upper.as_str() {
+                            "TIMESTAMPNTZ" | "TIMESTAMP_NTZ" => {
+                                self.write_keyword("TIMESTAMPNTZ");
+                                self.write(suffix);
+                            }
+                            "TIMESTAMPLTZ" | "TIMESTAMP_LTZ" => {
+                                self.write_keyword("TIMESTAMPLTZ");
+                                self.write(suffix);
+                            }
+                            "TIMESTAMPTZ" | "TIMESTAMP_TZ" => {
+                                self.write_keyword("TIMESTAMPTZ");
+                                self.write(suffix);
+                            }
+                            _ => self.write(name),
+                        }
+                    }
+                    Some(DialectType::Fabric) => {
+                        let (base_upper, args_str) = if let Some(idx) = name.find('(') {
+                            (name_upper[..idx].to_string(), Some(&name[idx..]))
+                        } else {
+                            (name_upper.clone(), None)
+                        };
+
+                        match base_upper.as_str() {
+                            "NVARCHAR" => {
+                                self.write_keyword("VARCHAR");
+                                if let Some(args) = args_str {
+                                    self.write(args);
+                                }
+                            }
+                            "NCHAR" => {
+                                self.write_keyword("CHAR");
+                                if let Some(args) = args_str {
+                                    self.write(args);
+                                }
+                            }
+                            _ => self.write(name),
+                        }
                     }
                     Some(DialectType::TSQL) if name_upper == "VARIANT" => {
                         self.write_keyword("SQL_VARIANT");
