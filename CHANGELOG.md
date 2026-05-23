@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.4.1] - 2026-05-23
+
+### Changed
+- `DropIndex.name` now uses the existing `TableRef` AST shape instead of a
+  flattened `Identifier`, preserving qualified index targets and per-part
+  quoted identifier metadata.
+- The `semantic` Cargo feature no longer implies `generate`, so semantic-only
+  Rust builds can compile without pulling in SQL generation.
+
+### Fixed
+- PostgreSQL `DROP INDEX` generation now preserves quoted mixed-case index
+  names, including identity transpilation such as
+  `DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_"`.
+- SQLite-to-PostgreSQL transpilation now converts backtick-quoted `DROP INDEX`
+  names to PostgreSQL double-quoted identifiers instead of emitting an
+  unquoted, lowercased-by-PostgreSQL name.
+- Qualified quoted `DROP INDEX` targets such as `"public"."IdxName"` now
+  round-trip without losing quote state on individual name parts.
+- `openlineage` and `semantic` feature combinations without `generate` now
+  compile; default/full builds continue to emit the same generated SQL
+  transformation descriptions as before.
+
 ## [0.4.0] - 2026-05-22
 
 ### Added
@@ -393,6 +415,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.4.1]: https://github.com/tobilg/polyglot/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tobilg/polyglot/compare/v0.3.12...v0.4.0
 [0.3.12]: https://github.com/tobilg/polyglot/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/tobilg/polyglot/compare/v0.3.10...v0.3.11
