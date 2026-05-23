@@ -1176,7 +1176,7 @@ fn extract_subquery_to_cte(
 ) -> Expression {
     match source {
         Expression::Subquery(sub) => {
-            let inner_sql = crate::generator::Generator::sql(&sub.this).unwrap_or_default();
+            let subquery_key = subquery_identity_key(&sub.this);
             let alias_name = sub
                 .alias
                 .as_ref()
@@ -1184,7 +1184,7 @@ fn extract_subquery_to_cte(
                 .unwrap_or_default();
 
             // Check for duplicate subquery (reuse existing CTE)
-            if let Some(existing_name) = seen_sql.get(&inner_sql) {
+            if let Some(existing_name) = seen_sql.get(&subquery_key) {
                 let mut tref = TableRef::new(existing_name.as_str());
                 if !alias_name.is_empty() {
                     tref.alias = Some(Identifier::new(&alias_name));
@@ -1199,7 +1199,7 @@ fn extract_subquery_to_cte(
                 find_new_name(taken, "_cte")
             };
             taken.insert(cte_name.clone());
-            seen_sql.insert(inner_sql, cte_name.clone());
+            seen_sql.insert(subquery_key, cte_name.clone());
 
             // Create CTE
             new_ctes.push(Cte {
@@ -1221,6 +1221,22 @@ fn extract_subquery_to_cte(
         }
         other => other,
     }
+}
+
+fn subquery_identity_key(expr: &Expression) -> String {
+    #[cfg(feature = "generate")]
+    {
+        crate::generator::Generator::sql(expr).unwrap_or_else(|_| structural_subquery_key(expr))
+    }
+
+    #[cfg(not(feature = "generate"))]
+    {
+        structural_subquery_key(expr)
+    }
+}
+
+fn structural_subquery_key(expr: &Expression) -> String {
+    serde_json::to_string(expr).unwrap_or_else(|_| format!("{expr:?}"))
 }
 
 /// Unnest correlated subqueries where possible.

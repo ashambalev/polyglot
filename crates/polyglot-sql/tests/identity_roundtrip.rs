@@ -777,6 +777,7 @@ mod ddl_drop_tests {
     #[test]
     fn test_drop_index() {
         assert_roundtrip("DROP INDEX a.b.c");
+        assert_roundtrip(r#"DROP INDEX "a"."B""#);
     }
 
     #[test]

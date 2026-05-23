@@ -330,6 +330,22 @@ mod ddl_tests {
             roundtrip("DROP INDEX IF EXISTS idx"),
             "DROP INDEX IF EXISTS idx"
         );
+        assert_eq!(
+            transpile(
+                r#"DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_""#,
+                DialectType::PostgreSQL,
+                DialectType::PostgreSQL
+            ),
+            r#"DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_""#
+        );
+        assert_eq!(
+            transpile(
+                "DROP INDEX IF EXISTS `idx_tokenKey__pb_users_auth_`",
+                DialectType::SQLite,
+                DialectType::PostgreSQL
+            ),
+            r#"DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_""#
+        );
     }
 
     #[test]

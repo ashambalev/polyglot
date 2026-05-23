@@ -550,9 +550,22 @@ fn input_fields_for_output(
     let description = output_field
         .expression
         .as_ref()
-        .map(|expr| expr.sql_for(options.dialect));
+        .and_then(|expr| transformation_description(expr, options.dialect));
 
     terminal_fields_to_openlineage(terminals, subtype, description, options, warnings)
+}
+
+fn transformation_description(expr: &Expression, dialect: DialectType) -> Option<String> {
+    #[cfg(feature = "generate")]
+    {
+        Some(expr.sql_for(dialect))
+    }
+
+    #[cfg(not(feature = "generate"))]
+    {
+        let _ = (expr, dialect);
+        None
+    }
 }
 
 fn terminal_fields_to_openlineage(

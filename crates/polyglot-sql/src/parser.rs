@@ -18529,12 +18529,9 @@ impl Parser {
 
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
 
-        // Parse potentially qualified index name (a.b.c)
-        let mut name_parts = vec![self.expect_identifier()?];
-        while self.match_token(TokenType::Dot) {
-            name_parts.push(self.expect_identifier()?);
-        }
-        let name = Identifier::new(name_parts.join("."));
+        // Parse potentially qualified index name (a.b.c), preserving quoted
+        // state independently for every part.
+        let name = self.parse_table_ref()?;
 
         // Optional ON table
         let table = if self.match_token(TokenType::On) {
@@ -60646,7 +60643,24 @@ OPTIONS (
 
         if let Expression::DropIndex(di) = &result[0] {
             assert!(di.if_exists);
+            assert_eq!(di.name.name.name, "idx_email");
+            assert!(!di.name.name.quoted);
             assert!(di.table.is_some());
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_index_preserves_qualified_quoted_name() {
+        let result = Parser::parse_sql(r#"DROP INDEX IF EXISTS "public"."IdxEmail""#).unwrap();
+
+        if let Expression::DropIndex(di) = &result[0] {
+            let schema = di.name.schema.as_ref().expect("schema");
+            assert_eq!(schema.name, "public");
+            assert!(schema.quoted);
+            assert_eq!(di.name.name.name, "IdxEmail");
+            assert!(di.name.name.quoted);
+        } else {
+            panic!("Expected DropIndex");
         }
     }
 

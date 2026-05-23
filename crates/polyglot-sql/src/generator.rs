@@ -11108,7 +11108,7 @@ impl Generator {
         }
 
         self.write_space();
-        self.generate_identifier(&di.name)?;
+        self.generate_table(&di.name)?;
 
         if let Some(ref table) = di.table {
             self.write_space();
@@ -38852,6 +38852,15 @@ mod tests {
     fn test_drop_index() {
         let result = roundtrip("DROP INDEX idx_name");
         assert_eq!(result, "DROP INDEX idx_name");
+
+        let result = roundtrip(r#"DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_""#);
+        assert_eq!(
+            result,
+            r#"DROP INDEX IF EXISTS "idx_tokenKey__pb_users_auth_""#
+        );
+
+        let result = roundtrip(r#"DROP INDEX "public"."IdxMixed""#);
+        assert_eq!(result, r#"DROP INDEX "public"."IdxMixed""#);
     }
 
     #[test]

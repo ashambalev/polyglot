@@ -8346,7 +8346,7 @@ pub struct IndexColumn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct DropIndex {
-    pub name: Identifier,
+    pub name: TableRef,
     pub table: Option<TableRef>,
     pub if_exists: bool,
     /// PostgreSQL CONCURRENTLY modifier
@@ -8357,7 +8357,7 @@ pub struct DropIndex {
 impl DropIndex {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            name: Identifier::new(name),
+            name: TableRef::new(name),
             table: None,
             if_exists: false,
             concurrently: false,
