@@ -22,7 +22,7 @@ export async function initWasmModule(
     .then(() => {
       initialized = true;
     })
-    .catch((error) => {
+    .catch((error: unknown) => {
       initPromise = undefined;
       throw error;
     });
