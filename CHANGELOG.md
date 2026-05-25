@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.4.2] - 2026-05-25
+
+### Added
+- TypeScript SDK manual WASM loader entry point at
+  `@polyglot-sql/sdk/manual`, allowing bundlers such as esbuild to initialize
+  the SDK with an explicitly imported WASM URL.
+- Public TypeScript SDK WASM asset export at
+  `@polyglot-sql/sdk/polyglot_sql.wasm`, published as
+  `dist/polyglot_sql.wasm`.
+- SDK bundler smoke coverage for esbuild, package export resolution, Node ESM,
+  and CommonJS loading.
+
+### Changed
+- TypeScript SDK builds are now split into browser/default ESM, Node ESM,
+  CommonJS, CDN ESM, and manual-loader artifacts so each runtime uses an
+  appropriate WASM loading path.
+- SDK, playground, and CI build flows now generate both wasm-bindgen bundler
+  and web wrappers, verify the renamed WASM artifact set, and run the bundler
+  smoke checks.
+- TypeScript SDK documentation now includes explicit bundler guidance for Vite,
+  esbuild, Next.js/webpack, Node ESM, CommonJS, and CDN/self-hosted usage.
+
+### Fixed
+- Browser/default TypeScript SDK bundles no longer include Node `node:fs` /
+  `node:url` compatibility code, fixing browser bundlers that reject Node
+  built-ins.
+- esbuild users can now bundle without manually copying opaque SDK internals by
+  importing the documented `polyglot_sql.wasm` asset and using the manual
+  loader entry.
+
 ## [0.4.1] - 2026-05-23
 
 ### Changed
@@ -415,6 +445,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.4.2]: https://github.com/tobilg/polyglot/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tobilg/polyglot/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tobilg/polyglot/compare/v0.3.12...v0.4.0
 [0.3.12]: https://github.com/tobilg/polyglot/compare/v0.3.11...v0.3.12

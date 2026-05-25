@@ -432,8 +432,8 @@ copy-bindings:
 
 # Build WASM package (full, all dialects)
 build-wasm:
-	cd crates/polyglot-sql-wasm && wasm-pack build --target bundler --release --out-dir ../../packages/sdk/wasm
-	cd packages/sdk && npm run build
+	cd packages/sdk && pnpm run build:wasm
+	cd packages/sdk && pnpm run build
 
 # Build everything (release-safe order)
 build-all:
@@ -591,6 +591,8 @@ clean:
 	rm -rf crates/polyglot-sql-wasm/pkg
 	rm -rf packages/sdk/dist
 	rm -rf packages/sdk/node_modules
+	rm -rf packages/sdk/wasm
+	rm -rf packages/sdk/wasm-web
 	rm -rf tools/sqlglot-compare/dist
 	rm -rf tools/sqlglot-compare/node_modules
 	rm -rf packages/playground/dist

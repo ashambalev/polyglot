@@ -1127,6 +1127,45 @@ mod tests {
     }
 
     #[test]
+    fn omits_bigquery_safe_namespace_from_column_lineage_issue207() {
+        let mut opts = options();
+        opts.dialect = DialectType::BigQuery;
+
+        let result = openlineage_column_lineage(
+            r#"
+WITH import_cte AS (
+  SELECT timestamp, data, operation
+  FROM `project`.`dataset`.`source_table`
+),
+transform_cte AS (
+  SELECT
+    timestamp,
+    SAFE.PARSE_JSON(data) AS json_data
+  FROM import_cte
+)
+SELECT json_data FROM transform_cte
+"#,
+            &opts,
+        )
+        .expect("lineage");
+        let field = result.facet.fields.get("json_data").expect("json_data");
+
+        assert!(
+            field.input_fields.iter().any(|input| input.field == "data"),
+            "expected data input field, got {:?}",
+            field.input_fields
+        );
+        assert!(
+            !field
+                .input_fields
+                .iter()
+                .any(|input| input.field.eq_ignore_ascii_case("safe")),
+            "did not expect SAFE namespace as input field, got {:?}",
+            field.input_fields
+        );
+    }
+
+    #[test]
     fn emits_aggregation_column_lineage() {
         let result =
             openlineage_column_lineage("SELECT SUM(amount) AS total FROM orders", &options())

@@ -714,7 +714,7 @@ fn to_node_inner(
     }
 
     // 7. Column references — trace each column to its source
-    let col_refs = find_column_refs_in_expr(&select_expr);
+    let col_refs = find_column_refs_in_expr(&select_expr, dialect);
     for col_ref in col_refs {
         let col_name = &col_ref.column;
         if let Some(ref table_id) = col_ref.table {
@@ -1265,13 +1265,30 @@ struct SimpleColumnRef {
 }
 
 /// Find all column references in an expression (does not recurse into subqueries).
-fn find_column_refs_in_expr(expr: &Expression) -> Vec<SimpleColumnRef> {
+fn find_column_refs_in_expr(
+    expr: &Expression,
+    dialect: Option<DialectType>,
+) -> Vec<SimpleColumnRef> {
     let mut refs = Vec::new();
-    collect_column_refs(expr, &mut refs);
+    collect_column_refs(expr, dialect, &mut refs);
     refs
 }
 
-fn collect_column_refs(expr: &Expression, refs: &mut Vec<SimpleColumnRef>) {
+fn is_bigquery_safe_namespace_receiver(expr: &Expression) -> bool {
+    match expr {
+        Expression::Column(col) => {
+            col.table.is_none() && !col.name.quoted && col.name.name.eq_ignore_ascii_case("SAFE")
+        }
+        Expression::Identifier(id) => !id.quoted && id.name.eq_ignore_ascii_case("SAFE"),
+        _ => false,
+    }
+}
+
+fn collect_column_refs(
+    expr: &Expression,
+    dialect: Option<DialectType>,
+    refs: &mut Vec<SimpleColumnRef>,
+) {
     let mut stack: Vec<&Expression> = vec![expr];
 
     while let Some(current) = stack.pop() {
@@ -1638,7 +1655,11 @@ fn collect_column_refs(expr: &Expression, refs: &mut Vec<SimpleColumnRef>) {
                 stack.push(&d.this);
             }
             Expression::MethodCall(m) => {
-                stack.push(&m.this);
+                if !matches!(dialect, Some(DialectType::BigQuery))
+                    || !is_bigquery_safe_namespace_receiver(&m.this)
+                {
+                    stack.push(&m.this);
+                }
                 for arg in &m.args {
                     stack.push(arg);
                 }
@@ -2986,6 +3007,71 @@ mod tests {
             names.iter().any(|n| n == "users.name"),
             "Expected users.name in downstream, got: {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn test_lineage_bigquery_safe_namespace_issue207() {
+        let query = r#"
+WITH import_cte AS (
+  SELECT timestamp, data, operation
+  FROM `project`.`dataset`.`source_table`
+),
+transform_cte AS (
+  SELECT
+    timestamp,
+    SAFE.PARSE_JSON(data) AS json_data
+  FROM import_cte
+)
+SELECT json_data FROM transform_cte
+"#;
+        let expr = parse_one(query, DialectType::BigQuery).expect("parse");
+        let node = lineage("json_data", &expr, Some(DialectType::BigQuery), false)
+            .expect("lineage should resolve SAFE.PARSE_JSON arguments");
+        let names: Vec<_> = node.walk().map(|n| n.name.clone()).collect();
+
+        assert!(
+            names.iter().any(|name| name == "source_table.data"),
+            "expected source_table.data in lineage, got {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("import_cte.safe")),
+            "did not expect SAFE namespace receiver in lineage, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_lineage_bigquery_safe_namespace_method_call_guard() {
+        let expr = parse("SELECT SAFE.PARSE_JSON(data) AS json_data FROM t");
+        let node = lineage("json_data", &expr, Some(DialectType::BigQuery), false)
+            .expect("lineage should resolve SAFE.PARSE_JSON arguments");
+        let names: Vec<_> = node.walk().map(|n| n.name.clone()).collect();
+
+        assert!(
+            names.iter().any(|name| name == "t.data"),
+            "expected t.data in lineage, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.eq_ignore_ascii_case("t.safe")),
+            "did not expect SAFE namespace receiver in lineage, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_lineage_method_call_receiver_control() {
+        let expr = parse("SELECT obj.METHOD(arg) AS out FROM t");
+        let node = lineage("out", &expr, None, false).expect("lineage");
+        let names: Vec<_> = node.walk().map(|n| n.name.clone()).collect();
+
+        assert!(
+            names.iter().any(|name| name == "t.obj"),
+            "expected ordinary method receiver to remain in lineage, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "t.arg"),
+            "expected method argument in lineage, got {names:?}"
         );
     }
 

@@ -154,7 +154,7 @@ jobs:
         run: cargo clean -p polyglot-sql-wasm
 
       - name: Build WASM
-        run: cd crates/polyglot-sql-wasm && wasm-pack build --target bundler --release --out-dir ../../packages/sdk/wasm
+        run: cd packages/sdk && pnpm run build:wasm
 
       - name: Generate TypeScript bindings
         run: make generate-bindings
@@ -170,11 +170,14 @@ jobs:
         run: |
           expected_version="${GITHUB_REF_NAME#v}"
           cd packages/sdk
-          actual_version="$(node -e "import('./dist/index.js').then((m) => process.stdout.write(m.getVersion()))")"
+          actual_version="$(node -e "import('./dist/index.node.js').then((m) => process.stdout.write(m.getVersion()))")"
           if [ "$actual_version" != "$expected_version" ]; then
             echo "Version mismatch: tag=$expected_version sdk/wasm=$actual_version"
             exit 1
           fi
+
+      - name: Test SDK bundler integration
+        run: cd packages/sdk && pnpm run test:bundlers
 
       - name: Test SDK
         run: cd packages/sdk && pnpm test

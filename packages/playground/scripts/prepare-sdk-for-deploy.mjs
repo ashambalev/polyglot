@@ -30,16 +30,31 @@ const sdkDir = resolve(rootDir, "packages/sdk");
 
 const sdkPackageJsonPath = resolve(sdkDir, "package.json");
 const sdkWasmPackageJsonPath = resolve(sdkDir, "wasm/package.json");
-const sdkDistIndexPath = resolve(sdkDir, "dist/index.js");
+const sdkDistIndexPath = resolve(sdkDir, "dist/index.node.js");
+const requiredDistFiles = [
+  "dist/index.js",
+  "dist/index.node.js",
+  "dist/index.cjs",
+  "dist/manual.js",
+  "dist/manual.d.ts",
+  "dist/polyglot_sql.wasm",
+  "dist/polyglot_sql.wasm.d.ts",
+  "dist/cdn/polyglot.esm.js",
+];
 
 const expectedVersion = readJson(sdkPackageJsonPath).version;
 const currentWasmVersion = existsSync(sdkWasmPackageJsonPath)
   ? readJson(sdkWasmPackageJsonPath).version
   : null;
 const currentDistVersion = await readDistVersion(sdkDistIndexPath);
+const hasRequiredDistFiles = requiredDistFiles.every((file) =>
+  existsSync(resolve(sdkDir, file)),
+);
 
 const needsBuild =
-  currentWasmVersion !== expectedVersion || currentDistVersion !== expectedVersion;
+  !hasRequiredDistFiles ||
+  currentWasmVersion !== expectedVersion ||
+  currentDistVersion !== expectedVersion;
 
 if (needsBuild) {
   console.log(
@@ -55,10 +70,15 @@ const finalWasmVersion = existsSync(sdkWasmPackageJsonPath)
   ? readJson(sdkWasmPackageJsonPath).version
   : null;
 const finalDistVersion = await readDistVersion(sdkDistIndexPath);
+const missingDistFiles = requiredDistFiles.filter((file) => !existsSync(resolve(sdkDir, file)));
 
-if (finalWasmVersion !== expectedVersion || finalDistVersion !== expectedVersion) {
+if (
+  missingDistFiles.length > 0 ||
+  finalWasmVersion !== expectedVersion ||
+  finalDistVersion !== expectedVersion
+) {
   throw new Error(
-    `[prepare:sdk] Version mismatch after prepare step: expected=${expectedVersion}, wasm=${finalWasmVersion ?? "missing"}, dist=${finalDistVersion ?? "missing"}`,
+    `[prepare:sdk] SDK artifact check failed after prepare step: expected=${expectedVersion}, wasm=${finalWasmVersion ?? "missing"}, dist=${finalDistVersion ?? "missing"}, missing=${missingDistFiles.join(", ") || "none"}`,
   );
 }
 

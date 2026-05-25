@@ -5,6 +5,7 @@ type WasmExtractPluginOptions = {
   wasmRelativePath: string;
   extractWasm: boolean;
   injectNodeCompat?: boolean;
+  emitWasmDts?: boolean;
 };
 
 const NODE_FILE_FETCH_COMPAT = [
@@ -25,7 +26,9 @@ const DATA_URL_REGEX = /(=\s*)(['"])data:application\/wasm;base64,([A-Za-z0-9+/=
 export function wasmExtractPlugin(options: WasmExtractPluginOptions): Plugin {
   const { wasmFilename, wasmRelativePath, extractWasm } = options;
   const injectNodeCompat = options.injectNodeCompat ?? true;
+  const emitWasmDts = options.emitWasmDts ?? false;
   let wroteWasm = false;
+  let wroteWasmDts = false;
 
   return {
     name: 'polyglot-wasm-extract',
@@ -49,6 +52,15 @@ export function wasmExtractPlugin(options: WasmExtractPluginOptions): Plugin {
             source: wasmBytes,
           });
           wroteWasm = true;
+        }
+
+        if (emitWasmDts && !wroteWasmDts) {
+          this.emitFile({
+            type: 'asset',
+            fileName: `${wasmFilename}.d.ts`,
+            source: 'declare const wasmUrl: string;\nexport default wasmUrl;\n',
+          });
+          wroteWasmDts = true;
         }
 
         item.code = item.code.replace(

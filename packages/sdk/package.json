@@ -1,6 +1,6 @@
 {
   "name": "@polyglot-sql/sdk",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "SQL dialect translator powered by WebAssembly",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -15,8 +15,23 @@
         "require": "./dist/index.d.cts"
       },
       "browser": "./dist/index.js",
+      "node": {
+        "import": "./dist/index.node.js",
+        "require": "./dist/index.cjs"
+      },
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./manual": {
+      "types": "./dist/manual.d.ts",
+      "browser": "./dist/manual.js",
+      "import": "./dist/manual.js",
+      "default": "./dist/manual.js"
+    },
+    "./polyglot_sql.wasm": {
+      "types": "./dist/polyglot_sql.wasm.d.ts",
+      "default": "./dist/polyglot_sql.wasm"
     },
     "./cdn": {
       "types": "./dist/index.d.ts",
@@ -29,15 +44,20 @@
   ],
   "scripts": {
     "build:bindings": "cd ../.. && make generate-bindings",
-    "build:wasm": "cd ../../crates/polyglot-sql-wasm && wasm-pack build --target bundler --release --out-dir ../../packages/sdk/wasm",
+    "build:wasm:bundler": "cd ../../crates/polyglot-sql-wasm && wasm-pack build --target bundler --release --out-dir ../../packages/sdk/wasm",
+    "build:wasm:web": "cd ../../crates/polyglot-sql-wasm && wasm-pack build --target web --release --out-dir ../../packages/sdk/wasm-web",
+    "build:wasm": "pnpm run build:wasm:bundler && pnpm run build:wasm:web",
     "build:esm": "vite build",
+    "build:node": "vite build --config vite.config.node.ts",
     "build:cjs": "vite build --config vite.config.cjs.ts && cp dist/index.d.ts dist/index.d.cts",
+    "build:manual": "vite build --config vite.config.manual.ts",
     "build:umd": "vite build --config vite.config.umd.ts",
     "build:dialect": "vite build --config vite.config.dialect.ts",
     "build:dialects": "for d in postgresql mysql bigquery snowflake duckdb tsql clickhouse; do POLYGLOT_DIALECT=$d pnpm run build:dialect; done",
-    "build": "pnpm run build:esm && pnpm run build:cjs && pnpm run build:umd",
+    "build": "pnpm run build:esm && pnpm run build:node && pnpm run build:cjs && pnpm run build:manual && pnpm run build:umd",
     "build:all": "pnpm run build && pnpm run build:dialects",
     "test": "vitest run",
+    "test:bundlers": "node scripts/test-bundlers.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
@@ -76,6 +96,7 @@
     "@biomejs/biome": "^2.3.14",
     "@types/node": "^25.0.9",
     "@vitest/coverage-v8": "^4.0.18",
+    "esbuild": "^0.27.3",
     "typescript": "^5.7.0",
     "vite": "7.3.1",
     "vite-plugin-dts": "^4.5.0",

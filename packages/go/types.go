@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.4.1"
+const sdkVersion = "0.4.2"
 
 func Version() string {
 	return sdkVersion

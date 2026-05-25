@@ -81,6 +81,7 @@ tools/sqlglot-compare/node_modules
 
 # WASM build output
 packages/sdk/wasm/
+packages/sdk/wasm-web/
 crates/polyglot-sql-wasm/pkg/
 crates/polyglot-sql-wasm/pkg-bundler/
 crates/polyglot-sql-wasm/pkg-node/

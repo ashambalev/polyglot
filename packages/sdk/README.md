@@ -807,7 +807,7 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 
 ## CDN Usage
 
-For browser use without a bundler:
+For browser use without a bundler, load the CDN ESM build. It resolves `../polyglot_sql.wasm` relative to `dist/cdn/polyglot.esm.js`, so self-hosted deployments must serve `dist/polyglot_sql.wasm` alongside the CDN bundle.
 
 ```html
 <script type="module">
@@ -860,11 +860,11 @@ console.log(isInitialized()); // true
 
 ## Bundler Configuration
 
-The ESM build uses **top-level `await`** (ES2022) and **`new URL("...", import.meta.url)`** for WASM loading. Both are web standards supported by all modern bundlers, but some require explicit configuration.
+The SDK publishes separate browser, Node, CommonJS, CDN, and manual-loader entry points. The default browser ESM build uses **top-level `await`** and a sibling `polyglot_sql.wasm` asset. Node ESM and CommonJS resolve the same asset from disk. For bundlers that do not copy WASM files from `new URL(..., import.meta.url)` references, use the manual entry point and import `@polyglot-sql/sdk/polyglot_sql.wasm` explicitly.
 
 ### Vite
 
-Vite works out of the box with `vite-plugin-wasm`. This is the setup used by the [Polyglot Playground](https://github.com/tobilg/polyglot):
+Vite works with the default SDK import and `vite-plugin-wasm`. This is the setup used by the [Polyglot Playground](https://github.com/tobilg/polyglot):
 
 ```typescript
 // vite.config.ts
@@ -882,9 +882,47 @@ export default defineConfig({
 });
 ```
 
+Application code can use the regular entry point:
+
+```typescript
+import { transpile, Dialect } from '@polyglot-sql/sdk';
+```
+
+### esbuild
+
+esbuild does not copy WASM files referenced only through `new URL(..., import.meta.url)`. Use the manual entry point and import the WASM asset directly:
+
+```typescript
+import wasmUrl from '@polyglot-sql/sdk/polyglot_sql.wasm';
+import { init, transpile, Dialect } from '@polyglot-sql/sdk/manual';
+
+await init({ wasmUrl });
+
+const result = transpile('SELECT IFNULL(a, b)', Dialect.MySQL, Dialect.PostgreSQL);
+console.log(result.sql?.[0]);
+```
+
+Configure esbuild to emit the WASM file:
+
+```javascript
+import * as esbuild from 'esbuild';
+
+await esbuild.build({
+  entryPoints: ['src/main.ts'],
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  target: 'es2022',
+  outdir: 'dist',
+  loader: {
+    '.wasm': 'file',
+  },
+});
+```
+
 ### Next.js
 
-Next.js requires enabling WebAssembly experiments in the webpack config:
+Next.js uses webpack under the hood. Use the default SDK import and enable the WebAssembly experiments in the webpack config:
 
 ```javascript
 // next.config.js
@@ -957,13 +995,49 @@ module.exports = {
 
 `topLevelAwait` is enabled by default since webpack 5.83.0. `asyncWebAssembly` must be set explicitly.
 
+### Node.js
+
+ESM can use the default entry point. Node resolves the `"node"` export to a build that loads `polyglot_sql.wasm` from disk:
+
+```javascript
+import { transpile, Dialect } from '@polyglot-sql/sdk';
+
+const result = transpile('SELECT IFNULL(a, b)', Dialect.MySQL, Dialect.PostgreSQL);
+console.log(result.sql?.[0]);
+```
+
+CommonJS requires explicit initialization because `require()` is synchronous:
+
+```javascript
+const { init, transpile, Dialect } = require('@polyglot-sql/sdk');
+
+await init();
+
+const result = transpile('SELECT IFNULL(a, b)', Dialect.MySQL, Dialect.PostgreSQL);
+console.log(result.sql?.[0]);
+```
+
+### CDN
+
+The CDN ESM build expects `polyglot_sql.wasm` to be served next to the package `dist` files:
+
+```html
+<script type="module">
+  import polyglot from 'https://unpkg.com/@polyglot-sql/sdk/dist/cdn/polyglot.esm.js';
+
+  const result = polyglot.transpile('SELECT 1', polyglot.Dialect.Generic, polyglot.Dialect.PostgreSQL);
+  console.log(result.sql[0]);
+</script>
+```
+
 ### Troubleshooting
 
-If you see `undefined` exports (e.g., `Dialect` is `undefined`) or errors about `require("fs")`:
+If you see missing WASM, `undefined` exports, or Node built-in resolution errors:
 
-1. Make sure `asyncWebAssembly` and `topLevelAwait` experiments are enabled in your bundler config
-2. Ensure the bundler is resolving the ESM build (the `"import"` or `"browser"` export condition), not the CJS build which uses Node.js APIs
-3. For SSR frameworks (Next.js, Nuxt), check that the `.wasm` file is correctly included in the server build output
+1. For browser builds, ensure the bundler resolves the `"browser"` or `"import"` export, not the CommonJS build.
+2. For esbuild, use `@polyglot-sql/sdk/manual` with the `@polyglot-sql/sdk/polyglot_sql.wasm` asset export.
+3. For webpack-based SSR frameworks, verify the emitted `.wasm` file is present in both client and server build outputs.
+4. Keep the build target at ES2022 or newer so top-level `await` is preserved.
 
 ## License
 

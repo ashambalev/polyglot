@@ -1588,6 +1588,38 @@ mod tests {
     }
 
     #[test]
+    fn test_safe_namespace_parses_as_function() {
+        let expr = parse_one(
+            "SELECT SAFE.PARSE_JSON(data) AS json_data FROM t",
+            DialectType::BigQuery,
+        )
+        .expect("parse");
+
+        let Expression::Select(select) = expr else {
+            panic!("expected SELECT");
+        };
+        let Expression::Alias(alias) = &select.expressions[0] else {
+            panic!("expected alias");
+        };
+        let Expression::Function(function) = &alias.this else {
+            panic!("expected SAFE namespace call to parse as Function");
+        };
+
+        assert_eq!(function.name, "SAFE.PARSE_JSON");
+        assert_eq!(function.args.len(), 1);
+    }
+
+    #[test]
+    fn test_safe_namespace_identity() {
+        bigquery_identity("SAFE.PARSE_JSON(data)", "SAFE.PARSE_JSON(data)");
+        bigquery_identity(
+            "SAFE.PARSE_DATE('%Y-%m-%d', date_col)",
+            "SAFE.PARSE_DATE('%F', date_col)",
+        );
+        bigquery_identity("SAFE.DIVIDE(a, b)", "SAFE.DIVIDE(a, b)");
+    }
+
+    #[test]
     fn test_cast_char_to_string() {
         bigquery_identity("CAST(x AS CHAR)", "CAST(x AS STRING)");
     }

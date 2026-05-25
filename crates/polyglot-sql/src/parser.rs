@@ -619,6 +619,39 @@ impl Parser {
         parser.parse()
     }
 
+    fn is_bigquery_safe_namespace_receiver(expr: &Expression) -> bool {
+        match expr {
+            Expression::Column(col) => {
+                col.table.is_none()
+                    && !col.name.quoted
+                    && col.name.name.eq_ignore_ascii_case("SAFE")
+            }
+            Expression::Identifier(id) => !id.quoted && id.name.eq_ignore_ascii_case("SAFE"),
+            _ => false,
+        }
+    }
+
+    fn parse_method_call_expression(
+        &self,
+        this: Expression,
+        method: Identifier,
+        args: Vec<Expression>,
+    ) -> Expression {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::BigQuery)
+        ) && Self::is_bigquery_safe_namespace_receiver(&this)
+            && !method.quoted
+        {
+            return Expression::Function(Box::new(Function::new(
+                format!("SAFE.{}", method.name),
+                args,
+            )));
+        }
+
+        Expression::MethodCall(Box::new(MethodCall { this, method, args }))
+    }
+
     /// Parse all remaining statements from the token stream.
     ///
     /// Consumes tokens until the end of input, splitting on semicolons.
@@ -30471,18 +30504,15 @@ impl Parser {
                     self.parse_function_arguments()?
                 };
                 self.expect(TokenType::RParen)?;
-                let method_call = Expression::MethodCall(Box::new(MethodCall {
-                    this: Expression::boxed_column(Column {
-                        name: ident.clone(),
-                        table: None,
-                        join_mark: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                        inferred_type: None,
-                    }),
-                    method: col_ident,
-                    args,
-                }));
+                let this = Expression::boxed_column(Column {
+                    name: ident.clone(),
+                    table: None,
+                    join_mark: false,
+                    trailing_comments: Vec::new(),
+                    span: None,
+                    inferred_type: None,
+                });
+                let method_call = self.parse_method_call_expression(this, col_ident, args);
                 return self.maybe_parse_subscript(method_call);
             }
 
@@ -32321,11 +32351,11 @@ impl Parser {
                         self.parse_expression_list()?
                     };
                     self.expect(TokenType::RParen)?;
-                    let method_call = Expression::MethodCall(Box::new(MethodCall {
-                        this: Expression::Identifier(Identifier::new(name)),
-                        method: col_ident,
+                    let method_call = self.parse_method_call_expression(
+                        Expression::Identifier(Identifier::new(name)),
+                        col_ident,
                         args,
-                    }));
+                    );
                     return self.maybe_parse_subscript(method_call);
                 }
 
@@ -37831,11 +37861,11 @@ impl Parser {
                         };
                         self.expect(TokenType::RParen)?;
                         // Create a method call expression (DotAccess with function call)
-                        expr = Expression::MethodCall(Box::new(MethodCall {
-                            this: expr,
-                            method: Identifier::new(field_name),
+                        expr = self.parse_method_call_expression(
+                            expr,
+                            Identifier::new(field_name),
                             args,
-                        }));
+                        );
                     } else {
                         let mut ident = Identifier::new(field_name);
                         if is_quoted {

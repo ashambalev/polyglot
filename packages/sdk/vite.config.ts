@@ -8,9 +8,11 @@ export default defineConfig({
   plugins: [
     wasm(),
     wasmExtractPlugin({
-      wasmFilename: 'polyglot_sql_wasm_bg.wasm',
-      wasmRelativePath: './polyglot_sql_wasm_bg.wasm',
+      wasmFilename: 'polyglot_sql.wasm',
+      wasmRelativePath: './polyglot_sql.wasm',
       extractWasm: true,
+      injectNodeCompat: false,
+      emitWasmDts: true,
     }),
     dts({
       include: ['src/**/*.ts'],

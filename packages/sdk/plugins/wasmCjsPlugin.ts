@@ -35,11 +35,11 @@ export function wasmCjsPlugin(): Plugin {
         );
 
         // ── Transform 2: Replace WASM URL ────────────────────────────
-        // ESM: new URL("./polyglot_sql_wasm_bg.wasm", import.meta.url).href
-        // CJS: require("path").join(__dirname, "polyglot_sql_wasm_bg.wasm")
+        // ESM: new URL("./polyglot_sql.wasm", import.meta.url).href
+        // CJS: require("path").join(__dirname, "polyglot_sql.wasm")
         code = code.replace(
-          /const __vite__wasmUrl\s*=\s*new URL\(["']\.\/polyglot_sql_wasm_bg\.wasm["'],\s*import\.meta\.url\)\.href;/,
-          'const __vite__wasmUrl = require("path").join(__dirname, "polyglot_sql_wasm_bg.wasm");',
+          /const __vite__wasmUrl\s*=\s*new URL\(["']\.\/polyglot_sql\.wasm["'],\s*import\.meta\.url\)\.href;/,
+          'const __vite__wasmUrl = require("path").join(__dirname, "polyglot_sql.wasm");',
         );
 
         // ── Transform 3: Defer WASM initialization ───────────────────
@@ -58,7 +58,7 @@ export function wasmCjsPlugin(): Plugin {
             '  if (__vite__wasmModule) return;',
             '  if (__initPromise) return __initPromise;',
             '  __initPromise = (async () => {',
-            '    const wasmPath = require("path").join(__dirname, "polyglot_sql_wasm_bg.wasm");',
+            '    const wasmPath = require("path").join(__dirname, "polyglot_sql.wasm");',
             '    const bytes = require("fs").readFileSync(wasmPath);',
             '    const result = await WebAssembly.instantiate(bytes, __vite__wasmImports);',
             '    __vite__wasmModule = result.instance.exports;',
