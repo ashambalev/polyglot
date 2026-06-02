@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.4.3] - 2026-06-02
+
+### Added
+- Structured PostgreSQL/generic prepared statement support with a new
+  `Prepare` AST node for `PREPARE name [(type, ...)] AS statement`.
+- PostgreSQL-style prepared statement execution arguments on `Execute` nodes,
+  allowing `EXECUTE name(...)` to parse and round-trip without falling back to
+  opaque command text.
+- Regression coverage for prepared statement parse/generate/source-table flows
+  across Rust, C FFI, WASM, Python, and the TypeScript SDK.
+
+### Fixed
+- Lineage, source-table extraction, traversal, scope analysis, and OpenLineage
+  output now inspect the body of structured `PREPARE` statements.
+- BigQuery `UNNEST(...) AS alias` sources now participate in lineage and
+  OpenLineage column lineage, avoiding empty field lineage for projections such
+  as `SELECT date_val AS week_start FROM UNNEST(...) AS date_val`.
+- Python bindings now expose the new `Prepare` expression subclass in the
+  native dispatcher, package exports, and type stubs.
+- Documentation builds no longer fail on TypeDoc analysis of the TypeScript SDK
+  manual WASM loader internals.
+
 ## [0.4.2] - 2026-05-25
 
 ### Added
@@ -445,6 +467,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.4.3]: https://github.com/tobilg/polyglot/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tobilg/polyglot/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tobilg/polyglot/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tobilg/polyglot/compare/v0.3.12...v0.4.0
