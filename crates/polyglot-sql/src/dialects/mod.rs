@@ -1704,6 +1704,24 @@ where
                         Expression::Union(mut union) => {
                             union.left = left;
                             union.right = right;
+                            if let Some(mut order) = union.order_by.take() {
+                                order.expressions = order
+                                    .expressions
+                                    .into_iter()
+                                    .map(|o| {
+                                        let mut o = o;
+                                        let original = o.this.clone();
+                                        o.this = transform_recursive(o.this, transform_fn)
+                                            .unwrap_or(original);
+                                        match transform_fn(Expression::Ordered(Box::new(o.clone())))
+                                        {
+                                            Ok(Expression::Ordered(transformed)) => *transformed,
+                                            Ok(_) | Err(_) => o,
+                                        }
+                                    })
+                                    .collect();
+                                union.order_by = Some(order);
+                            }
                             if let Some(mut with) = union.with.take() {
                                 with.ctes = with
                                     .ctes
@@ -1722,6 +1740,24 @@ where
                         Expression::Intersect(mut intersect) => {
                             intersect.left = left;
                             intersect.right = right;
+                            if let Some(mut order) = intersect.order_by.take() {
+                                order.expressions = order
+                                    .expressions
+                                    .into_iter()
+                                    .map(|o| {
+                                        let mut o = o;
+                                        let original = o.this.clone();
+                                        o.this = transform_recursive(o.this, transform_fn)
+                                            .unwrap_or(original);
+                                        match transform_fn(Expression::Ordered(Box::new(o.clone())))
+                                        {
+                                            Ok(Expression::Ordered(transformed)) => *transformed,
+                                            Ok(_) | Err(_) => o,
+                                        }
+                                    })
+                                    .collect();
+                                intersect.order_by = Some(order);
+                            }
                             if let Some(mut with) = intersect.with.take() {
                                 with.ctes = with
                                     .ctes
@@ -1740,6 +1776,24 @@ where
                         Expression::Except(mut except) => {
                             except.left = left;
                             except.right = right;
+                            if let Some(mut order) = except.order_by.take() {
+                                order.expressions = order
+                                    .expressions
+                                    .into_iter()
+                                    .map(|o| {
+                                        let mut o = o;
+                                        let original = o.this.clone();
+                                        o.this = transform_recursive(o.this, transform_fn)
+                                            .unwrap_or(original);
+                                        match transform_fn(Expression::Ordered(Box::new(o.clone())))
+                                        {
+                                            Ok(Expression::Ordered(transformed)) => *transformed,
+                                            Ok(_) | Err(_) => o,
+                                        }
+                                    })
+                                    .collect();
+                                except.order_by = Some(order);
+                            }
                             if let Some(mut with) = except.with.take() {
                                 with.ctes = with
                                     .ctes
@@ -2563,6 +2617,22 @@ where
             u.left = transform_recursive(left, transform_fn)?;
             let right = std::mem::replace(&mut u.right, Expression::Null(Null));
             u.right = transform_recursive(right, transform_fn)?;
+            if let Some(mut order) = u.order_by.take() {
+                order.expressions = order
+                    .expressions
+                    .into_iter()
+                    .map(|o| {
+                        let mut o = o;
+                        let original = o.this.clone();
+                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
+                            Ok(Expression::Ordered(transformed)) => *transformed,
+                            Ok(_) | Err(_) => o,
+                        }
+                    })
+                    .collect();
+                u.order_by = Some(order);
+            }
             if let Some(mut with) = u.with.take() {
                 with.ctes = with
                     .ctes
@@ -2582,6 +2652,22 @@ where
             i.left = transform_recursive(left, transform_fn)?;
             let right = std::mem::replace(&mut i.right, Expression::Null(Null));
             i.right = transform_recursive(right, transform_fn)?;
+            if let Some(mut order) = i.order_by.take() {
+                order.expressions = order
+                    .expressions
+                    .into_iter()
+                    .map(|o| {
+                        let mut o = o;
+                        let original = o.this.clone();
+                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
+                            Ok(Expression::Ordered(transformed)) => *transformed,
+                            Ok(_) | Err(_) => o,
+                        }
+                    })
+                    .collect();
+                i.order_by = Some(order);
+            }
             if let Some(mut with) = i.with.take() {
                 with.ctes = with
                     .ctes
@@ -2601,6 +2687,22 @@ where
             e.left = transform_recursive(left, transform_fn)?;
             let right = std::mem::replace(&mut e.right, Expression::Null(Null));
             e.right = transform_recursive(right, transform_fn)?;
+            if let Some(mut order) = e.order_by.take() {
+                order.expressions = order
+                    .expressions
+                    .into_iter()
+                    .map(|o| {
+                        let mut o = o;
+                        let original = o.this.clone();
+                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
+                            Ok(Expression::Ordered(transformed)) => *transformed,
+                            Ok(_) | Err(_) => o,
+                        }
+                    })
+                    .collect();
+                e.order_by = Some(order);
+            }
             if let Some(mut with) = e.with.take() {
                 with.ctes = with
                     .ctes
@@ -2845,6 +2947,22 @@ where
         }
         Expression::StringAgg(mut f) => {
             f.this = transform_recursive(f.this, transform_fn)?;
+            if let Some(order_by) = f.order_by.take() {
+                f.order_by = Some(
+                    order_by
+                        .into_iter()
+                        .map(|mut ordered| {
+                            let original = ordered.this.clone();
+                            ordered.this =
+                                transform_recursive(ordered.this, transform_fn).unwrap_or(original);
+                            match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
+                                Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                                Ok(_) | Err(_) => Ok(ordered),
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
             Expression::StringAgg(f)
         }
         Expression::ListAgg(mut f) => {
@@ -4459,6 +4577,14 @@ impl Dialect {
                     normalized
                 };
 
+                let normalized = if matches!(self.dialect_type, DialectType::PostgreSQL)
+                    && matches!(target, DialectType::Fabric)
+                {
+                    Self::normalize_postgres_to_fabric_decimal_types(normalized)?
+                } else {
+                    normalized
+                };
+
                 // For DuckDB target from BigQuery source: wrap UNNEST of struct arrays in
                 // (SELECT UNNEST(..., max_depth => 2)) subquery
                 // Must run BEFORE unnest_alias_to_column_alias since it changes alias structure
@@ -4589,7 +4715,27 @@ impl Dialect {
                     normalized
                 };
 
+                // T-SQL/Fabric do not have a scalar boolean type. Keep predicate
+                // contexts intact, but materialize boolean-valued expressions used
+                // as values before target transforms add ORDER BY null sort keys.
+                let normalized = if matches!(target, DialectType::TSQL | DialectType::Fabric)
+                    && !matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::rewrite_boolean_values_for_tsql(normalized)?
+                } else {
+                    normalized
+                };
+
                 let transformed = target_dialect.transform(normalized)?;
+
+                // T-SQL and Fabric do not support aggregate FILTER clauses. Rewrite any
+                // remaining filters after target transforms so special aggregate rewrites
+                // (for example BOOL_OR/BOOL_AND) can consume their filters first.
+                let transformed = if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    Self::rewrite_aggregate_filters_for_tsql(transformed)?
+                } else {
+                    transformed
+                };
 
                 // DuckDB target: when FROM is RANGE(n), replace SEQ's ROW_NUMBER pattern with `range`
                 let transformed = if matches!(target, DialectType::DuckDB) {
@@ -4618,6 +4764,681 @@ impl Dialect {
 // Transpile-only methods: cross-dialect normalization and helpers
 #[cfg(feature = "transpile")]
 impl Dialect {
+    fn rewrite_boolean_values_for_tsql(expr: Expression) -> Result<Expression> {
+        match expr {
+            Expression::Select(select) => Self::rewrite_boolean_values_in_tsql_select(select),
+            Expression::Subquery(mut subquery) => {
+                subquery.this = Self::rewrite_boolean_values_for_tsql(subquery.this)?;
+                Ok(Expression::Subquery(subquery))
+            }
+            Expression::Union(mut union) => {
+                let left = std::mem::replace(&mut union.left, Expression::null());
+                let right = std::mem::replace(&mut union.right, Expression::null());
+                union.left = Self::rewrite_boolean_values_for_tsql(left)?;
+                union.right = Self::rewrite_boolean_values_for_tsql(right)?;
+                if let Some(mut with) = union.with.take() {
+                    with.ctes = with
+                        .ctes
+                        .into_iter()
+                        .map(|mut cte| {
+                            cte.this = Self::rewrite_boolean_values_for_tsql(cte.this)?;
+                            Ok(cte)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    union.with = Some(with);
+                }
+                Ok(Expression::Union(union))
+            }
+            Expression::Intersect(mut intersect) => {
+                let left = std::mem::replace(&mut intersect.left, Expression::null());
+                let right = std::mem::replace(&mut intersect.right, Expression::null());
+                intersect.left = Self::rewrite_boolean_values_for_tsql(left)?;
+                intersect.right = Self::rewrite_boolean_values_for_tsql(right)?;
+                Ok(Expression::Intersect(intersect))
+            }
+            Expression::Except(mut except) => {
+                let left = std::mem::replace(&mut except.left, Expression::null());
+                let right = std::mem::replace(&mut except.right, Expression::null());
+                except.left = Self::rewrite_boolean_values_for_tsql(left)?;
+                except.right = Self::rewrite_boolean_values_for_tsql(right)?;
+                Ok(Expression::Except(except))
+            }
+            other => Self::rewrite_tsql_boolean_embedded_queries(other),
+        }
+    }
+
+    fn rewrite_boolean_values_in_tsql_select(
+        mut select: Box<crate::expressions::Select>,
+    ) -> Result<Expression> {
+        if let Some(mut with) = select.with.take() {
+            with.ctes = with
+                .ctes
+                .into_iter()
+                .map(|mut cte| {
+                    cte.this = Self::rewrite_boolean_values_for_tsql(cte.this)?;
+                    Ok(cte)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            select.with = Some(with);
+        }
+
+        select.expressions = select
+            .expressions
+            .into_iter()
+            .map(Self::rewrite_tsql_boolean_scalar_value)
+            .collect::<Result<Vec<_>>>()?;
+
+        if let Some(mut from) = select.from.take() {
+            from.expressions = from
+                .expressions
+                .into_iter()
+                .map(Self::rewrite_tsql_boolean_embedded_queries)
+                .collect::<Result<Vec<_>>>()?;
+            select.from = Some(from);
+        }
+
+        select.joins = select
+            .joins
+            .into_iter()
+            .map(|mut join| {
+                join.this = Self::rewrite_tsql_boolean_embedded_queries(join.this)?;
+                if let Some(on) = join.on.take() {
+                    join.on = Some(Self::rewrite_tsql_boolean_predicate_context(on)?);
+                }
+                if let Some(match_condition) = join.match_condition.take() {
+                    join.match_condition = Some(Self::rewrite_tsql_boolean_predicate_context(
+                        match_condition,
+                    )?);
+                }
+                join.pivots = join
+                    .pivots
+                    .into_iter()
+                    .map(Self::rewrite_tsql_boolean_embedded_queries)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(join)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        select.lateral_views = select
+            .lateral_views
+            .into_iter()
+            .map(|mut lateral_view| {
+                lateral_view.this = Self::rewrite_tsql_boolean_embedded_queries(lateral_view.this)?;
+                Ok(lateral_view)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if let Some(prewhere) = select.prewhere.take() {
+            select.prewhere = Some(Self::rewrite_tsql_boolean_predicate_context(prewhere)?);
+        }
+
+        if let Some(mut where_clause) = select.where_clause.take() {
+            where_clause.this = Self::rewrite_tsql_boolean_predicate_context(where_clause.this)?;
+            select.where_clause = Some(where_clause);
+        }
+
+        if let Some(mut group_by) = select.group_by.take() {
+            group_by.expressions = group_by
+                .expressions
+                .into_iter()
+                .map(Self::rewrite_tsql_boolean_scalar_value)
+                .collect::<Result<Vec<_>>>()?;
+            select.group_by = Some(group_by);
+        }
+
+        if let Some(mut having) = select.having.take() {
+            having.this = Self::rewrite_tsql_boolean_predicate_context(having.this)?;
+            select.having = Some(having);
+        }
+
+        if let Some(mut qualify) = select.qualify.take() {
+            qualify.this = Self::rewrite_tsql_boolean_predicate_context(qualify.this)?;
+            select.qualify = Some(qualify);
+        }
+
+        if let Some(mut order_by) = select.order_by.take() {
+            order_by.expressions = Self::rewrite_tsql_boolean_ordered_values(order_by.expressions)?;
+            select.order_by = Some(order_by);
+        }
+
+        if let Some(mut distribute_by) = select.distribute_by.take() {
+            distribute_by.expressions = distribute_by
+                .expressions
+                .into_iter()
+                .map(Self::rewrite_tsql_boolean_scalar_value)
+                .collect::<Result<Vec<_>>>()?;
+            select.distribute_by = Some(distribute_by);
+        }
+
+        if let Some(mut cluster_by) = select.cluster_by.take() {
+            cluster_by.expressions =
+                Self::rewrite_tsql_boolean_ordered_values(cluster_by.expressions)?;
+            select.cluster_by = Some(cluster_by);
+        }
+
+        if let Some(mut sort_by) = select.sort_by.take() {
+            sort_by.expressions = Self::rewrite_tsql_boolean_ordered_values(sort_by.expressions)?;
+            select.sort_by = Some(sort_by);
+        }
+
+        if let Some(limit_by) = select.limit_by.take() {
+            select.limit_by = Some(
+                limit_by
+                    .into_iter()
+                    .map(Self::rewrite_tsql_boolean_scalar_value)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        if let Some(distinct_on) = select.distinct_on.take() {
+            select.distinct_on = Some(
+                distinct_on
+                    .into_iter()
+                    .map(Self::rewrite_tsql_boolean_scalar_value)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        if let Some(mut sample) = select.sample.take() {
+            sample.size = Self::rewrite_tsql_boolean_embedded_queries(sample.size)?;
+            if let Some(offset) = sample.offset.take() {
+                sample.offset = Some(Self::rewrite_tsql_boolean_embedded_queries(offset)?);
+            }
+            if let Some(bucket_numerator) = sample.bucket_numerator.take() {
+                sample.bucket_numerator = Some(Box::new(
+                    Self::rewrite_tsql_boolean_embedded_queries(*bucket_numerator)?,
+                ));
+            }
+            if let Some(bucket_denominator) = sample.bucket_denominator.take() {
+                sample.bucket_denominator = Some(Box::new(
+                    Self::rewrite_tsql_boolean_embedded_queries(*bucket_denominator)?,
+                ));
+            }
+            if let Some(bucket_field) = sample.bucket_field.take() {
+                sample.bucket_field = Some(Box::new(Self::rewrite_tsql_boolean_embedded_queries(
+                    *bucket_field,
+                )?));
+            }
+            select.sample = Some(sample);
+        }
+
+        if let Some(settings) = select.settings.take() {
+            select.settings = Some(
+                settings
+                    .into_iter()
+                    .map(Self::rewrite_tsql_boolean_embedded_queries)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        if let Some(format) = select.format.take() {
+            select.format = Some(Self::rewrite_tsql_boolean_embedded_queries(format)?);
+        }
+
+        if let Some(mut windows) = select.windows.take() {
+            for window in windows.iter_mut() {
+                Self::rewrite_tsql_boolean_over_values(&mut window.spec)?;
+            }
+            select.windows = Some(windows);
+        }
+
+        Ok(Expression::Select(select))
+    }
+
+    fn rewrite_tsql_boolean_scalar_value(expr: Expression) -> Result<Expression> {
+        if Self::is_tsql_boolean_value_expression(&expr) {
+            return Ok(Self::tsql_boolean_value_case(expr));
+        }
+
+        match expr {
+            Expression::Alias(mut alias) => {
+                alias.this = Self::rewrite_tsql_boolean_scalar_value(alias.this)?;
+                Ok(Expression::Alias(alias))
+            }
+            Expression::Paren(mut paren) => {
+                paren.this = Self::rewrite_tsql_boolean_scalar_value(paren.this)?;
+                Ok(Expression::Paren(paren))
+            }
+            Expression::Cast(mut cast) => {
+                cast.this = Self::rewrite_tsql_boolean_scalar_value(cast.this)?;
+                if let Some(format) = cast.format.take() {
+                    cast.format = Some(Box::new(Self::rewrite_tsql_boolean_embedded_queries(
+                        *format,
+                    )?));
+                }
+                if let Some(default) = cast.default.take() {
+                    cast.default =
+                        Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*default)?));
+                }
+                Ok(Expression::Cast(cast))
+            }
+            Expression::TryCast(mut cast) => {
+                cast.this = Self::rewrite_tsql_boolean_scalar_value(cast.this)?;
+                if let Some(format) = cast.format.take() {
+                    cast.format = Some(Box::new(Self::rewrite_tsql_boolean_embedded_queries(
+                        *format,
+                    )?));
+                }
+                if let Some(default) = cast.default.take() {
+                    cast.default =
+                        Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*default)?));
+                }
+                Ok(Expression::TryCast(cast))
+            }
+            Expression::SafeCast(mut cast) => {
+                cast.this = Self::rewrite_tsql_boolean_scalar_value(cast.this)?;
+                if let Some(format) = cast.format.take() {
+                    cast.format = Some(Box::new(Self::rewrite_tsql_boolean_embedded_queries(
+                        *format,
+                    )?));
+                }
+                if let Some(default) = cast.default.take() {
+                    cast.default =
+                        Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*default)?));
+                }
+                Ok(Expression::SafeCast(cast))
+            }
+            Expression::Case(mut case) => {
+                if let Some(operand) = case.operand.take() {
+                    case.operand = Some(Self::rewrite_tsql_boolean_scalar_value(operand)?);
+                }
+                case.whens = case
+                    .whens
+                    .into_iter()
+                    .map(|(condition, result)| {
+                        Ok((
+                            Self::rewrite_tsql_boolean_predicate_context(condition)?,
+                            Self::rewrite_tsql_boolean_scalar_value(result)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(else_) = case.else_.take() {
+                    case.else_ = Some(Self::rewrite_tsql_boolean_scalar_value(else_)?);
+                }
+                Ok(Expression::Case(case))
+            }
+            Expression::IfFunc(mut if_func) => {
+                if_func.condition =
+                    Self::rewrite_tsql_boolean_predicate_context(if_func.condition)?;
+                if_func.true_value = Self::rewrite_tsql_boolean_scalar_value(if_func.true_value)?;
+                if let Some(false_value) = if_func.false_value.take() {
+                    if_func.false_value =
+                        Some(Self::rewrite_tsql_boolean_scalar_value(false_value)?);
+                }
+                Ok(Expression::IfFunc(if_func))
+            }
+            Expression::WindowFunction(mut window_function) => {
+                window_function.this =
+                    Self::rewrite_tsql_boolean_embedded_queries(window_function.this)?;
+                Self::rewrite_tsql_boolean_over_values(&mut window_function.over)?;
+                if let Some(mut keep) = window_function.keep.take() {
+                    keep.order_by = Self::rewrite_tsql_boolean_ordered_values(keep.order_by)?;
+                    window_function.keep = Some(keep);
+                }
+                Ok(Expression::WindowFunction(window_function))
+            }
+            Expression::WithinGroup(mut within_group) => {
+                within_group.this = Self::rewrite_tsql_boolean_embedded_queries(within_group.this)?;
+                within_group.order_by =
+                    Self::rewrite_tsql_boolean_ordered_values(within_group.order_by)?;
+                Ok(Expression::WithinGroup(within_group))
+            }
+            Expression::Subquery(mut subquery) => {
+                subquery.this = Self::rewrite_boolean_values_for_tsql(subquery.this)?;
+                Ok(Expression::Subquery(subquery))
+            }
+            Expression::Select(select) => Self::rewrite_boolean_values_in_tsql_select(select),
+            other => Self::rewrite_tsql_boolean_embedded_queries(other),
+        }
+    }
+
+    fn rewrite_tsql_boolean_predicate_context(expr: Expression) -> Result<Expression> {
+        Self::rewrite_tsql_boolean_embedded_queries(expr)
+    }
+
+    fn rewrite_tsql_boolean_embedded_queries(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Select(select) => Self::rewrite_boolean_values_in_tsql_select(select),
+            Expression::Subquery(mut subquery) => {
+                subquery.this = Self::rewrite_boolean_values_for_tsql(subquery.this)?;
+                Ok(Expression::Subquery(subquery))
+            }
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+                Self::rewrite_boolean_values_for_tsql(e)
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn rewrite_tsql_boolean_ordered_values(
+        ordered: Vec<crate::expressions::Ordered>,
+    ) -> Result<Vec<crate::expressions::Ordered>> {
+        ordered
+            .into_iter()
+            .map(|mut ordered| {
+                ordered.this = Self::rewrite_tsql_boolean_scalar_value(ordered.this)?;
+                if let Some(with_fill) = ordered.with_fill.take() {
+                    ordered.with_fill = Some(Box::new(
+                        Self::rewrite_tsql_boolean_with_fill_values(*with_fill)?,
+                    ));
+                }
+                Ok(ordered)
+            })
+            .collect()
+    }
+
+    fn rewrite_tsql_boolean_with_fill_values(
+        mut with_fill: crate::expressions::WithFill,
+    ) -> Result<crate::expressions::WithFill> {
+        if let Some(from) = with_fill.from_.take() {
+            with_fill.from_ = Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*from)?));
+        }
+        if let Some(to) = with_fill.to.take() {
+            with_fill.to = Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*to)?));
+        }
+        if let Some(step) = with_fill.step.take() {
+            with_fill.step = Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(*step)?));
+        }
+        if let Some(staleness) = with_fill.staleness.take() {
+            with_fill.staleness = Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(
+                *staleness,
+            )?));
+        }
+        if let Some(interpolate) = with_fill.interpolate.take() {
+            with_fill.interpolate = Some(Box::new(Self::rewrite_tsql_boolean_scalar_value(
+                *interpolate,
+            )?));
+        }
+        Ok(with_fill)
+    }
+
+    fn rewrite_tsql_boolean_over_values(over: &mut crate::expressions::Over) -> Result<()> {
+        over.partition_by = std::mem::take(&mut over.partition_by)
+            .into_iter()
+            .map(Self::rewrite_tsql_boolean_scalar_value)
+            .collect::<Result<Vec<_>>>()?;
+        over.order_by =
+            Self::rewrite_tsql_boolean_ordered_values(std::mem::take(&mut over.order_by))?;
+        Ok(())
+    }
+
+    fn is_tsql_boolean_value_expression(expr: &Expression) -> bool {
+        match expr {
+            Expression::Paren(paren) => Self::is_tsql_boolean_value_expression(&paren.this),
+            Expression::Eq(_)
+            | Expression::Neq(_)
+            | Expression::Lt(_)
+            | Expression::Lte(_)
+            | Expression::Gt(_)
+            | Expression::Gte(_)
+            | Expression::Is(_)
+            | Expression::IsNull(_)
+            | Expression::IsTrue(_)
+            | Expression::IsFalse(_)
+            | Expression::Like(_)
+            | Expression::ILike(_)
+            | Expression::SimilarTo(_)
+            | Expression::Glob(_)
+            | Expression::RegexpLike(_)
+            | Expression::In(_)
+            | Expression::Between(_)
+            | Expression::Exists(_)
+            | Expression::And(_)
+            | Expression::Or(_)
+            | Expression::Not(_)
+            | Expression::Any(_)
+            | Expression::All(_)
+            | Expression::EqualNull(_) => true,
+            _ => false,
+        }
+    }
+
+    fn tsql_boolean_value_case(predicate: Expression) -> Expression {
+        Expression::Case(Box::new(crate::expressions::Case {
+            operand: None,
+            whens: vec![
+                (predicate.clone(), Expression::number(1)),
+                (
+                    Expression::Not(Box::new(crate::expressions::UnaryOp {
+                        this: predicate,
+                        inferred_type: None,
+                    })),
+                    Expression::number(0),
+                ),
+            ],
+            else_: None,
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn rewrite_aggregate_filters_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| Self::rewrite_aggregate_filter_for_tsql(e))
+    }
+
+    fn rewrite_aggregate_filter_for_tsql(expr: Expression) -> Result<Expression> {
+        macro_rules! rewrite_agg_filter {
+            ($variant:ident, $agg:expr) => {{
+                let mut agg = $agg;
+                if let Some(filter) = agg.filter.take() {
+                    let this = std::mem::replace(&mut agg.this, Expression::null());
+                    agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                }
+                Ok(Expression::$variant(agg))
+            }};
+        }
+
+        match expr {
+            Expression::Filter(filter) => {
+                let condition = match *filter.expression {
+                    Expression::Where(where_) => where_.this,
+                    other => other,
+                };
+                Ok(Self::push_filter_into_tsql_aggregate(
+                    *filter.this,
+                    condition,
+                ))
+            }
+            Expression::AggregateFunction(mut agg) => {
+                if let Some(filter) = agg.filter.take() {
+                    Self::rewrite_generic_aggregate_filter_for_tsql(&mut agg, filter);
+                }
+                Ok(Expression::AggregateFunction(agg))
+            }
+            Expression::Count(mut count) => {
+                if let Some(filter) = count.filter.take() {
+                    let value = if count.star {
+                        Expression::number(1)
+                    } else {
+                        count.this.take().unwrap_or_else(|| Expression::number(1))
+                    };
+                    count.star = false;
+                    count.this = Some(Self::conditional_aggregate_value_for_tsql(filter, value));
+                }
+                Ok(Expression::Count(count))
+            }
+            Expression::Sum(agg) => rewrite_agg_filter!(Sum, agg),
+            Expression::Avg(agg) => rewrite_agg_filter!(Avg, agg),
+            Expression::Min(agg) => rewrite_agg_filter!(Min, agg),
+            Expression::Max(agg) => rewrite_agg_filter!(Max, agg),
+            Expression::ArrayAgg(agg) => rewrite_agg_filter!(ArrayAgg, agg),
+            Expression::CountIf(agg) => rewrite_agg_filter!(CountIf, agg),
+            Expression::Stddev(agg) => rewrite_agg_filter!(Stddev, agg),
+            Expression::StddevPop(agg) => rewrite_agg_filter!(StddevPop, agg),
+            Expression::StddevSamp(agg) => rewrite_agg_filter!(StddevSamp, agg),
+            Expression::Variance(agg) => rewrite_agg_filter!(Variance, agg),
+            Expression::VarPop(agg) => rewrite_agg_filter!(VarPop, agg),
+            Expression::VarSamp(agg) => rewrite_agg_filter!(VarSamp, agg),
+            Expression::Median(agg) => rewrite_agg_filter!(Median, agg),
+            Expression::Mode(agg) => rewrite_agg_filter!(Mode, agg),
+            Expression::First(agg) => rewrite_agg_filter!(First, agg),
+            Expression::Last(agg) => rewrite_agg_filter!(Last, agg),
+            Expression::AnyValue(agg) => rewrite_agg_filter!(AnyValue, agg),
+            Expression::ApproxDistinct(agg) => rewrite_agg_filter!(ApproxDistinct, agg),
+            Expression::ApproxCountDistinct(agg) => {
+                rewrite_agg_filter!(ApproxCountDistinct, agg)
+            }
+            Expression::LogicalAnd(agg) => rewrite_agg_filter!(LogicalAnd, agg),
+            Expression::LogicalOr(agg) => rewrite_agg_filter!(LogicalOr, agg),
+            Expression::Skewness(agg) => rewrite_agg_filter!(Skewness, agg),
+            Expression::ArrayConcatAgg(agg) => rewrite_agg_filter!(ArrayConcatAgg, agg),
+            Expression::ArrayUniqueAgg(agg) => rewrite_agg_filter!(ArrayUniqueAgg, agg),
+            Expression::BoolXorAgg(agg) => rewrite_agg_filter!(BoolXorAgg, agg),
+            Expression::BitwiseAndAgg(agg) => rewrite_agg_filter!(BitwiseAndAgg, agg),
+            Expression::BitwiseOrAgg(agg) => rewrite_agg_filter!(BitwiseOrAgg, agg),
+            Expression::BitwiseXorAgg(agg) => rewrite_agg_filter!(BitwiseXorAgg, agg),
+            Expression::StringAgg(mut agg) => {
+                if let Some(filter) = agg.filter.take() {
+                    let this = std::mem::replace(&mut agg.this, Expression::null());
+                    agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                }
+                Ok(Expression::StringAgg(agg))
+            }
+            Expression::GroupConcat(mut agg) => {
+                if let Some(filter) = agg.filter.take() {
+                    let this = std::mem::replace(&mut agg.this, Expression::null());
+                    agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                }
+                Ok(Expression::GroupConcat(agg))
+            }
+            Expression::ListAgg(mut agg) => {
+                if let Some(filter) = agg.filter.take() {
+                    let this = std::mem::replace(&mut agg.this, Expression::null());
+                    agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                }
+                Ok(Expression::ListAgg(agg))
+            }
+            Expression::WithinGroup(mut within_group) => {
+                within_group.this = Self::rewrite_aggregate_filters_for_tsql(within_group.this)?;
+                Ok(Expression::WithinGroup(within_group))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn push_filter_into_tsql_aggregate(expr: Expression, filter: Expression) -> Expression {
+        macro_rules! push_agg_filter {
+            ($variant:ident, $agg:expr) => {{
+                let mut agg = $agg;
+                let this = std::mem::replace(&mut agg.this, Expression::null());
+                agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                agg.filter = None;
+                Expression::$variant(agg)
+            }};
+        }
+
+        match expr {
+            Expression::AggregateFunction(mut agg) => {
+                Self::rewrite_generic_aggregate_filter_for_tsql(&mut agg, filter);
+                Expression::AggregateFunction(agg)
+            }
+            Expression::Count(mut count) => {
+                let value = if count.star {
+                    Expression::number(1)
+                } else {
+                    count.this.take().unwrap_or_else(|| Expression::number(1))
+                };
+                count.star = false;
+                count.filter = None;
+                count.this = Some(Self::conditional_aggregate_value_for_tsql(filter, value));
+                Expression::Count(count)
+            }
+            Expression::Sum(agg) => push_agg_filter!(Sum, agg),
+            Expression::Avg(agg) => push_agg_filter!(Avg, agg),
+            Expression::Min(agg) => push_agg_filter!(Min, agg),
+            Expression::Max(agg) => push_agg_filter!(Max, agg),
+            Expression::ArrayAgg(agg) => push_agg_filter!(ArrayAgg, agg),
+            Expression::CountIf(agg) => push_agg_filter!(CountIf, agg),
+            Expression::Stddev(agg) => push_agg_filter!(Stddev, agg),
+            Expression::StddevPop(agg) => push_agg_filter!(StddevPop, agg),
+            Expression::StddevSamp(agg) => push_agg_filter!(StddevSamp, agg),
+            Expression::Variance(agg) => push_agg_filter!(Variance, agg),
+            Expression::VarPop(agg) => push_agg_filter!(VarPop, agg),
+            Expression::VarSamp(agg) => push_agg_filter!(VarSamp, agg),
+            Expression::Median(agg) => push_agg_filter!(Median, agg),
+            Expression::Mode(agg) => push_agg_filter!(Mode, agg),
+            Expression::First(agg) => push_agg_filter!(First, agg),
+            Expression::Last(agg) => push_agg_filter!(Last, agg),
+            Expression::AnyValue(agg) => push_agg_filter!(AnyValue, agg),
+            Expression::ApproxDistinct(agg) => push_agg_filter!(ApproxDistinct, agg),
+            Expression::ApproxCountDistinct(agg) => {
+                push_agg_filter!(ApproxCountDistinct, agg)
+            }
+            Expression::LogicalAnd(agg) => push_agg_filter!(LogicalAnd, agg),
+            Expression::LogicalOr(agg) => push_agg_filter!(LogicalOr, agg),
+            Expression::Skewness(agg) => push_agg_filter!(Skewness, agg),
+            Expression::ArrayConcatAgg(agg) => push_agg_filter!(ArrayConcatAgg, agg),
+            Expression::ArrayUniqueAgg(agg) => push_agg_filter!(ArrayUniqueAgg, agg),
+            Expression::BoolXorAgg(agg) => push_agg_filter!(BoolXorAgg, agg),
+            Expression::BitwiseAndAgg(agg) => push_agg_filter!(BitwiseAndAgg, agg),
+            Expression::BitwiseOrAgg(agg) => push_agg_filter!(BitwiseOrAgg, agg),
+            Expression::BitwiseXorAgg(agg) => push_agg_filter!(BitwiseXorAgg, agg),
+            Expression::StringAgg(mut agg) => {
+                let this = std::mem::replace(&mut agg.this, Expression::null());
+                agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                agg.filter = None;
+                Expression::StringAgg(agg)
+            }
+            Expression::GroupConcat(mut agg) => {
+                let this = std::mem::replace(&mut agg.this, Expression::null());
+                agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                agg.filter = None;
+                Expression::GroupConcat(agg)
+            }
+            Expression::ListAgg(mut agg) => {
+                let this = std::mem::replace(&mut agg.this, Expression::null());
+                agg.this = Self::conditional_aggregate_value_for_tsql(filter, this);
+                agg.filter = None;
+                Expression::ListAgg(agg)
+            }
+            Expression::WithinGroup(mut within_group) => {
+                within_group.this =
+                    Self::push_filter_into_tsql_aggregate(within_group.this, filter);
+                Expression::WithinGroup(within_group)
+            }
+            other => Expression::Filter(Box::new(crate::expressions::Filter {
+                this: Box::new(other),
+                expression: Box::new(filter),
+            })),
+        }
+    }
+
+    fn rewrite_generic_aggregate_filter_for_tsql(
+        agg: &mut crate::expressions::AggregateFunction,
+        filter: Expression,
+    ) {
+        let is_count =
+            agg.name.eq_ignore_ascii_case("COUNT") || agg.name.eq_ignore_ascii_case("COUNT_BIG");
+        let is_count_star = is_count
+            && (agg.args.is_empty()
+                || (agg.args.len() == 1 && matches!(agg.args[0], Expression::Star(_))));
+
+        if is_count_star {
+            agg.args = vec![Self::conditional_aggregate_value_for_tsql(
+                filter,
+                Expression::number(1),
+            )];
+        } else if !agg.args.is_empty() {
+            agg.args = agg
+                .args
+                .drain(..)
+                .map(|arg| Self::conditional_aggregate_value_for_tsql(filter.clone(), arg))
+                .collect();
+        } else {
+            agg.filter = Some(filter);
+        }
+    }
+
+    fn conditional_aggregate_value_for_tsql(filter: Expression, value: Expression) -> Expression {
+        Expression::Case(Box::new(crate::expressions::Case {
+            operand: None,
+            whens: vec![(filter, value)],
+            else_: None,
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
     fn reject_pgvector_distance_operators_for_sqlite(&self, sql: &str) -> Result<()> {
         let tokens = self.tokenize(sql)?;
         for (i, token) in tokens.iter().enumerate() {
@@ -4730,6 +5551,38 @@ impl Dialect {
                     column.data_type = sqlite_type(column.data_type.clone());
                 }
                 Ok(Expression::CreateTable(ct))
+            }
+            _ => Ok(e),
+        })
+    }
+
+    fn normalize_postgres_to_fabric_decimal_types(expr: Expression) -> Result<Expression> {
+        fn fabric_decimal_type(dt: crate::expressions::DataType) -> crate::expressions::DataType {
+            use crate::expressions::DataType;
+
+            match dt {
+                DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                } => DataType::Decimal {
+                    precision: Some(38),
+                    scale: Some(10),
+                },
+                _ => dt,
+            }
+        }
+
+        transform_recursive(expr, &|e| match e {
+            Expression::DataType(dt) => Ok(Expression::DataType(fabric_decimal_type(dt))),
+            Expression::CreateTable(mut ct) => {
+                for column in &mut ct.columns {
+                    column.data_type = fabric_decimal_type(column.data_type.clone());
+                }
+                Ok(Expression::CreateTable(ct))
+            }
+            Expression::ColumnDef(mut col) => {
+                col.data_type = fabric_decimal_type(col.data_type);
+                Ok(Expression::ColumnDef(col))
             }
             _ => Ok(e),
         })
@@ -35658,7 +36511,7 @@ impl Dialect {
                 }
             }
 
-            // MOD(x, y) -> x % y for PostgreSQL/DuckDB
+            // MOD(x, y) -> x % y for dialects that prefer or require the infix operator.
             "MOD" if args.len() == 2 => {
                 match target {
                     DialectType::PostgreSQL
@@ -35666,7 +36519,9 @@ impl Dialect {
                     | DialectType::Presto
                     | DialectType::Trino
                     | DialectType::Athena
-                    | DialectType::Snowflake => {
+                    | DialectType::Snowflake
+                    | DialectType::TSQL
+                    | DialectType::Fabric => {
                         let x = args.remove(0);
                         let y = args.remove(0);
                         // Wrap complex expressions in parens to preserve precedence
@@ -35677,6 +36532,8 @@ impl Dialect {
                                     | Expression::Sub(_)
                                     | Expression::Mul(_)
                                     | Expression::Div(_)
+                                    | Expression::Mod(_)
+                                    | Expression::ModFunc(_)
                             )
                         };
                         let x = if needs_paren(&x) {
@@ -35710,6 +36567,8 @@ impl Dialect {
                                     | Expression::Sub(_)
                                     | Expression::Mul(_)
                                     | Expression::Div(_)
+                                    | Expression::Mod(_)
+                                    | Expression::ModFunc(_)
                             )
                         };
                         let x = if needs_paren(&x) {

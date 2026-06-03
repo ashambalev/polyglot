@@ -10,7 +10,7 @@ use crate::expressions::{Expression, Identifier, Select};
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
 use crate::schema::{normalize_name, Schema};
-use crate::scope::{build_scope, Scope};
+use crate::scope::{build_scope, Scope, ScopeType, SourceInfo as ScopeSourceInfo, SourceKind};
 use crate::traversal::ExpressionWalk;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,11 @@ pub struct LineageNode {
     pub downstream: Vec<LineageNode>,
     /// Optional source name (e.g., for derived tables)
     pub source_name: String,
+    /// Semantic source kind for downstream consumers.
+    pub source_kind: SourceKind,
+    /// User-written source alias when different from canonical source name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_alias: Option<String>,
     /// Optional reference node name (e.g., for CTEs)
     pub reference_node_name: String,
 }
@@ -42,6 +47,8 @@ impl LineageNode {
             source,
             downstream: Vec::new(),
             source_name: String::new(),
+            source_kind: SourceKind::Unknown,
+            source_alias: None,
             reference_node_name: String::new(),
         }
     }
@@ -55,6 +62,39 @@ impl LineageNode {
     pub fn downstream_names(&self) -> Vec<String> {
         self.downstream.iter().map(|n| n.name.clone()).collect()
     }
+}
+
+fn source_kind_for_scope_context(
+    scope: &Scope,
+    source_name: &str,
+    reference_node_name: &str,
+) -> SourceKind {
+    if source_name.is_empty() && reference_node_name.is_empty() {
+        return SourceKind::Root;
+    }
+    if let Some(source_info) = scope.sources.get(source_name) {
+        return source_info.kind;
+    }
+    if scope.cte_sources.contains_key(source_name) {
+        return SourceKind::Cte;
+    }
+    match scope.scope_type {
+        ScopeType::Cte => SourceKind::Cte,
+        ScopeType::DerivedTable => SourceKind::DerivedTable,
+        ScopeType::Udtf => SourceKind::Virtual,
+        _ => SourceKind::Unknown,
+    }
+}
+
+fn apply_scope_context(
+    node: &mut LineageNode,
+    scope: &Scope,
+    source_name: &str,
+    reference_node_name: &str,
+) {
+    node.source_name = source_name.to_string();
+    node.reference_node_name = reference_node_name.to_string();
+    node.source_kind = source_kind_for_scope_context(scope, source_name, reference_node_name);
 }
 
 /// Iterator for walking the lineage graph
@@ -690,13 +730,12 @@ fn to_node_inner(
 
     // 4. Create the lineage node
     let mut node = LineageNode::new(&column_name, select_expr.clone(), node_source);
-    node.source_name = source_name.to_string();
-    node.reference_node_name = reference_node_name.to_string();
+    apply_scope_context(&mut node, scope, source_name, reference_node_name);
 
     // 5. Star handling — add downstream for each source
     if matches!(&select_expr, Expression::Star(_)) {
         for (name, source_info) in &scope.sources {
-            let child = LineageNode::new(
+            let mut child = LineageNode::new(
                 format!("{}.*", name),
                 Expression::Star(crate::expressions::Star {
                     table: None,
@@ -708,6 +747,7 @@ fn to_node_inner(
                 }),
                 source_info.expression.clone(),
             );
+            apply_source_info_context(&mut child, name, source_info);
             node.downstream.push(child);
         }
         return Ok(node);
@@ -802,8 +842,7 @@ fn handle_set_operation(
     };
 
     let mut node = LineageNode::new(&col_name, scope_expr.clone(), scope_expr.clone());
-    node.source_name = source_name.to_string();
-    node.reference_node_name = reference_node_name.to_string();
+    apply_scope_context(&mut node, scope, source_name, reference_node_name);
 
     // Recurse into each union branch
     for branch_scope in &scope.union_scopes {
@@ -899,11 +938,20 @@ fn resolve_qualified_column(
     // but store the resolved table expression and name for downstream consumers.
     if let Some(source_info) = scope.sources.get(table) {
         if !source_info.is_scope {
-            node.downstream.push(make_table_column_node_from_source(
-                table,
-                col_name,
-                &source_info.expression,
-            ));
+            let mut child = make_table_column_node_from_source(table, col_name, source_info);
+            if source_info.kind == SourceKind::Virtual {
+                attach_virtual_source_dependencies(
+                    &mut child,
+                    scope,
+                    dialect,
+                    table,
+                    &source_info.expression,
+                    trim_selects,
+                    all_cte_scopes,
+                    depth,
+                );
+            }
+            node.downstream.push(child);
             return;
         }
     }
@@ -984,6 +1032,62 @@ fn resolve_unqualified_column(
     node.downstream.push(child);
 }
 
+fn attach_virtual_source_dependencies(
+    node: &mut LineageNode,
+    scope: &Scope,
+    dialect: Option<DialectType>,
+    source_alias: &str,
+    source_expr: &Expression,
+    trim_selects: bool,
+    all_cte_scopes: &[&Scope],
+    depth: usize,
+) {
+    let parent_name = node.name.clone();
+    let mut seen = HashSet::new();
+    for col_ref in find_column_refs_in_expr(source_expr, dialect) {
+        let key = (
+            col_ref.table.as_ref().map(|t| t.name.clone()),
+            col_ref.column.clone(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        if let Some(table_id) = col_ref.table {
+            let table = table_id.name;
+            if table == source_alias {
+                continue;
+            }
+            resolve_qualified_column(
+                node,
+                scope,
+                dialect,
+                &table,
+                &col_ref.column,
+                &parent_name,
+                trim_selects,
+                all_cte_scopes,
+                depth + 1,
+            );
+        } else {
+            let non_virtual_sources = non_virtual_source_names_from_from_join(scope);
+            if non_virtual_sources.len() == 1 {
+                resolve_qualified_column(
+                    node,
+                    scope,
+                    dialect,
+                    &non_virtual_sources[0],
+                    &col_ref.column,
+                    &parent_name,
+                    trim_selects,
+                    all_cte_scopes,
+                    depth + 1,
+                );
+            }
+        }
+    }
+}
+
 fn source_names_from_from_join(scope: &Scope) -> Vec<String> {
     fn source_name(expr: &Expression) -> Option<String> {
         match expr {
@@ -1034,6 +1138,18 @@ fn source_names_from_from_join(scope: &Scope) -> Vec<String> {
     }
 
     names
+}
+
+fn non_virtual_source_names_from_from_join(scope: &Scope) -> Vec<String> {
+    source_names_from_from_join(scope)
+        .into_iter()
+        .filter(|name| {
+            !matches!(
+                scope.sources.get(name).map(|source| source.kind),
+                Some(SourceKind::Virtual)
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1361,7 @@ fn make_table_column_node(table: &str, column: &str) -> LineageNode {
         Expression::Table(Box::new(crate::expressions::TableRef::new(table))),
     );
     node.source_name = table.to_string();
+    node.source_kind = SourceKind::Table;
     node
 }
 
@@ -1260,29 +1377,45 @@ fn table_name_from_table_ref(table_ref: &crate::expressions::TableRef) -> String
     parts.join(".")
 }
 
+fn apply_source_info_context(
+    node: &mut LineageNode,
+    source_key: &str,
+    source_info: &ScopeSourceInfo,
+) {
+    node.source_kind = source_info.kind;
+    node.source_name =
+        source_info
+            .lineage_name
+            .clone()
+            .unwrap_or_else(|| match &source_info.expression {
+                Expression::Table(table_ref) => table_name_from_table_ref(table_ref),
+                _ => source_key.to_string(),
+            });
+    node.source_alias = source_info.alias.clone();
+}
+
 fn make_table_column_node_from_source(
-    table_alias: &str,
+    source_key: &str,
     column: &str,
-    source: &Expression,
+    source_info: &ScopeSourceInfo,
 ) -> LineageNode {
+    let lineage_name = source_info.lineage_name.as_deref().unwrap_or(source_key);
     let mut node = LineageNode::new(
-        format!("{}.{}", table_alias, column),
+        format!("{}.{}", lineage_name, column),
         Expression::Column(Box::new(crate::expressions::Column {
             name: crate::expressions::Identifier::new(column.to_string()),
-            table: Some(crate::expressions::Identifier::new(table_alias.to_string())),
+            table: Some(crate::expressions::Identifier::new(
+                lineage_name.to_string(),
+            )),
             join_mark: false,
             trailing_comments: vec![],
             span: None,
             inferred_type: None,
         })),
-        source.clone(),
+        source_info.expression.clone(),
     );
 
-    if let Expression::Table(table_ref) = source {
-        node.source_name = table_name_from_table_ref(table_ref);
-    } else {
-        node.source_name = table_alias.to_string();
-    }
+    apply_source_info_context(&mut node, source_key, source_info);
 
     node
 }
@@ -2244,6 +2377,8 @@ mod tests {
                 Expression::Null(crate::expressions::Null),
             )],
             source_name: String::new(),
+            source_kind: SourceKind::Unknown,
+            source_alias: None,
             reference_node_name: String::new(),
         };
 
@@ -2534,8 +2669,10 @@ FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS
             .first()
             .expect("week_start should have downstream lineage");
 
-        assert_eq!(child.name, "date_val.date_val");
-        assert_eq!(child.source_name, "date_val");
+        assert_eq!(child.name, "_0.date_val");
+        assert_eq!(child.source_name, "_0");
+        assert_eq!(child.source_kind, SourceKind::Virtual);
+        assert_eq!(child.source_alias.as_deref(), Some("date_val"));
 
         let Expression::Column(column) = &child.expression else {
             panic!(
@@ -2546,13 +2683,83 @@ FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS
         assert_eq!(column.name.name, "date_val");
         assert_eq!(
             column.table.as_ref().map(|table| table.name.as_str()),
-            Some("date_val")
+            Some("_0")
         );
         assert!(
             matches!(&child.source, Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) && alias.alias.name == "date_val"),
             "expected UNNEST source expression, got {:?}",
             child.source
         );
+    }
+
+    #[test]
+    fn test_lineage_real_table_named_like_unnest_alias_is_not_virtual() {
+        let expr =
+            parse_one("SELECT date_val.id FROM date_val", DialectType::BigQuery).expect("parse");
+
+        let node = lineage("id", &expr, Some(DialectType::BigQuery), false).expect("lineage");
+        let child = node.downstream.first().expect("id should have lineage");
+
+        assert_eq!(child.name, "date_val.id");
+        assert_eq!(child.source_name, "date_val");
+        assert_eq!(child.source_kind, SourceKind::Table);
+        assert_eq!(child.source_alias, None);
+    }
+
+    #[test]
+    fn test_lineage_multiple_bigquery_unnest_sources_get_stable_virtual_names() {
+        let expr = parse_one(
+            r#"
+SELECT a.a AS first_value, b.b AS second_value
+FROM UNNEST(GENERATE_ARRAY(1, 2)) AS a
+JOIN UNNEST(GENERATE_ARRAY(3, 4)) AS b ON TRUE
+"#,
+            DialectType::BigQuery,
+        )
+        .expect("parse");
+
+        let first =
+            lineage("first_value", &expr, Some(DialectType::BigQuery), false).expect("lineage");
+        let second =
+            lineage("second_value", &expr, Some(DialectType::BigQuery), false).expect("lineage");
+
+        let first_child = first.downstream.first().expect("first source");
+        let second_child = second.downstream.first().expect("second source");
+
+        assert_eq!(first_child.name, "_0.a");
+        assert_eq!(first_child.source_name, "_0");
+        assert_eq!(first_child.source_alias.as_deref(), Some("a"));
+        assert_eq!(first_child.source_kind, SourceKind::Virtual);
+
+        assert_eq!(second_child.name, "_1.b");
+        assert_eq!(second_child.source_name, "_1");
+        assert_eq!(second_child.source_alias.as_deref(), Some("b"));
+        assert_eq!(second_child.source_kind, SourceKind::Virtual);
+    }
+
+    #[test]
+    fn test_lineage_table_backed_unnest_points_to_real_source_column() {
+        let expr = parse_one(
+            r#"
+SELECT item.item AS item
+FROM t JOIN UNNEST(t.items) AS item ON TRUE
+"#,
+            DialectType::BigQuery,
+        )
+        .expect("parse");
+
+        let node = lineage("item", &expr, Some(DialectType::BigQuery), false).expect("lineage");
+        let virtual_child = node.downstream.first().expect("virtual item source");
+        assert_eq!(virtual_child.name, "_0.item");
+        assert_eq!(virtual_child.source_kind, SourceKind::Virtual);
+
+        let real_child = virtual_child
+            .downstream
+            .first()
+            .expect("UNNEST(t.items) should depend on t.items");
+        assert_eq!(real_child.name, "t.items");
+        assert_eq!(real_child.source_name, "t");
+        assert_eq!(real_child.source_kind, SourceKind::Table);
     }
 
     #[test]

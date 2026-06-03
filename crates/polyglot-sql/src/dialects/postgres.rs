@@ -18,9 +18,9 @@
 use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
-    AggFunc, BinaryOp, BooleanLiteral, Case, Cast, CeilFunc, DataType, DateTimeField, Expression,
-    ExtractFunc, Function, Interval, IntervalUnit, IntervalUnitSpec, Join, JoinKind, Literal,
-    Paren, UnaryFunc, VarArgFunc,
+    AggFunc, AggregateFunction, BinaryOp, BooleanLiteral, Case, Cast, CeilFunc, DataType,
+    DateTimeField, Expression, ExtractFunc, Function, Interval, IntervalUnit, IntervalUnitSpec,
+    Join, JoinKind, Literal, Paren, UnaryFunc, VarArgFunc,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
@@ -263,16 +263,32 @@ impl DialectImpl for PostgresDialect {
             // BOOLEAN AGGREGATES
             // ============================================
             // LogicalAnd -> BOOL_AND
-            Expression::LogicalAnd(f) => Ok(Expression::Function(Box::new(Function::new(
-                "BOOL_AND".to_string(),
-                vec![f.this],
-            )))),
+            Expression::LogicalAnd(f) => {
+                Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    name: "BOOL_AND".to_string(),
+                    args: vec![f.this],
+                    distinct: f.distinct,
+                    filter: f.filter,
+                    order_by: f.order_by,
+                    limit: f.limit,
+                    ignore_nulls: f.ignore_nulls,
+                    inferred_type: f.inferred_type,
+                })))
+            }
 
             // LogicalOr -> BOOL_OR
-            Expression::LogicalOr(f) => Ok(Expression::Function(Box::new(Function::new(
-                "BOOL_OR".to_string(),
-                vec![f.this],
-            )))),
+            Expression::LogicalOr(f) => {
+                Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    name: "BOOL_OR".to_string(),
+                    args: vec![f.this],
+                    distinct: f.distinct,
+                    filter: f.filter,
+                    order_by: f.order_by,
+                    limit: f.limit,
+                    ignore_nulls: f.ignore_nulls,
+                    inferred_type: f.inferred_type,
+                })))
+            }
 
             // Xor -> PostgreSQL bool_xor pattern: a <> b for boolean values
             Expression::Xor(f) => {

@@ -314,7 +314,7 @@
       "sql": "SELECT x ILIKE '%foo%'",
       "write": {
         "mysql": "SELECT LOWER(x) LIKE LOWER('%foo%')",
-        "tsql": "SELECT LOWER(x) LIKE LOWER('%foo%')",
+        "tsql": "SELECT CASE WHEN LOWER(x) LIKE LOWER('%foo%') THEN 1 WHEN NOT LOWER(x) LIKE LOWER('%foo%') THEN 0 END",
         "duckdb": "SELECT x ILIKE '%foo%'",
         "postgresql": "SELECT x ILIKE '%foo%'",
         "snowflake": "SELECT x ILIKE '%foo%'",
@@ -363,11 +363,11 @@
       "sql": "SELECT BOOL_AND(x) FROM t",
       "write": {
         "snowflake": "SELECT BOOLAND_AGG(x) FROM t",
-        "duckdb": "SELECT BOOL_AND(x) FROM t",
-        "mysql": "SELECT BOOL_AND(x) FROM t",
+        "duckdb": "SELECT BOOL_AND(CAST(x AS BOOLEAN)) FROM t",
+        "mysql": "SELECT MIN(x) FROM t",
         "postgresql": "SELECT BOOL_AND(x) FROM t",
         "spark": "SELECT BOOL_AND(x) FROM t",
-        "tsql": "SELECT BOOL_AND(x) FROM t"
+        "tsql": "SELECT CAST(MIN(CASE WHEN x <> 0 THEN 1 WHEN NOT x <> 0 THEN 0 ELSE NULL END) AS BIT) FROM t"
       },
       "description": "BOOL_AND: Snowflake→BOOLAND_AGG"
     },
@@ -375,11 +375,11 @@
       "sql": "SELECT BOOL_OR(x) FROM t",
       "write": {
         "snowflake": "SELECT BOOLOR_AGG(x) FROM t",
-        "duckdb": "SELECT BOOL_OR(x) FROM t",
-        "mysql": "SELECT BOOL_OR(x) FROM t",
+        "duckdb": "SELECT BOOL_OR(CAST(x AS BOOLEAN)) FROM t",
+        "mysql": "SELECT MAX(x) FROM t",
         "postgresql": "SELECT BOOL_OR(x) FROM t",
         "spark": "SELECT BOOL_OR(x) FROM t",
-        "tsql": "SELECT BOOL_OR(x) FROM t"
+        "tsql": "SELECT CAST(MAX(CASE WHEN x <> 0 THEN 1 WHEN NOT x <> 0 THEN 0 ELSE NULL END) AS BIT) FROM t"
       },
       "description": "BOOL_OR: Snowflake→BOOLOR_AGG"
     },
@@ -391,7 +391,7 @@
         "mysql": "SELECT VAR_SAMP(x) FROM t",
         "postgresql": "SELECT VAR_SAMP(x) FROM t",
         "spark": "SELECT VAR_SAMP(x) FROM t",
-        "tsql": "SELECT VAR_SAMP(x) FROM t"
+        "tsql": "SELECT VAR(x) FROM t"
       },
       "description": "VAR_SAMP: DuckDB/Snowflake→VARIANCE"
     },
@@ -403,7 +403,7 @@
         "mysql": "SELECT STDDEV_SAMP(x) FROM t",
         "postgresql": "SELECT STDDEV_SAMP(x) FROM t",
         "spark": "SELECT STDDEV_SAMP(x) FROM t",
-        "tsql": "SELECT STDDEV_SAMP(x) FROM t"
+        "tsql": "SELECT STDEV(x) FROM t"
       },
       "description": "STDDEV_SAMP: Snowflake→STDDEV"
     },

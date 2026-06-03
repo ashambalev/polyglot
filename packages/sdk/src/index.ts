@@ -710,7 +710,6 @@ export {
   // Query builders
   SelectBuilder,
   SetOpBuilder,
-  WindowDefBuilder,
   select,
   sign,
   sqlExpr,
@@ -727,23 +726,19 @@ export {
   unionAll,
   update,
   upper,
+  WindowDefBuilder,
 } from './builders';
+export type { DiffEdit, DiffOptions, DiffResult, EditType } from './diff';
+// Re-export diff module
+export { changesOnly, diff, hasChanges } from './diff';
 export type {
-  ValidationError,
-  ValidationOptions,
-  ValidationResult,
-} from './validation';
-// Re-export validation module
-export { ValidationSeverity, validate } from './validation';
+  LineageNode,
+  LineageResult,
+  LineageSourceKind,
+  SourceTablesResult,
+} from './lineage';
 // Re-export lineage module
 export { getSourceTables, lineage, lineageWithSchema } from './lineage';
-export type { LineageNode, LineageResult, SourceTablesResult } from './lineage';
-// Re-export OpenLineage module
-export {
-  openLineageColumnLineage,
-  openLineageJobEvent,
-  openLineageRunEvent,
-} from './openlineage';
 export type {
   OpenLineageColumnLineageFacet,
   OpenLineageColumnLineageField,
@@ -757,11 +752,12 @@ export type {
   OpenLineageTransformation,
   OpenLineageWarning,
 } from './openlineage';
-// Re-export diff module
-export { changesOnly, diff, hasChanges } from './diff';
-export type { DiffEdit, DiffOptions, DiffResult, EditType } from './diff';
-// Re-export planner module
-export { plan } from './planner';
+// Re-export OpenLineage module
+export {
+  openLineageColumnLineage,
+  openLineageJobEvent,
+  openLineageRunEvent,
+} from './openlineage';
 export type {
   JoinType as PlanJoinType,
   PlanResult,
@@ -770,6 +766,15 @@ export type {
   SetOperationType,
   StepKind,
 } from './planner';
+// Re-export planner module
+export { plan } from './planner';
+export type {
+  ValidationError,
+  ValidationOptions,
+  ValidationResult,
+} from './validation';
+// Re-export validation module
+export { ValidationSeverity, validate } from './validation';
 export type {
   ColumnSchema,
   Schema,
@@ -778,14 +783,14 @@ export type {
 } from './validation/schema-validator';
 export { validateWithSchema } from './validation/schema-validator';
 
+import { changesOnly, diff, hasChanges } from './diff';
 // Import new modules for default export
-import { lineage, lineageWithSchema, getSourceTables } from './lineage';
+import { getSourceTables, lineage, lineageWithSchema } from './lineage';
 import {
   openLineageColumnLineage,
   openLineageJobEvent,
   openLineageRunEvent,
 } from './openlineage';
-import { diff, hasChanges, changesOnly } from './diff';
 import { plan } from './planner';
 
 // Default export

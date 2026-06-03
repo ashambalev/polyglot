@@ -46,6 +46,8 @@ impl DialectImpl for FabricDialect {
             identifier_quote_style: IdentifierQuoteStyle::BRACKET,
             dialect: Some(DialectType::Fabric),
             null_ordering_supported: false,
+            aggregate_filter_supported: false,
+            cte_recursive_keyword_required: false,
             ..Default::default()
         }
     }
@@ -107,13 +109,7 @@ impl DialectImpl for FabricDialect {
         // Handle DataType::Decimal specially BEFORE T-SQL transform
         // because TSQL converts DECIMAL to NUMERIC, but Fabric wants DECIMAL
         if let Expression::DataType(DataType::Decimal { precision, scale }) = &expr {
-            let name = if let (Some(p), Some(s)) = (precision, scale) {
-                format!("DECIMAL({}, {})", p, s)
-            } else if let Some(p) = precision {
-                format!("DECIMAL({})", p)
-            } else {
-                "DECIMAL".to_string()
-            };
+            let name = Self::decimal_type_name(*precision, *scale);
             return Ok(Expression::DataType(DataType::Custom { name }));
         }
 
@@ -339,21 +335,9 @@ impl FabricDialect {
             },
 
             // DECIMAL -> DECIMAL (override TSQL which converts to NUMERIC)
-            DataType::Decimal { precision, scale } => {
-                if let (Some(p), Some(s)) = (&precision, &scale) {
-                    DataType::Custom {
-                        name: format!("DECIMAL({}, {})", p, s),
-                    }
-                } else if let Some(p) = &precision {
-                    DataType::Custom {
-                        name: format!("DECIMAL({})", p),
-                    }
-                } else {
-                    DataType::Custom {
-                        name: "DECIMAL".to_string(),
-                    }
-                }
-            }
+            DataType::Decimal { precision, scale } => DataType::Custom {
+                name: Self::decimal_type_name(precision, scale),
+            },
 
             // JSON -> VARCHAR
             DataType::Json => DataType::Custom {
@@ -506,21 +490,9 @@ impl FabricDialect {
 
                     // NUMERIC -> DECIMAL (override TSQL's conversion)
                     // Fabric uses DECIMAL, not NUMERIC
-                    "NUMERIC" => {
-                        if let (Some(p), Some(s)) = (precision, scale) {
-                            DataType::Custom {
-                                name: format!("DECIMAL({}, {})", p, s),
-                            }
-                        } else if let Some(p) = precision {
-                            DataType::Custom {
-                                name: format!("DECIMAL({})", p),
-                            }
-                        } else {
-                            DataType::Custom {
-                                name: "DECIMAL".to_string(),
-                            }
-                        }
-                    }
+                    "DECIMAL" | "NUMERIC" => DataType::Custom {
+                        name: Self::decimal_type_name(precision, scale),
+                    },
 
                     // Pass through other custom types unchanged
                     _ => dt,
@@ -540,6 +512,14 @@ impl FabricDialect {
             Some(p) if p > max => max,
             Some(p) => p,
             None => max, // Default to max if not specified
+        }
+    }
+
+    fn decimal_type_name(precision: Option<u32>, scale: Option<u32>) -> String {
+        match (precision, scale) {
+            (Some(p), Some(s)) => format!("DECIMAL({}, {})", p, s),
+            (Some(p), None) => format!("DECIMAL({})", p),
+            (None, _) => "DECIMAL".to_string(),
         }
     }
 }

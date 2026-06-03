@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.4.3"
+const sdkVersion = "0.4.4"
 
 func Version() string {
 	return sdkVersion
@@ -86,6 +86,8 @@ type LineageNode struct {
 	Source            json.RawMessage `json:"source"`
 	Downstream        []LineageNode   `json:"downstream"`
 	SourceName        string          `json:"source_name"`
+	SourceKind        string          `json:"source_kind"`
+	SourceAlias       *string         `json:"source_alias,omitempty"`
 	ReferenceNodeName string          `json:"reference_node_name"`
 }
 

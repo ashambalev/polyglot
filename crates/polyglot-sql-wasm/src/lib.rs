@@ -2722,6 +2722,24 @@ mod tests {
     }
 
     #[test]
+    fn test_lineage_bigquery_unnest_virtual_source_metadata() {
+        let result = lineage_sql(
+            "SELECT date_val AS week_start FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS date_val",
+            "week_start",
+            "bigquery",
+            false,
+        );
+        assert!(result.contains("\"success\":true"), "Result: {}", result);
+        let result: serde_json::Value = serde_json::from_str(&result).expect("valid wrapper json");
+        let lineage = result["lineage"].as_object().expect("lineage object");
+        let child = &lineage["downstream"][0];
+        assert_eq!(child["name"], "_0.date_val");
+        assert_eq!(child["source_name"], "_0");
+        assert_eq!(child["source_kind"], "virtual");
+        assert_eq!(child["source_alias"], "date_val");
+    }
+
+    #[test]
     fn test_lineage_invalid_column() {
         let result = lineage_sql("SELECT a FROM t", "nonexistent", "generic", false);
         assert!(result.contains("\"success\":false"), "Result: {}", result);

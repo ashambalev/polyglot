@@ -13,12 +13,14 @@
 use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
-    Alias, Cast, Cte, DataType, Expression, Function, Identifier, In, Join, JoinKind, LikeOp,
-    Literal, Null, QuantifiedOp, StringAggFunc, Subquery, UnaryFunc,
+    Alias, BinaryOp, Cast, Column, Cte, DataType, Exists, Expression, Function, Identifier, In,
+    Join, JoinKind, LikeOp, Literal, Null, Over, QuantifiedOp, Select, StringAggFunc, Subquery,
+    UnaryFunc, Where,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
 use crate::tokens::TokenizerConfig;
+use std::collections::HashMap;
 
 /// T-SQL (SQL Server) dialect
 pub struct TSQLDialect;
@@ -51,6 +53,8 @@ impl DialectImpl for TSQLDialect {
             limit_fetch_style: crate::generator::LimitFetchStyle::FetchFirst,
             // NULLS FIRST/LAST not supported in SQL Server
             null_ordering_supported: false,
+            // SQL Server does not support SQL:2003 aggregate FILTER clauses.
+            aggregate_filter_supported: false,
             // SQL Server supports SELECT INTO
             supports_select_into: true,
             // ALTER TABLE doesn't require COLUMN keyword
@@ -159,6 +163,17 @@ impl DialectImpl for TSQLDialect {
                         }
                     })
                     .collect();
+
+                Self::normalize_frame_incompatible_window_functions(&mut select);
+
+                let outer_qualifier = Self::single_select_source_qualifier(&select);
+                if let Some(ref mut where_clause) = select.where_clause {
+                    where_clause.this = Self::rewrite_tuple_in_subquery_predicates(
+                        std::mem::replace(&mut where_clause.this, Expression::Null(Null)),
+                        outer_qualifier.as_ref(),
+                        false,
+                    );
+                }
 
                 // Transform CTEs in the WITH clause to add auto-aliases
                 if let Some(ref mut with) = select.with {
@@ -281,6 +296,11 @@ impl DialectImpl for TSQLDialect {
                 inferred_type: None,
             }))),
 
+            // T-SQL/Fabric do not have boolean aggregates. Preserve PostgreSQL NULL
+            // semantics by returning NULL for unknown input predicates.
+            Expression::LogicalAnd(f) => Self::transform_logical_aggregate(f.this, f.filter, "MIN"),
+            Expression::LogicalOr(f) => Self::transform_logical_aggregate(f.this, f.filter, "MAX"),
+
             // TryCast -> TRY_CAST (SQL Server supports TRY_CAST starting from 2012)
             Expression::TryCast(c) => Ok(Expression::TryCast(c)),
 
@@ -332,43 +352,10 @@ impl DialectImpl for TSQLDialect {
                 vec![f.this],
             )))),
 
-            // LATERAL JOIN -> CROSS APPLY in SQL Server
-            Expression::Join(join) if join.kind == JoinKind::Lateral => {
-                Ok(Expression::Join(Box::new(Join {
-                    this: join.this,
-                    on: None,
-                    using: join.using,
-                    kind: JoinKind::CrossApply,
-                    use_inner_keyword: false,
-                    use_outer_keyword: false,
-                    deferred_condition: false,
-                    join_hint: None,
-                    match_condition: None,
-                    pivots: join.pivots,
-                    comments: join.comments,
-                    nesting_group: 0,
-                    directed: false,
-                })))
-            }
-
-            // LEFT LATERAL JOIN -> OUTER APPLY in SQL Server
-            Expression::Join(join) if join.kind == JoinKind::LeftLateral => {
-                Ok(Expression::Join(Box::new(Join {
-                    this: join.this,
-                    on: None, // APPLY doesn't use ON clause
-                    using: join.using,
-                    kind: JoinKind::OuterApply,
-                    use_inner_keyword: false,
-                    use_outer_keyword: false,
-                    deferred_condition: false,
-                    join_hint: None,
-                    match_condition: None,
-                    pivots: join.pivots,
-                    comments: join.comments,
-                    nesting_group: 0,
-                    directed: false,
-                })))
-            }
+            // PostgreSQL LATERAL join forms -> SQL Server APPLY.
+            Expression::Join(join) => Ok(Expression::Join(Box::new(
+                Self::transform_lateral_join_to_apply(*join),
+            ))),
 
             // LENGTH -> LEN in SQL Server
             Expression::Length(f) => Ok(Expression::Function(Box::new(Function::new(
@@ -379,6 +366,14 @@ impl DialectImpl for TSQLDialect {
             // STDDEV -> STDEV in SQL Server
             Expression::Stddev(f) => Ok(Expression::Function(Box::new(Function::new(
                 "STDEV".to_string(),
+                vec![f.this],
+            )))),
+            Expression::StddevSamp(f) => Ok(Expression::Function(Box::new(Function::new(
+                "STDEV".to_string(),
+                vec![f.this],
+            )))),
+            Expression::StddevPop(f) => Ok(Expression::Function(Box::new(Function::new(
+                "STDEVP".to_string(),
                 vec![f.this],
             )))),
 
@@ -530,6 +525,10 @@ impl DialectImpl for TSQLDialect {
 
             // Variance -> VAR
             Expression::Variance(f) => Ok(Expression::Function(Box::new(Function::new(
+                "VAR".to_string(),
+                vec![f.this],
+            )))),
+            Expression::VarSamp(f) => Ok(Expression::Function(Box::new(Function::new(
                 "VAR".to_string(),
                 vec![f.this],
             )))),
@@ -688,6 +687,507 @@ impl DialectImpl for TSQLDialect {
 
 #[cfg(feature = "transpile")]
 impl TSQLDialect {
+    fn normalize_frame_incompatible_window_functions(select: &mut Select) {
+        let window_map: HashMap<String, Over> = select
+            .windows
+            .as_ref()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .map(|window| (window.name.name.to_lowercase(), window.spec.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for expr in &mut select.expressions {
+            Self::normalize_frame_incompatible_window_expr(expr, &window_map);
+        }
+
+        if let Some(order_by) = &mut select.order_by {
+            for ordered in &mut order_by.expressions {
+                Self::normalize_frame_incompatible_window_expr(&mut ordered.this, &window_map);
+            }
+        }
+
+        if let Some(qualify) = &mut select.qualify {
+            Self::normalize_frame_incompatible_window_expr(&mut qualify.this, &window_map);
+        }
+    }
+
+    fn normalize_frame_incompatible_window_expr(
+        expr: &mut Expression,
+        window_map: &HashMap<String, Over>,
+    ) {
+        match expr {
+            Expression::WindowFunction(wf) => {
+                Self::normalize_frame_incompatible_window_expr(&mut wf.this, window_map);
+
+                if !Self::is_tsql_frame_incompatible_window_function(&wf.this) {
+                    return;
+                }
+
+                wf.over.frame = None;
+
+                let Some(window_name) = wf.over.window_name.clone() else {
+                    return;
+                };
+                let Some(named_spec) =
+                    Self::resolve_named_window_spec(&window_name.name, window_map, &mut Vec::new())
+                else {
+                    return;
+                };
+
+                if named_spec.frame.is_none() {
+                    return;
+                }
+
+                if wf.over.partition_by.is_empty() {
+                    wf.over.partition_by = named_spec.partition_by;
+                }
+                if wf.over.order_by.is_empty() {
+                    wf.over.order_by = named_spec.order_by;
+                }
+                wf.over.window_name = None;
+                wf.over.frame = None;
+            }
+            Expression::Alias(alias) => {
+                Self::normalize_frame_incompatible_window_expr(&mut alias.this, window_map);
+            }
+            Expression::Paren(paren) => {
+                Self::normalize_frame_incompatible_window_expr(&mut paren.this, window_map);
+            }
+            Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+                Self::normalize_frame_incompatible_window_expr(&mut cast.this, window_map);
+            }
+            Expression::Function(function) => {
+                for arg in &mut function.args {
+                    Self::normalize_frame_incompatible_window_expr(arg, window_map);
+                }
+            }
+            Expression::Case(case) => {
+                if let Some(operand) = &mut case.operand {
+                    Self::normalize_frame_incompatible_window_expr(operand, window_map);
+                }
+                for (condition, result) in &mut case.whens {
+                    Self::normalize_frame_incompatible_window_expr(condition, window_map);
+                    Self::normalize_frame_incompatible_window_expr(result, window_map);
+                }
+                if let Some(else_expr) = &mut case.else_ {
+                    Self::normalize_frame_incompatible_window_expr(else_expr, window_map);
+                }
+            }
+            Expression::And(op)
+            | Expression::Or(op)
+            | Expression::Add(op)
+            | Expression::Sub(op)
+            | Expression::Mul(op)
+            | Expression::Div(op)
+            | Expression::Mod(op)
+            | Expression::Eq(op)
+            | Expression::Neq(op)
+            | Expression::Lt(op)
+            | Expression::Lte(op)
+            | Expression::Gt(op)
+            | Expression::Gte(op)
+            | Expression::Match(op)
+            | Expression::BitwiseAnd(op)
+            | Expression::BitwiseOr(op)
+            | Expression::BitwiseXor(op)
+            | Expression::Concat(op)
+            | Expression::Adjacent(op)
+            | Expression::TsMatch(op)
+            | Expression::PropertyEQ(op)
+            | Expression::ArrayContainsAll(op)
+            | Expression::ArrayContainedBy(op)
+            | Expression::ArrayOverlaps(op)
+            | Expression::JSONBContainsAllTopKeys(op)
+            | Expression::JSONBContainsAnyTopKeys(op)
+            | Expression::JSONBDeleteAtPath(op)
+            | Expression::ExtendsLeft(op)
+            | Expression::ExtendsRight(op)
+            | Expression::Is(op)
+            | Expression::MemberOf(op) => {
+                Self::normalize_frame_incompatible_window_expr(&mut op.left, window_map);
+                Self::normalize_frame_incompatible_window_expr(&mut op.right, window_map);
+            }
+            Expression::Like(op) | Expression::ILike(op) => {
+                Self::normalize_frame_incompatible_window_expr(&mut op.left, window_map);
+                Self::normalize_frame_incompatible_window_expr(&mut op.right, window_map);
+                if let Some(escape) = &mut op.escape {
+                    Self::normalize_frame_incompatible_window_expr(escape, window_map);
+                }
+            }
+            Expression::Not(op) | Expression::Neg(op) | Expression::BitwiseNot(op) => {
+                Self::normalize_frame_incompatible_window_expr(&mut op.this, window_map);
+            }
+            Expression::In(in_expr) => {
+                Self::normalize_frame_incompatible_window_expr(&mut in_expr.this, window_map);
+                for value in &mut in_expr.expressions {
+                    Self::normalize_frame_incompatible_window_expr(value, window_map);
+                }
+            }
+            Expression::Between(between) => {
+                Self::normalize_frame_incompatible_window_expr(&mut between.this, window_map);
+                Self::normalize_frame_incompatible_window_expr(&mut between.low, window_map);
+                Self::normalize_frame_incompatible_window_expr(&mut between.high, window_map);
+            }
+            Expression::IsNull(is_null) => {
+                Self::normalize_frame_incompatible_window_expr(&mut is_null.this, window_map);
+            }
+            Expression::IsTrue(is_true) | Expression::IsFalse(is_true) => {
+                Self::normalize_frame_incompatible_window_expr(&mut is_true.this, window_map);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_tsql_frame_incompatible_window_function(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::RowNumber(_)
+                | Expression::Rank(_)
+                | Expression::DenseRank(_)
+                | Expression::NTile(_)
+                | Expression::Ntile(_)
+                | Expression::Lead(_)
+                | Expression::Lag(_)
+                | Expression::PercentRank(_)
+                | Expression::CumeDist(_)
+        )
+    }
+
+    fn resolve_named_window_spec(
+        name: &str,
+        window_map: &HashMap<String, Over>,
+        seen: &mut Vec<String>,
+    ) -> Option<Over> {
+        let key = name.to_lowercase();
+        if seen.iter().any(|seen_name| seen_name == &key) {
+            return None;
+        }
+
+        let named_spec = window_map.get(&key)?.clone();
+        seen.push(key);
+
+        let mut resolved = if let Some(base_window) = &named_spec.window_name {
+            Self::resolve_named_window_spec(&base_window.name, window_map, seen)
+                .unwrap_or_else(Self::empty_over)
+        } else {
+            Self::empty_over()
+        };
+
+        if !named_spec.partition_by.is_empty() {
+            resolved.partition_by = named_spec.partition_by;
+        }
+        if !named_spec.order_by.is_empty() {
+            resolved.order_by = named_spec.order_by;
+        }
+        if named_spec.frame.is_some() {
+            resolved.frame = named_spec.frame;
+        }
+
+        Some(resolved)
+    }
+
+    fn empty_over() -> Over {
+        Over {
+            window_name: None,
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            frame: None,
+            alias: None,
+        }
+    }
+
+    fn transform_lateral_join_to_apply(mut join: Join) -> Join {
+        let Some(apply_kind) = Self::lateral_apply_kind(&join) else {
+            return join;
+        };
+
+        join.this = Self::remove_lateral_marker(join.this);
+        join.on = None;
+        join.using.clear();
+        join.kind = apply_kind;
+        join.use_inner_keyword = false;
+        join.use_outer_keyword = false;
+        join.deferred_condition = false;
+        join.join_hint = None;
+        join.match_condition = None;
+        join.directed = false;
+        join
+    }
+
+    fn lateral_apply_kind(join: &Join) -> Option<JoinKind> {
+        let has_apply_condition = join.using.is_empty() && Self::has_no_or_true_on(&join.on);
+
+        match join.kind {
+            JoinKind::Lateral if has_apply_condition => Some(JoinKind::CrossApply),
+            JoinKind::LeftLateral if has_apply_condition => Some(JoinKind::OuterApply),
+            JoinKind::Cross | JoinKind::Inner
+                if has_apply_condition && Self::is_lateral_table_expression(&join.this) =>
+            {
+                Some(JoinKind::CrossApply)
+            }
+            JoinKind::Left
+                if has_apply_condition && Self::is_lateral_table_expression(&join.this) =>
+            {
+                Some(JoinKind::OuterApply)
+            }
+            _ => None,
+        }
+    }
+
+    fn has_no_or_true_on(on: &Option<Expression>) -> bool {
+        match on {
+            None => true,
+            Some(expr) => Self::is_true_condition(expr),
+        }
+    }
+
+    fn is_true_condition(expr: &Expression) -> bool {
+        match expr {
+            Expression::Boolean(boolean) => boolean.value,
+            Expression::Literal(lit) => {
+                matches!(lit.as_ref(), Literal::Number(value) if value.trim() == "1")
+            }
+            Expression::Eq(op) => {
+                Self::is_true_condition(&op.left) && Self::is_true_condition(&op.right)
+            }
+            Expression::Paren(paren) => Self::is_true_condition(&paren.this),
+            _ => false,
+        }
+    }
+
+    fn is_lateral_table_expression(expr: &Expression) -> bool {
+        match expr {
+            Expression::Subquery(subquery) => subquery.lateral,
+            Expression::Lateral(_) => true,
+            Expression::Alias(alias) => Self::is_lateral_table_expression(&alias.this),
+            _ => false,
+        }
+    }
+
+    fn remove_lateral_marker(expr: Expression) -> Expression {
+        match expr {
+            Expression::Subquery(mut subquery) => {
+                subquery.lateral = false;
+                Expression::Subquery(subquery)
+            }
+            Expression::Lateral(lateral) => Self::lateral_to_table_expression(*lateral),
+            Expression::Alias(mut alias) => {
+                alias.this = Self::remove_lateral_marker(alias.this);
+                Expression::Alias(alias)
+            }
+            other => other,
+        }
+    }
+
+    fn lateral_to_table_expression(lateral: crate::expressions::Lateral) -> Expression {
+        let expr = *lateral.this;
+        let Some(alias) = lateral.alias else {
+            return expr;
+        };
+
+        Expression::Alias(Box::new(Alias {
+            this: expr,
+            alias: if lateral.alias_quoted {
+                Identifier::quoted(alias)
+            } else {
+                Identifier::new(alias)
+            },
+            column_aliases: lateral
+                .column_aliases
+                .into_iter()
+                .map(Identifier::new)
+                .collect(),
+            alias_explicit_as: true,
+            alias_keyword: None,
+            pre_alias_comments: Vec::new(),
+            trailing_comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn rewrite_tuple_in_subquery_predicates(
+        expr: Expression,
+        outer_qualifier: Option<&Identifier>,
+        under_not: bool,
+    ) -> Expression {
+        match expr {
+            Expression::In(in_expr) if !under_not => {
+                let in_expr = *in_expr;
+                Self::tuple_in_subquery_to_exists(&in_expr, outer_qualifier)
+                    .unwrap_or_else(|| Expression::In(Box::new(in_expr)))
+            }
+            Expression::And(mut op) => {
+                op.left =
+                    Self::rewrite_tuple_in_subquery_predicates(op.left, outer_qualifier, under_not);
+                op.right = Self::rewrite_tuple_in_subquery_predicates(
+                    op.right,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::And(op)
+            }
+            Expression::Or(mut op) => {
+                op.left =
+                    Self::rewrite_tuple_in_subquery_predicates(op.left, outer_qualifier, under_not);
+                op.right = Self::rewrite_tuple_in_subquery_predicates(
+                    op.right,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::Or(op)
+            }
+            Expression::Paren(mut paren) => {
+                paren.this = Self::rewrite_tuple_in_subquery_predicates(
+                    paren.this,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::Paren(paren)
+            }
+            Expression::Not(mut not) => {
+                not.this =
+                    Self::rewrite_tuple_in_subquery_predicates(not.this, outer_qualifier, true);
+                Expression::Not(not)
+            }
+            other => other,
+        }
+    }
+
+    fn tuple_in_subquery_to_exists(
+        in_expr: &In,
+        outer_qualifier: Option<&Identifier>,
+    ) -> Option<Expression> {
+        if in_expr.not || !in_expr.expressions.is_empty() || in_expr.unnest.is_some() {
+            return None;
+        }
+
+        let left_expressions = Self::tuple_expressions(&in_expr.this)?;
+        let mut select = match in_expr.query.as_ref()? {
+            Expression::Select(select) => (**select).clone(),
+            _ => return None,
+        };
+
+        if left_expressions.len() != select.expressions.len() || left_expressions.is_empty() {
+            return None;
+        }
+
+        let inner_qualifier = Self::single_select_source_qualifier(&select);
+        let mut predicates = Vec::with_capacity(left_expressions.len() + 1);
+        for (projection, left) in select
+            .expressions
+            .iter()
+            .cloned()
+            .zip(left_expressions.iter().cloned())
+        {
+            let inner = Self::tuple_in_projection_expr(projection, inner_qualifier.as_ref())?;
+            let outer = Self::qualify_tuple_operand(left, outer_qualifier);
+            predicates.push(Expression::Eq(Box::new(BinaryOp::new(inner, outer))));
+        }
+
+        if let Some(where_clause) = select.where_clause.take() {
+            predicates.push(where_clause.this);
+        }
+
+        select.expressions = vec![Expression::number(1)];
+        select.where_clause = Some(Where {
+            this: Self::and_all(predicates)?,
+        });
+
+        Some(Expression::Exists(Box::new(Exists {
+            this: Expression::Select(Box::new(select)),
+            not: false,
+        })))
+    }
+
+    fn tuple_expressions(expr: &Expression) -> Option<&[Expression]> {
+        match expr {
+            Expression::Tuple(tuple) => Some(&tuple.expressions),
+            Expression::Paren(paren) => Self::tuple_expressions(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn tuple_in_projection_expr(
+        expr: Expression,
+        qualifier: Option<&Identifier>,
+    ) -> Option<Expression> {
+        match expr {
+            Expression::Alias(alias) => Self::tuple_in_projection_expr(alias.this, qualifier),
+            Expression::Column(mut column) => {
+                if column.table.is_none() {
+                    column.table = qualifier.cloned();
+                }
+                Some(Expression::Column(column))
+            }
+            Expression::Identifier(identifier) => {
+                Some(Self::column_from_identifier(identifier, qualifier.cloned()))
+            }
+            Expression::Dot(_) => Some(expr),
+            _ => None,
+        }
+    }
+
+    fn qualify_tuple_operand(expr: Expression, qualifier: Option<&Identifier>) -> Expression {
+        match expr {
+            Expression::Column(mut column) => {
+                if column.table.is_none() {
+                    column.table = qualifier.cloned();
+                }
+                Expression::Column(column)
+            }
+            Expression::Identifier(identifier) => {
+                Self::column_from_identifier(identifier, qualifier.cloned())
+            }
+            other => other,
+        }
+    }
+
+    fn column_from_identifier(identifier: Identifier, table: Option<Identifier>) -> Expression {
+        Expression::Column(Box::new(Column {
+            name: identifier,
+            table,
+            join_mark: false,
+            trailing_comments: Vec::new(),
+            span: None,
+            inferred_type: None,
+        }))
+    }
+
+    fn single_select_source_qualifier(select: &Select) -> Option<Identifier> {
+        if !select.joins.is_empty() {
+            return None;
+        }
+
+        let from = select.from.as_ref()?;
+        if from.expressions.len() != 1 {
+            return None;
+        }
+
+        Self::source_qualifier(&from.expressions[0])
+    }
+
+    fn source_qualifier(source: &Expression) -> Option<Identifier> {
+        match source {
+            Expression::Table(table) => table.alias.clone().or_else(|| Some(table.name.clone())),
+            Expression::Subquery(subquery) => subquery.alias.clone(),
+            _ => None,
+        }
+    }
+
+    fn and_all(mut predicates: Vec<Expression>) -> Option<Expression> {
+        if predicates.is_empty() {
+            return None;
+        }
+
+        let first = predicates.remove(0);
+        Some(predicates.into_iter().fold(first, |left, right| {
+            Expression::And(Box::new(BinaryOp::new(left, right)))
+        }))
+    }
+
     /// Transform data types according to T-SQL TYPE_MAPPING
     pub(super) fn transform_data_type(
         &self,
@@ -761,6 +1261,57 @@ impl TSQLDialect {
             (base, None, None)
         } else {
             (name.to_string(), None, None)
+        }
+    }
+
+    fn transform_logical_aggregate(
+        condition: Expression,
+        filter: Option<Expression>,
+        aggregate_name: &str,
+    ) -> Result<Expression> {
+        let false_condition = Expression::Not(Box::new(crate::expressions::UnaryOp {
+            this: condition.clone(),
+            inferred_type: None,
+        }));
+        let true_condition = Self::apply_aggregate_filter(condition, filter.clone());
+        let false_condition = Self::apply_aggregate_filter(false_condition, filter);
+
+        let case_expr = Expression::Case(Box::new(crate::expressions::Case {
+            operand: None,
+            whens: vec![
+                (true_condition, Expression::number(1)),
+                (false_condition, Expression::number(0)),
+            ],
+            else_: Some(Expression::null()),
+            comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        let case_expr = crate::transforms::ensure_bools(case_expr)?;
+        let aggregate = Expression::Function(Box::new(Function::new(
+            aggregate_name.to_string(),
+            vec![case_expr],
+        )));
+
+        Ok(Expression::Cast(Box::new(Cast {
+            this: aggregate,
+            to: DataType::Custom {
+                name: "BIT".to_string(),
+            },
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        })))
+    }
+
+    fn apply_aggregate_filter(condition: Expression, filter: Option<Expression>) -> Expression {
+        match filter {
+            Some(filter) => Expression::And(Box::new(crate::expressions::BinaryOp::new(
+                filter, condition,
+            ))),
+            None => condition,
         }
     }
 
@@ -1054,6 +1605,16 @@ impl TSQLDialect {
                 f.args,
             )))),
 
+            // Boolean aggregates -> MIN/MAX over a null-preserving CASE, cast back to BIT.
+            "BOOL_AND" | "LOGICAL_AND" | "BOOLAND_AGG" | "EVERY" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Self::transform_logical_aggregate(args.remove(0), None, "MIN")
+            }
+            "BOOL_OR" | "LOGICAL_OR" | "BOOLOR_AGG" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Self::transform_logical_aggregate(args.remove(0), None, "MAX")
+            }
+
             // DATE_ADD(date, interval) -> DATEADD(DAY, interval, date)
             "DATE_ADD" => {
                 if f.args.len() == 2 {
@@ -1120,6 +1681,16 @@ impl TSQLDialect {
                     "STRING_AGG".to_string(),
                     f.args,
                 ))))
+            }
+
+            // Boolean aggregates -> MIN/MAX over a null-preserving CASE, cast back to BIT.
+            "BOOL_AND" | "LOGICAL_AND" | "BOOLAND_AGG" | "EVERY" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Self::transform_logical_aggregate(args.remove(0), f.filter, "MIN")
+            }
+            "BOOL_OR" | "LOGICAL_OR" | "BOOLOR_AGG" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Self::transform_logical_aggregate(args.remove(0), f.filter, "MAX")
             }
 
             // Pass through everything else

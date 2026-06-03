@@ -323,7 +323,13 @@ test-go:
 
 # Build the native FFI library and run Go SDK integration tests against it.
 test-go-integration: build-ffi
-	cd packages/go && POLYGLOT_SQL_FFI_PATH="../../target/ffi_release/$$(case "$$(uname -s)" in Darwin) echo libpolyglot_sql_ffi.dylib ;; MINGW*|MSYS*|CYGWIN*) echo polyglot_sql_ffi.dll ;; *) echo libpolyglot_sql_ffi.so ;; esac)" go test ./...
+	cd packages/go && \
+		ffi_lib=libpolyglot_sql_ffi.so; \
+		case "$$(uname -s)" in \
+			Darwin) ffi_lib=libpolyglot_sql_ffi.dylib ;; \
+			MINGW*|MSYS*|CYGWIN*) ffi_lib=polyglot_sql_ffi.dll ;; \
+		esac; \
+		POLYGLOT_SQL_FFI_PATH="../../target/ffi_release/$$ffi_lib" go test ./...
 
 # -----------------------------------------------------------------------------
 # ClickHouse Tests

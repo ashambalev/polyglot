@@ -9837,16 +9837,18 @@ impl Parser {
                     kind
                 };
 
-                let right = self.parse_select_or_paren_select()?;
+                let mut right = self.parse_select_or_paren_select()?;
+                let (order_by, limit, offset) =
+                    Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Union(Box::new(Union {
                     left,
                     right,
                     all,
                     distinct,
                     with: None,
-                    order_by: None,
-                    limit: None,
-                    offset: None,
+                    order_by,
+                    limit,
+                    offset,
                     distribute_by: None,
                     sort_by: None,
                     cluster_by: None,
@@ -9875,16 +9877,18 @@ impl Parser {
                     kind
                 };
 
-                let right = self.parse_select_or_paren_select()?;
+                let mut right = self.parse_select_or_paren_select()?;
+                let (order_by, limit, offset) =
+                    Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Intersect(Box::new(Intersect {
                     left,
                     right,
                     all,
                     distinct,
                     with: None,
-                    order_by: None,
-                    limit: None,
-                    offset: None,
+                    order_by,
+                    limit,
+                    offset,
                     distribute_by: None,
                     sort_by: None,
                     cluster_by: None,
@@ -9913,16 +9917,18 @@ impl Parser {
                     kind
                 };
 
-                let right = self.parse_select_or_paren_select()?;
+                let mut right = self.parse_select_or_paren_select()?;
+                let (order_by, limit, offset) =
+                    Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Except(Box::new(Except {
                     left,
                     right,
                     all,
                     distinct,
                     with: None,
-                    order_by: None,
-                    limit: None,
-                    offset: None,
+                    order_by,
+                    limit,
+                    offset,
                     distribute_by: None,
                     sort_by: None,
                     cluster_by: None,
@@ -9949,6 +9955,23 @@ impl Parser {
             self.parse_set_operation_modifiers(&mut result)?;
         }
         Ok(result)
+    }
+
+    fn detach_unparenthesized_set_operation_modifiers(
+        expr: &mut Expression,
+    ) -> (
+        Option<OrderBy>,
+        Option<Box<Expression>>,
+        Option<Box<Expression>>,
+    ) {
+        if let Expression::Select(select) = expr {
+            let order_by = select.order_by.take();
+            let limit = select.limit.take().map(|limit| Box::new(limit.this));
+            let offset = select.offset.take().map(|offset| Box::new(offset.this));
+            (order_by, limit, offset)
+        } else {
+            (None, None, None)
+        }
     }
 
     /// Parse BigQuery set operation side (LEFT, RIGHT, FULL) and kind (INNER)
@@ -35330,6 +35353,8 @@ impl Parser {
             | "VARIANCE"
             | "VAR_POP"
             | "VAR_SAMP"
+            | "BOOL_AND"
+            | "BOOL_OR"
             | "MEDIAN"
             | "MODE"
             | "FIRST"
@@ -35529,7 +35554,7 @@ impl Parser {
                         limit,
                         inferred_type: None,
                     };
-                    Ok(match upper_name {
+                    Ok(match canonical_upper_name {
                         "SUM" => Expression::Sum(Box::new(agg)),
                         "AVG" => Expression::Avg(Box::new(agg)),
                         "MIN" => Expression::Min(Box::new(agg)),
@@ -35542,6 +35567,8 @@ impl Parser {
                         "VARIANCE" => Expression::Variance(Box::new(agg)),
                         "VAR_POP" => Expression::VarPop(Box::new(agg)),
                         "VAR_SAMP" => Expression::VarSamp(Box::new(agg)),
+                        "BOOL_AND" => Expression::LogicalAnd(Box::new(agg)),
+                        "BOOL_OR" => Expression::LogicalOr(Box::new(agg)),
                         "MEDIAN" => Expression::Median(Box::new(agg)),
                         "MODE" => Expression::Mode(Box::new(agg)),
                         "FIRST" => Expression::First(Box::new(agg)),
@@ -60896,6 +60923,13 @@ OPTIONS (
         let select = result[0].as_select().unwrap();
         assert!(matches!(select.expressions[0], Expression::Stddev(_)));
         assert!(matches!(select.expressions[1], Expression::Variance(_)));
+
+        // Boolean aggregates and aliases
+        let result = Parser::parse_sql("SELECT BOOL_AND(x), BOOL_OR(y), EVERY(z)").unwrap();
+        let select = result[0].as_select().unwrap();
+        assert!(matches!(select.expressions[0], Expression::LogicalAnd(_)));
+        assert!(matches!(select.expressions[1], Expression::LogicalOr(_)));
+        assert!(matches!(select.expressions[2], Expression::LogicalAnd(_)));
     }
 
     #[test]

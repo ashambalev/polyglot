@@ -8,6 +8,7 @@ use crate::dialects::{Dialect, DialectType};
 use crate::expressions::*;
 use crate::lineage::{self, LineageNode};
 use crate::schema::Schema;
+use crate::scope::SourceKind;
 use crate::traversal::ExpressionWalk;
 use crate::{mapping_schema_from_validation_schema, Error, Result, ValidationSchema};
 use serde::de::{self, Deserializer};
@@ -537,6 +538,9 @@ fn input_fields_for_output(
     let terminals: Vec<TerminalField> = terminals.into_iter().collect();
 
     if terminals.is_empty() {
+        if has_virtual_terminal(&node) {
+            return Ok(Vec::new());
+        }
         warnings.push(OpenLineageWarning::new(
             "W_EMPTY_FIELD_LINEAGE",
             format!(
@@ -623,6 +627,9 @@ fn transformation_subtype(expr: Option<&Expression>, terminals: &[TerminalField]
 
 fn collect_terminal_fields(node: &LineageNode, terminals: &mut BTreeSet<TerminalField>) {
     if node.downstream.is_empty() {
+        if node.source_kind == SourceKind::Virtual {
+            return;
+        }
         if let Expression::Column(column) = &node.expression {
             let table = if !node.source_name.is_empty() {
                 Some(node.source_name.clone())
@@ -644,6 +651,13 @@ fn collect_terminal_fields(node: &LineageNode, terminals: &mut BTreeSet<Terminal
     for child in &node.downstream {
         collect_terminal_fields(child, terminals);
     }
+}
+
+fn has_virtual_terminal(node: &LineageNode) -> bool {
+    if node.downstream.is_empty() {
+        return node.source_kind == SourceKind::Virtual;
+    }
+    node.downstream.iter().any(has_virtual_terminal)
 }
 
 fn expression_contains_aggregate(expr: &Expression) -> bool {
@@ -1200,9 +1214,7 @@ FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS
         .expect("lineage");
         let field = result.facet.fields.get("week_start").expect("week_start");
 
-        assert_eq!(field.input_fields.len(), 1);
-        assert_eq!(field.input_fields[0].name, "date_val");
-        assert_eq!(field.input_fields[0].field, "date_val");
+        assert!(field.input_fields.is_empty());
         assert!(
             result
                 .warnings
@@ -1211,6 +1223,28 @@ FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS
             "did not expect empty-lineage warning, got {:?}",
             result.warnings
         );
+    }
+
+    #[test]
+    fn emits_bigquery_table_backed_unnest_column_lineage() {
+        let mut opts = options();
+        opts.dialect = DialectType::BigQuery;
+        opts.dataset_namespace = Some("bigquery://warehouse".to_string());
+        opts.output_dataset = Some(OpenLineageDatasetId::new("bigquery://warehouse", "items"));
+
+        let result = openlineage_column_lineage(
+            r#"
+SELECT item.item AS item
+FROM t JOIN UNNEST(t.items) AS item ON TRUE
+"#,
+            &opts,
+        )
+        .expect("lineage");
+        let field = result.facet.fields.get("item").expect("item");
+
+        assert_eq!(field.input_fields.len(), 1);
+        assert_eq!(field.input_fields[0].name, "t");
+        assert_eq!(field.input_fields[0].field, "items");
     }
 
     #[test]

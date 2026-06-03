@@ -239,6 +239,10 @@ if err != nil {
 fmt.Println(node.Name, tables)
 ```
 
+`LineageNode.SourceKind` identifies whether a source is a real table, CTE,
+derived table, virtual source, or unknown. `LineageNode.SourceAlias` is set for
+virtual sources such as BigQuery `UNNEST(...) AS alias`.
+
 ### OpenLineage
 
 | API | Description |
@@ -300,7 +304,7 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `SchemaForeignKey` | `Name`, `Columns`, `References` |
 | `SchemaColumnReference` | `Table`, `Column`, `Schema` |
 | `SchemaTableReference` | `Table`, `Columns`, `Schema` |
-| `LineageNode` | `Name`, `Expression`, `Source`, `Downstream`, `SourceName`, `ReferenceNodeName` |
+| `LineageNode` | `Name`, `Expression`, `Source`, `Downstream`, `SourceName`, `SourceKind`, `SourceAlias`, `ReferenceNodeName` |
 | `QualifyTablesOptions` | `DB`, `Catalog`, `Dialect`, `CanonicalizeTableAliases`, `AliasUnaliasedTables`, `AliasUnaliasedSubqueries`, `AliasPrefix`, `NormalizeSetOperationSubqueries` |
 | `RenameTablesOptions` | `AliasRenamedTables`, `PreserveExistingAliases` |
 | `OpenLineageOptions` | `Dialect`, `Producer`, `DatasetNamespace`, `DatasetMappings`, `OutputDataset`, `Schema`, `JobNamespace`, `JobName`, `EventTime`, `RunID`, `EventType` |

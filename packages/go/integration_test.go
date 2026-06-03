@@ -231,6 +231,26 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 		t.Fatalf("unexpected lineage node: %#v", node)
 	}
 
+	bigQueryNode, err := client.Lineage(
+		"week_start",
+		"SELECT date_val AS week_start FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-01-31')) AS date_val",
+		"bigquery",
+	)
+	if err != nil {
+		t.Fatalf("BigQuery UNNEST Lineage: %v", err)
+	}
+	if len(bigQueryNode.Downstream) != 1 {
+		t.Fatalf("unexpected BigQuery UNNEST lineage node: %#v", bigQueryNode)
+	}
+	virtualSource := bigQueryNode.Downstream[0]
+	if virtualSource.Name != "_0.date_val" ||
+		virtualSource.SourceName != "_0" ||
+		virtualSource.SourceKind != "virtual" ||
+		virtualSource.SourceAlias == nil ||
+		*virtualSource.SourceAlias != "date_val" {
+		t.Fatalf("unexpected BigQuery UNNEST virtual source: %#v", virtualSource)
+	}
+
 	tables, err := client.SourceTables("total", "SELECT o.total FROM orders o", "generic")
 	if err != nil {
 		t.Fatalf("SourceTables: %v", err)

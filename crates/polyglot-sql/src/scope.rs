@@ -30,6 +30,30 @@ pub enum ScopeType {
     Udtf,
 }
 
+/// Semantic kind of a source registered in a scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Root query or statement context
+    Root,
+    /// Physical table source
+    Table,
+    /// Derived table/subquery source
+    DerivedTable,
+    /// Common Table Expression source
+    Cte,
+    /// Virtual table source such as UNNEST / UDTF
+    Virtual,
+    /// Unresolved or synthetic fallback source
+    Unknown,
+}
+
+impl Default for SourceKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 /// Information about a source (table or subquery) in a scope
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
@@ -37,6 +61,34 @@ pub struct SourceInfo {
     pub expression: Expression,
     /// Whether this source is a scope (vs. a plain table)
     pub is_scope: bool,
+    /// Semantic source kind for lineage consumers.
+    pub kind: SourceKind,
+    /// User-written alias, when it should be preserved separately from lineage name.
+    pub alias: Option<String>,
+    /// Canonical lineage source name, e.g. synthetic `_0` for virtual sources.
+    pub lineage_name: Option<String>,
+}
+
+impl SourceInfo {
+    pub fn new(expression: Expression, is_scope: bool, kind: SourceKind) -> Self {
+        Self {
+            expression,
+            is_scope,
+            kind,
+            alias: None,
+            lineage_name: None,
+        }
+    }
+
+    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
+        self.alias = Some(alias.into());
+        self
+    }
+
+    pub fn with_lineage_name(mut self, lineage_name: impl Into<String>) -> Self {
+        self.lineage_name = Some(lineage_name.into());
+        self
+    }
 }
 
 /// A column reference found in a scope
@@ -169,51 +221,56 @@ impl Scope {
 
     /// Add a source to this scope
     pub fn add_source(&mut self, name: String, expression: Expression, is_scope: bool) {
-        self.sources.insert(
-            name,
-            SourceInfo {
-                expression,
-                is_scope,
-            },
-        );
+        let kind = if is_scope {
+            SourceKind::DerivedTable
+        } else {
+            SourceKind::Table
+        };
+        self.add_source_info(name, SourceInfo::new(expression, is_scope, kind));
+    }
+
+    /// Add a preconfigured source to this scope
+    pub fn add_source_info(&mut self, name: String, info: SourceInfo) {
+        self.sources.insert(name, info);
         self.clear_cache();
+    }
+
+    /// Add a virtual source such as UNNEST / UDTF.
+    pub fn add_virtual_source(&mut self, alias: String, expression: Expression) {
+        let lineage_name = self.next_virtual_source_name();
+        let info = SourceInfo::new(expression, false, SourceKind::Virtual)
+            .with_alias(alias.clone())
+            .with_lineage_name(lineage_name);
+        self.add_source_info(alias, info);
+    }
+
+    fn next_virtual_source_name(&self) -> String {
+        let count = self
+            .sources
+            .values()
+            .filter(|source| source.kind == SourceKind::Virtual)
+            .count();
+        format!("_{}", count)
     }
 
     /// Add a lateral source to this scope
     pub fn add_lateral_source(&mut self, name: String, expression: Expression, is_scope: bool) {
-        self.lateral_sources.insert(
-            name.clone(),
-            SourceInfo {
-                expression: expression.clone(),
-                is_scope,
-            },
-        );
-        self.sources.insert(
-            name,
-            SourceInfo {
-                expression,
-                is_scope,
-            },
-        );
+        let kind = if is_scope {
+            SourceKind::DerivedTable
+        } else {
+            SourceKind::Table
+        };
+        let info = SourceInfo::new(expression.clone(), is_scope, kind);
+        self.sources.insert(name.clone(), info.clone());
+        self.lateral_sources.insert(name, info);
         self.clear_cache();
     }
 
     /// Add a CTE source to this scope
     pub fn add_cte_source(&mut self, name: String, expression: Expression) {
-        self.cte_sources.insert(
-            name.clone(),
-            SourceInfo {
-                expression: expression.clone(),
-                is_scope: true,
-            },
-        );
-        self.sources.insert(
-            name,
-            SourceInfo {
-                expression,
-                is_scope: true,
-            },
-        );
+        let info = SourceInfo::new(expression, true, SourceKind::Cte);
+        self.cte_sources.insert(name.clone(), info.clone());
+        self.sources.insert(name, info);
         self.clear_cache();
     }
 
@@ -662,7 +719,7 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             };
 
             if let Some(source) = cte_source {
-                scope.add_source(name, source.expression.clone(), true);
+                scope.add_source_info(name, source.clone());
             } else {
                 scope.add_source(name, expr.clone(), false);
             }
@@ -682,11 +739,11 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
         }
         Expression::Unnest(unnest) => {
             if let Some(alias) = &unnest.alias {
-                scope.add_source(alias.name.clone(), expr.clone(), false);
+                scope.add_virtual_source(alias.name.clone(), expr.clone());
             }
         }
         Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
-            scope.add_source(alias.alias.name.clone(), expr.clone(), false);
+            scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
         }
         Expression::Paren(paren) => {
             add_table_to_scope(&paren.this, scope);

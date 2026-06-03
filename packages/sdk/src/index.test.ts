@@ -9,6 +9,7 @@ import {
   getVersion,
   init,
   isInitialized,
+  lineage,
   openLineageColumnLineage,
   openLineageJobEvent,
   openLineageRunEvent,
@@ -131,6 +132,22 @@ describe('Polyglot SDK', () => {
   });
 
   describe('lineage helpers', () => {
+    it('should mark BigQuery UNNEST aliases as virtual lineage sources', () => {
+      const result = lineage(
+        'week_start',
+        "SELECT date_val AS week_start FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-01-31')) AS date_val",
+        Dialect.BigQuery,
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.lineage?.downstream[0]).toMatchObject({
+        name: '_0.date_val',
+        source_name: '_0',
+        source_kind: 'virtual',
+        source_alias: 'date_val',
+      });
+    });
+
     it('should collect source tables from prepared statement bodies', () => {
       const result = getSourceTables(
         'id',

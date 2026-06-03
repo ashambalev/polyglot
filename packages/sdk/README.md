@@ -561,6 +561,11 @@ if (tables.success) {
 }
 ```
 
+Lineage nodes include `source_kind` and optional `source_alias` metadata. Table
+columns are marked as `table`, CTEs as `cte`, derived queries as
+`derived_table`, and virtual sources such as BigQuery `UNNEST(...) AS alias`
+are marked as `virtual`.
+
 ## OpenLineage Output
 
 Generate OpenLineage-compatible JSON payloads from SQL analysis. The SDK only

@@ -543,6 +543,27 @@ fn test_lineage_happy_path() {
 }
 
 #[test]
+fn test_lineage_bigquery_unnest_virtual_source_metadata() {
+    let column = c("week_start");
+    let sql = c(
+        "SELECT date_val AS week_start FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS date_val",
+    );
+    let dialect = c("bigquery");
+    let (status, data, error) = consume_result(polyglot_lineage(
+        column.as_ptr(),
+        sql.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "error={error:?}");
+    let node: Value = serde_json::from_str(&data.expect("missing lineage")).expect("invalid json");
+    let child = &node["downstream"][0];
+    assert_eq!(child["name"], "_0.date_val");
+    assert_eq!(child["source_name"], "_0");
+    assert_eq!(child["source_kind"], "virtual");
+    assert_eq!(child["source_alias"], "date_val");
+}
+
+#[test]
 fn test_source_tables() {
     let column = c("total");
     let sql = c("SELECT o.total FROM orders o");

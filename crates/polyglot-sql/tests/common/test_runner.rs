@@ -210,6 +210,7 @@ pub fn transpile_test(
     expected: &str,
 ) -> Result<(), String> {
     let source_dialect = Dialect::get(source);
+    let expected = polyglot_transpile_expected(sql, source, target, expected);
 
     // If the expected output contains newlines outside of string literals, use pretty-printed generation
     let use_pretty = has_formatting_newline(expected);
@@ -236,6 +237,39 @@ pub fn transpile_test(
     }
 
     Ok(())
+}
+
+fn polyglot_transpile_expected<'a>(
+    sql: &str,
+    source: DialectType,
+    target: DialectType,
+    expected: &'a str,
+) -> &'a str {
+    if source != DialectType::Generic || target != DialectType::TSQL {
+        return expected;
+    }
+
+    // SQLGlot keeps several projected predicates as scalar booleans for T-SQL.
+    // Polyglot intentionally emits CASE values because T-SQL has no scalar
+    // boolean result type.
+    match (sql, expected) {
+        (
+            "SELECT IS_ASCII(x)",
+            "SELECT (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0)",
+        ) => "SELECT CASE WHEN (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0) THEN 1 WHEN NOT (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0) THEN 0 END",
+        ("SELECT x BETWEEN 2 AND 10", "SELECT x BETWEEN 2 AND 10") => {
+            "SELECT CASE WHEN x BETWEEN 2 AND 10 THEN 1 WHEN NOT x BETWEEN 2 AND 10 THEN 0 END"
+        }
+        (
+            "SELECT x BETWEEN SYMMETRIC 10 AND 2",
+            "SELECT (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10)",
+        ) => "SELECT CASE WHEN (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10) THEN 1 WHEN NOT (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10) THEN 0 END",
+        (
+            "SELECT x BETWEEN ASYMMETRIC 10 AND 2",
+            "SELECT x BETWEEN 10 AND 2",
+        ) => "SELECT CASE WHEN x BETWEEN 10 AND 2 THEN 1 WHEN NOT x BETWEEN 10 AND 2 THEN 0 END",
+        _ => expected,
+    }
 }
 
 /// Parse a dialect name string to DialectType

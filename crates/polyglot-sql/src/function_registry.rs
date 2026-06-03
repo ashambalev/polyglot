@@ -821,6 +821,16 @@ pub(crate) const TYPED_FUNCTION_SPECS: &[TypedFunctionSpec] = &[
         parse_kind: TypedParseKind::AggregateLike,
     },
     TypedFunctionSpec {
+        canonical_name: "BOOL_AND",
+        aliases: &["LOGICAL_AND", "EVERY"],
+        parse_kind: TypedParseKind::AggregateLike,
+    },
+    TypedFunctionSpec {
+        canonical_name: "BOOL_OR",
+        aliases: &["LOGICAL_OR"],
+        parse_kind: TypedParseKind::AggregateLike,
+    },
+    TypedFunctionSpec {
         canonical_name: "MEDIAN",
         aliases: &[],
         parse_kind: TypedParseKind::AggregateLike,
@@ -1137,6 +1147,14 @@ pub(crate) const TYPED_DISPATCH_GROUP_SPECS: &[TypedDispatchGroupSpec] = &[
     },
     TypedDispatchGroupSpec {
         name: "VAR_SAMP",
+        group: TypedDispatchGroup::AggregateFamily,
+    },
+    TypedDispatchGroupSpec {
+        name: "BOOL_AND",
+        group: TypedDispatchGroup::AggregateFamily,
+    },
+    TypedDispatchGroupSpec {
+        name: "BOOL_OR",
         group: TypedDispatchGroup::AggregateFamily,
     },
     TypedDispatchGroupSpec {
@@ -2596,6 +2614,8 @@ mod tests {
             "VARIANCE",
             "VAR_POP",
             "VAR_SAMP",
+            "BOOL_AND",
+            "BOOL_OR",
             "MEDIAN",
             "MODE",
             "FIRST",

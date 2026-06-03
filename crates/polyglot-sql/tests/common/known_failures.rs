@@ -209,6 +209,15 @@ pub fn dialect_identity_known_failures(_dialect: &str) -> HashSet<String> {
 }
 
 /// Load transpilation tests that should be skipped for now.
-pub fn transpilation_known_failures(_source: &str, _target: &str) -> HashSet<String> {
-    HashSet::new()
+pub fn transpilation_known_failures(source: &str, target: &str) -> HashSet<String> {
+    let mut failures = HashSet::new();
+
+    if source == "generic" && target == "tsql" {
+        // SQLGlot currently keeps the unsupported T-SQL aggregate FILTER syntax
+        // for COUNT_IF(...). Polyglot rewrites remaining filters into CASE
+        // expressions for T-SQL/Fabric targets.
+        failures.insert("generic->tsql:201".to_string());
+    }
+
+    failures
 }

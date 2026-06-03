@@ -5755,16 +5755,22 @@ impl Generator {
                 JoinKind::RightSemi => self.write_keyword("RIGHT SEMI JOIN"),
                 JoinKind::RightAnti => self.write_keyword("RIGHT ANTI JOIN"),
                 JoinKind::CrossApply => {
-                    // CROSS APPLY -> INNER JOIN LATERAL for non-TSQL dialects
-                    if matches!(self.config.dialect, Some(DialectType::TSQL) | None) {
+                    // CROSS APPLY -> INNER JOIN LATERAL for non-TSQL-like dialects
+                    if matches!(
+                        self.config.dialect,
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) | None
+                    ) {
                         self.write_keyword("CROSS APPLY");
                     } else {
                         self.write_keyword("INNER JOIN LATERAL");
                     }
                 }
                 JoinKind::OuterApply => {
-                    // OUTER APPLY -> LEFT JOIN LATERAL for non-TSQL dialects
-                    if matches!(self.config.dialect, Some(DialectType::TSQL) | None) {
+                    // OUTER APPLY -> LEFT JOIN LATERAL for non-TSQL-like dialects
+                    if matches!(
+                        self.config.dialect,
+                        Some(DialectType::TSQL) | Some(DialectType::Fabric) | None
+                    ) {
                         self.write_keyword("OUTER APPLY");
                     } else {
                         self.write_keyword("LEFT JOIN LATERAL");
@@ -6396,7 +6402,142 @@ impl Generator {
         Ok(())
     }
 
+    fn should_wrap_set_operation_modifiers(
+        &self,
+        order_by: &Option<OrderBy>,
+        limit: &Option<Box<Expression>>,
+        offset: &Option<Box<Expression>>,
+    ) -> bool {
+        let has_row_limit = limit.is_some() || offset.is_some();
+        let has_emulated_null_ordering = order_by.as_ref().map_or(false, |order_by| {
+            order_by
+                .expressions
+                .iter()
+                .any(|ordered| ordered.nulls_first.is_some())
+        });
+
+        (has_row_limit || has_emulated_null_ordering)
+            && matches!(
+                self.config.dialect,
+                Some(DialectType::TSQL) | Some(DialectType::Fabric)
+            )
+    }
+
+    fn generate_tsql_wrapped_set_operation(
+        &mut self,
+        inner: Expression,
+        with: Option<With>,
+        order_by: Option<OrderBy>,
+        limit: Option<Box<Expression>>,
+        offset: Option<Box<Expression>>,
+    ) -> Result<()> {
+        let subquery = Subquery {
+            this: inner,
+            alias: Some(Identifier::new("_l_0".to_string())),
+            column_aliases: Vec::new(),
+            alias_explicit_as: true,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            inferred_type: None,
+        };
+
+        let mut outer_select = Select {
+            expressions: vec![Expression::Star(Star {
+                table: None,
+                except: None,
+                replace: None,
+                rename: None,
+                trailing_comments: Vec::new(),
+                span: None,
+            })],
+            from: Some(From {
+                expressions: vec![Expression::Subquery(Box::new(subquery))],
+            }),
+            with,
+            order_by,
+            limit: limit.map(|limit| Limit {
+                this: *limit,
+                percent: false,
+                comments: Vec::new(),
+            }),
+            offset: offset.map(|offset| Offset {
+                this: *offset,
+                rows: Some(true),
+            }),
+            ..Select::new()
+        };
+
+        if outer_select.offset.is_some() && outer_select.order_by.is_none() {
+            outer_select.order_by = Some(Self::dummy_tsql_order_by());
+        }
+
+        self.generate_select(&outer_select)
+    }
+
+    fn dummy_tsql_order_by() -> OrderBy {
+        let null_select = Expression::Select(Box::new(Select {
+            expressions: vec![Expression::Null(Null)],
+            ..Select::new()
+        }));
+
+        OrderBy {
+            expressions: vec![Ordered {
+                this: Expression::Subquery(Box::new(Subquery {
+                    this: null_select,
+                    alias: None,
+                    column_aliases: Vec::new(),
+                    alias_explicit_as: false,
+                    alias_keyword: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    lateral: false,
+                    modifiers_inside: false,
+                    trailing_comments: Vec::new(),
+                    distribute_by: None,
+                    sort_by: None,
+                    cluster_by: None,
+                    inferred_type: None,
+                })),
+                desc: false,
+                nulls_first: None,
+                explicit_asc: false,
+                with_fill: None,
+            }],
+            siblings: false,
+            comments: Vec::new(),
+        }
+    }
+
     fn generate_union(&mut self, outermost: &Union) -> Result<()> {
+        if self.should_wrap_set_operation_modifiers(
+            &outermost.order_by,
+            &outermost.limit,
+            &outermost.offset,
+        ) {
+            let mut inner = outermost.clone();
+            let with = inner.with.take();
+            let order_by = inner.order_by.take();
+            let limit = inner.limit.take();
+            let offset = inner.offset.take();
+
+            return self.generate_tsql_wrapped_set_operation(
+                Expression::Union(Box::new(inner)),
+                with,
+                order_by,
+                limit,
+                offset,
+            );
+        }
+
         // Collect the left-recursive chain of Union nodes iteratively.
         // This avoids stack overflow for deeply nested chains like
         // SELECT 1 UNION ALL SELECT 2 UNION ALL ... UNION ALL SELECT N
@@ -6556,6 +6697,26 @@ impl Generator {
     }
 
     fn generate_intersect(&mut self, outermost: &Intersect) -> Result<()> {
+        if self.should_wrap_set_operation_modifiers(
+            &outermost.order_by,
+            &outermost.limit,
+            &outermost.offset,
+        ) {
+            let mut inner = outermost.clone();
+            let with = inner.with.take();
+            let order_by = inner.order_by.take();
+            let limit = inner.limit.take();
+            let offset = inner.offset.take();
+
+            return self.generate_tsql_wrapped_set_operation(
+                Expression::Intersect(Box::new(inner)),
+                with,
+                order_by,
+                limit,
+                offset,
+            );
+        }
+
         // Collect the left-recursive chain iteratively to avoid stack overflow
         let mut chain: Vec<&Intersect> = vec![outermost];
         let mut leftmost: &Expression = &outermost.left;
@@ -6707,6 +6868,26 @@ impl Generator {
     }
 
     fn generate_except(&mut self, outermost: &Except) -> Result<()> {
+        if self.should_wrap_set_operation_modifiers(
+            &outermost.order_by,
+            &outermost.limit,
+            &outermost.offset,
+        ) {
+            let mut inner = outermost.clone();
+            let with = inner.with.take();
+            let order_by = inner.order_by.take();
+            let limit = inner.limit.take();
+            let offset = inner.offset.take();
+
+            return self.generate_tsql_wrapped_set_operation(
+                Expression::Except(Box::new(inner)),
+                with,
+                order_by,
+                limit,
+                offset,
+            );
+        }
+
         // Collect the left-recursive chain iteratively to avoid stack overflow
         let mut chain: Vec<&Except> = vec![outermost];
         let mut leftmost: &Expression = &outermost.left;
@@ -17074,11 +17255,11 @@ impl Generator {
         matches!(self.config.dialect, Some(DialectType::ClickHouse))
     }
 
-    /// Generate MOD function - uses % operator for Snowflake/MySQL/Presto/Trino, MOD() for others
+    /// Generate MOD function - uses % operator for dialects that prefer or require it.
     fn generate_mod_func(&mut self, f: &crate::expressions::BinaryFunc) -> Result<()> {
         use crate::dialects::DialectType;
 
-        // Snowflake, MySQL, Presto, Trino, PostgreSQL, and DuckDB prefer x % y instead of MOD(x, y)
+        // Several dialects prefer or require x % y instead of MOD(x, y).
         let use_percent_operator = matches!(
             self.config.dialect,
             Some(DialectType::Snowflake)
@@ -17091,12 +17272,24 @@ impl Generator {
                 | Some(DialectType::Spark)
                 | Some(DialectType::Databricks)
                 | Some(DialectType::Athena)
+                | Some(DialectType::TSQL)
+                | Some(DialectType::Fabric)
         );
 
         if use_percent_operator {
-            // Wrap complex expressions in parens to preserve precedence
-            // Since % has higher precedence than +/-, we need parens for Add/Sub on either side
-            let needs_paren = |e: &Expression| matches!(e, Expression::Add(_) | Expression::Sub(_));
+            // MOD(a, b) treats both arguments as grouped expressions. When
+            // lowering to an infix operator, keep binary arguments grouped.
+            let needs_paren = |e: &Expression| {
+                matches!(
+                    e,
+                    Expression::Add(_)
+                        | Expression::Sub(_)
+                        | Expression::Mul(_)
+                        | Expression::Div(_)
+                        | Expression::Mod(_)
+                        | Expression::ModFunc(_)
+                )
+            };
             if needs_paren(&f.this) {
                 self.write("(");
                 self.generate_expression(&f.this)?;
@@ -19994,9 +20187,9 @@ impl Generator {
     }
 
     fn generate_string_agg(&mut self, f: &StringAggFunc) -> Result<()> {
-        let is_tsql = matches!(
+        let uses_within_group_order = matches!(
             self.config.dialect,
-            Some(crate::dialects::DialectType::TSQL)
+            Some(crate::dialects::DialectType::TSQL | crate::dialects::DialectType::Fabric)
         );
         self.write_keyword("STRING_AGG");
         self.write("(");
@@ -20009,8 +20202,8 @@ impl Generator {
             self.write(", ");
             self.generate_expression(separator)?;
         }
-        // For TSQL, ORDER BY goes in WITHIN GROUP clause after the closing paren
-        if !is_tsql {
+        // TSQL/Fabric put aggregate ORDER BY in WITHIN GROUP after the closing paren.
+        if !uses_within_group_order {
             if let Some(ref order_by) = f.order_by {
                 self.write_space();
                 self.write_keyword("ORDER BY");
@@ -20030,8 +20223,7 @@ impl Generator {
             self.generate_expression(limit)?;
         }
         self.write(")");
-        // TSQL uses WITHIN GROUP (ORDER BY ...) after the function call
-        if is_tsql {
+        if uses_within_group_order {
             if let Some(ref order_by) = f.order_by {
                 self.write_space();
                 self.write_keyword("WITHIN GROUP");
@@ -34923,7 +35115,10 @@ impl Generator {
                 self.generate_expression(position)?;
             }
             self.write(")");
-        } else if matches!(self.config.dialect, Some(DialectType::TSQL)) {
+        } else if matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) {
             // CHARINDEX(substr, str[, position])
             self.write_keyword("CHARINDEX");
             self.write("(");

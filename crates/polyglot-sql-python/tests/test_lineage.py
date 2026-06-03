@@ -70,6 +70,20 @@ def test_lineage_with_schema_resolves_ambiguous_column():
     assert any(name == "u.id" for name in names), f"expected u.id in lineage tree, got: {names}"
 
 
+def test_bigquery_unnest_lineage_marks_virtual_source():
+    sql = """
+SELECT date_val AS week_start
+FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS date_val
+"""
+    result = polyglot_sql.lineage("week_start", sql, dialect="bigquery")
+    child = result["downstream"][0]
+
+    assert child["name"] == "_0.date_val"
+    assert child["source_name"] == "_0"
+    assert child["source_kind"] == "virtual"
+    assert child["source_alias"] == "date_val"
+
+
 def test_openlineage_column_lineage_returns_facet():
     options = {
         "producer": "https://github.com/tobilg/polyglot",

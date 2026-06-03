@@ -13,6 +13,14 @@ import {
 import type { Expression } from './generated/Expression';
 import type { Schema } from './validation/schema';
 
+export type LineageSourceKind =
+  | 'root'
+  | 'table'
+  | 'derived_table'
+  | 'cte'
+  | 'virtual'
+  | 'unknown';
+
 /** A node in the column lineage tree */
 export interface LineageNode {
   name: string;
@@ -20,6 +28,8 @@ export interface LineageNode {
   source: Expression;
   downstream: LineageNode[];
   source_name: string;
+  source_kind: LineageSourceKind;
+  source_alias?: string;
   reference_node_name: string;
 }
 

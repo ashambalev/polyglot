@@ -4,6 +4,80 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.4.4] - 2026-06-03
+
+### Added
+- Lineage nodes now expose `source_kind` and optional `source_alias` metadata
+  across Rust core, C FFI, WASM, Python, Go, and the TypeScript SDK so clients
+  can distinguish physical tables, CTEs, derived tables, virtual sources, and
+  unresolved sources.
+- Regression coverage for BigQuery `UNNEST` lineage metadata across the native
+  wrappers and SDKs, including Go and TypeScript SDK assertions.
+
+### Changed
+- OpenLineage column lineage now ignores purely virtual terminal sources such
+  as standalone BigQuery `UNNEST(...) AS alias` values instead of emitting
+  synthetic physical input fields, while table-backed `UNNEST(t.items)` still
+  resolves to the real source column.
+- PostgreSQL-to-T-SQL and PostgreSQL-to-Fabric transpilation now materializes
+  scalar boolean value expressions as `CASE` values in projection, grouping,
+  ordering, and window contexts while preserving predicate contexts such as
+  `WHERE` and `HAVING`.
+- The `test-go-integration` Makefile target now resolves the platform-specific
+  FFI library name through an explicit shell variable before running Go SDK
+  integration tests.
+
+### Fixed
+- BigQuery `UNNEST(...) AS alias` lineage now uses stable synthetic virtual
+  source names such as `_0`/`_1`, preserves the user-written alias separately,
+  and avoids treating real tables with the same name as virtual sources.
+- PostgreSQL-to-T-SQL and PostgreSQL-to-Fabric transpilation now omits the
+  unsupported `RECURSIVE` keyword from recursive CTE output.
+- PostgreSQL `CROSS JOIN LATERAL`, `JOIN LATERAL`, `INNER JOIN LATERAL`, and
+  `LEFT JOIN LATERAL` now transpile to T-SQL/Fabric `CROSS APPLY` or
+  `OUTER APPLY` when the join has no meaningful join predicate, and Fabric now
+  preserves native `APPLY` joins during generation.
+- T-SQL and Fabric output now strips unsupported window frames from
+  ranking/navigation window functions such as `ROW_NUMBER`, `RANK`, `NTILE`,
+  `LEAD`, and `LAG`; framed named windows are inlined only for the affected
+  function so aggregate uses of the same named window remain unchanged.
+- PostgreSQL `MOD(a, b)` now lowers to the T-SQL/Fabric `%` operator and keeps
+  compound arguments parenthesized to preserve precedence.
+- PostgreSQL `POSITION(substr IN str)` and `STRPOS(str, substr)` now transpile
+  to Fabric `CHARINDEX(substr, str)`.
+- PostgreSQL row-value `IN` subqueries such as `(a, b) IN (SELECT x, y ...)`
+  now transpile to correlated `EXISTS` predicates for T-SQL and Fabric when the
+  arity matches, while `NOT IN` and mismatched arity cases are left unchanged.
+- Fabric now maps unqualified PostgreSQL `NUMERIC`/`DECIMAL` casts to
+  `DECIMAL(38, 10)` while preserving explicit precision and scale.
+- PostgreSQL statistical aggregates `STDDEV_SAMP`, `STDDEV_POP`, `VAR_SAMP`,
+  and `VAR_POP` now map to the corresponding T-SQL/Fabric function names
+  `STDEV`, `STDEVP`, `VAR`, and `VARP`.
+- PostgreSQL boolean aggregates `BOOL_AND`, `BOOL_OR`, and `EVERY`, including
+  filtered variants, now transpile to null-preserving T-SQL/Fabric `MIN`/`MAX`
+  `CASE` aggregates cast to `BIT`.
+- T-SQL and Fabric aggregate `FILTER (WHERE ...)` clauses now transpile to
+  conditional aggregate inputs for counts, distinct counts, ordinary
+  aggregates, and window aggregates.
+- PostgreSQL `STRING_AGG(value, sep ORDER BY ...)` now emits T-SQL/Fabric
+  `WITHIN GROUP (ORDER BY ...)`, including NULL-ordering emulation where
+  needed.
+- PostgreSQL `BPCHAR` casts, double-colon casts, and DDL column definitions now
+  normalize to `CHAR` for T-SQL and Fabric.
+- PostgreSQL `= ANY(ARRAY[...])` and `= ANY((...))` predicates now transpile to
+  `IN (...)` for T-SQL and Fabric, with empty arrays lowering to an always
+  false predicate.
+- PostgreSQL-to-Fabric and PostgreSQL-to-T-SQL transpilation now attaches
+  trailing set-operation `ORDER BY`, `LIMIT`, and `OFFSET` clauses to the
+  outer `UNION`/`INTERSECT`/`EXCEPT` result instead of the right-hand operand.
+- Fabric and T-SQL set operations that need row limiting or NULL-ordering
+  emulation are now wrapped in an outer query before applying `ORDER BY` /
+  `TOP` / `OFFSET ... FETCH`, avoiding invalid `CASE WHEN ... IS NULL` sort
+  keys inside the set-operation `ORDER BY`.
+- Set-operation `ORDER BY` expressions now participate in cross-dialect
+  NULL-ordering normalization, preserving PostgreSQL NULL sort semantics when
+  transpiling to Fabric or T-SQL.
+
 ## [0.4.3] - 2026-06-02
 
 ### Added

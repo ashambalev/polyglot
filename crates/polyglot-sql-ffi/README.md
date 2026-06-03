@@ -179,6 +179,10 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_diff`: JSON array of diff edits
 - `polyglot_dialect_list`: JSON array of dialect names
 
+`LineageNode` includes `source_kind` and optional `source_alias` metadata so
+wrappers can distinguish physical table sources from virtual sources such as
+BigQuery `UNNEST(...) AS alias`.
+
 ### Validation payloads
 
 - `errors_json`: JSON array of validation error objects:
