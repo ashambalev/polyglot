@@ -16,9 +16,11 @@ type Library struct {
 	FormatWithOptions        func(string, string, string) Result
 	Optimize                 func(string, string) Result
 	Generate                 func(string, string) Result
+	GenerateDataType         func(string, string) Result
 	Validate                 func(string, string) ValidationResult
 	Parse                    func(string, string) Result
 	ParseOne                 func(string, string) Result
+	ParseDataType            func(string, string) Result
 	Tokenize                 func(string, string) Result
 	AnnotateTypes            func(string, string, string) Result
 	Diff                     func(string, string, string) Result
@@ -30,6 +32,7 @@ type Library struct {
 	OpenLineageColumnLineage func(string, string) Result
 	OpenLineageJobEvent      func(string, string) Result
 	OpenLineageRunEvent      func(string, string) Result
+	AnalyzeQuery             func(string, string) Result
 	DialectList              func() uintptr
 	DialectCount             func() int32
 	Version                  func() uintptr
@@ -76,9 +79,11 @@ func (l *Library) registerAll() error {
 		{"polyglot_format_with_options", &l.FormatWithOptions},
 		{"polyglot_optimize", &l.Optimize},
 		{"polyglot_generate", &l.Generate},
+		{"polyglot_generate_data_type", &l.GenerateDataType},
 		{"polyglot_validate", &l.Validate},
 		{"polyglot_parse", &l.Parse},
 		{"polyglot_parse_one", &l.ParseOne},
+		{"polyglot_parse_data_type", &l.ParseDataType},
 		{"polyglot_tokenize", &l.Tokenize},
 		{"polyglot_annotate_types", &l.AnnotateTypes},
 		{"polyglot_diff", &l.Diff},
@@ -90,6 +95,7 @@ func (l *Library) registerAll() error {
 		{"polyglot_openlineage_column_lineage", &l.OpenLineageColumnLineage},
 		{"polyglot_openlineage_job_event", &l.OpenLineageJobEvent},
 		{"polyglot_openlineage_run_event", &l.OpenLineageRunEvent},
+		{"polyglot_analyze_query", &l.AnalyzeQuery},
 		{"polyglot_dialect_list", &l.DialectList},
 		{"polyglot_dialect_count", &l.DialectCount},
 		{"polyglot_version", &l.Version},

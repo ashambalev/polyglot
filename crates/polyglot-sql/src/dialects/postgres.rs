@@ -65,6 +65,19 @@ impl DialectImpl for PostgresDialect {
         config
             .keywords
             .insert("EXEC".to_string(), TokenType::Command);
+        for command in [
+            "BASE_BACKUP",
+            "CREATE_REPLICATION_SLOT",
+            "DROP_REPLICATION_SLOT",
+            "IDENTIFY_SYSTEM",
+            "READ_REPLICATION_SLOT",
+            "START_REPLICATION",
+            "TIMELINE_HISTORY",
+        ] {
+            config
+                .keywords
+                .insert(command.to_string(), TokenType::Command);
+        }
         config
     }
 

@@ -37,6 +37,8 @@ pub mod optimizer;
 pub mod parser;
 #[cfg(feature = "planner")]
 pub mod planner;
+#[cfg(all(feature = "semantic", feature = "generate"))]
+pub mod query_analysis;
 #[cfg(feature = "semantic")]
 pub mod resolver;
 #[cfg(feature = "semantic")]
@@ -72,7 +74,7 @@ pub use dialects::{TranspileOptions, TranspileTarget};
 pub use error::{Error, Result};
 #[cfg(feature = "semantic")]
 pub use error::{ValidationError, ValidationResult, ValidationSeverity};
-pub use expressions::Expression;
+pub use expressions::{DataType, Expression};
 #[cfg(feature = "semantic")]
 pub use function_catalog::{
     FunctionCatalog, FunctionNameCase, FunctionSignature, HashMapFunctionCatalog,
@@ -89,6 +91,12 @@ pub use optimizer::{
     annotate_types, qualify_tables, QualifyTablesOptions, TypeAnnotator, TypeCoercionClass,
 };
 pub use parser::Parser;
+#[cfg(all(feature = "semantic", feature = "generate"))]
+pub use query_analysis::{
+    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, ProjectionFact, QueryAnalysis,
+    QueryShape, ReferenceConfidence, RelationFact, SetOperationBranchFact, SetOperationFact,
+    TransformKind,
+};
 #[cfg(feature = "semantic")]
 pub use resolver::{is_column_ambiguous, resolve_column, Resolver, ResolverError, ResolverResult};
 #[cfg(feature = "semantic")]
@@ -493,6 +501,31 @@ pub fn parse_one(sql: &str, dialect: DialectType) -> Result<Expression> {
     }
 
     Ok(expressions.remove(0))
+}
+
+/// Parse a standalone SQL data type.
+///
+/// # Arguments
+/// * `sql` - The data type string to parse, e.g. `DECIMAL(10, 2)`
+/// * `dialect` - The dialect to use for parsing
+///
+/// # Returns
+/// The parsed data type
+pub fn parse_data_type(sql: &str, dialect: DialectType) -> Result<DataType> {
+    Dialect::get(dialect).parse_data_type(sql)
+}
+
+/// Generate SQL from a standalone data type.
+///
+/// # Arguments
+/// * `data_type` - The data type to render
+/// * `dialect` - The target dialect
+///
+/// # Returns
+/// The generated type SQL string
+#[cfg(feature = "generate")]
+pub fn generate_data_type(data_type: &DataType, dialect: DialectType) -> Result<String> {
+    Dialect::get(dialect).generate(&Expression::DataType(data_type.clone()))
 }
 
 /// Generate SQL from an AST.

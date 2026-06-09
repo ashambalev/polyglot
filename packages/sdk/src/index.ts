@@ -7,6 +7,7 @@
 
 // Import the WASM module - synchronously initialized on import via bundler target
 import * as wasmModule from '../wasm/polyglot_sql_wasm.js';
+import type { DataType } from './generated/DataType';
 import type { Expression } from './generated/Expression';
 import type { Schema as ValidationSchema } from './validation/schema-validator';
 
@@ -99,6 +100,40 @@ export interface ParseResult {
 }
 
 /**
+ * Result of a standalone data type parse operation
+ */
+export interface DataTypeResult {
+  success: boolean;
+  dataType?: DataType;
+  error?: string;
+  /** 1-based line number where the error occurred */
+  errorLine?: number;
+  /** 1-based column number where the error occurred */
+  errorColumn?: number;
+  /** Start byte offset of the error range */
+  errorStart?: number;
+  /** End byte offset of the error range (exclusive) */
+  errorEnd?: number;
+}
+
+/**
+ * Result of a standalone data type generation operation
+ */
+export interface GenerateDataTypeResult {
+  success: boolean;
+  sql?: string;
+  error?: string;
+  /** 1-based line number where the error occurred */
+  errorLine?: number;
+  /** 1-based column number where the error occurred */
+  errorColumn?: number;
+  /** Start byte offset of the error range */
+  errorStart?: number;
+  /** End byte offset of the error range (exclusive) */
+  errorEnd?: number;
+}
+
+/**
  * Span information for a token, indicating its position in the source SQL.
  */
 export interface SpanInfo {
@@ -150,6 +185,85 @@ export interface FormatOptions {
   maxSetOpChain?: number;
 }
 
+export interface AnalyzeQueryOptions {
+  /** Dialect used for parsing and dialect-aware rendering */
+  dialect?: Dialect | string;
+  /** Optional schema used for qualification and type annotation */
+  schema?: ValidationSchema;
+}
+
+export type QueryShape = 'select' | 'set_operation';
+export type QueryAnalysisSourceKind =
+  | 'root'
+  | 'table'
+  | 'derived_table'
+  | 'cte'
+  | 'virtual'
+  | 'unknown';
+export type TransformKind =
+  | 'direct'
+  | 'cast'
+  | 'aggregation'
+  | 'constant'
+  | 'expression'
+  | 'star';
+export type ReferenceConfidence = 'resolved' | 'ambiguous' | 'unknown';
+
+export interface ColumnReferenceFact {
+  sourceName?: string;
+  sourceAlias?: string;
+  sourceKind: QueryAnalysisSourceKind;
+  table?: string;
+  column: string;
+  unqualified: boolean;
+  confidence: ReferenceConfidence;
+}
+
+export interface ProjectionFact {
+  index: number;
+  name?: string;
+  isStar: boolean;
+  starTable?: string;
+  transformKind: TransformKind;
+  castType?: string;
+  typeHint?: string;
+  upstream: ColumnReferenceFact[];
+}
+
+export interface RelationFact {
+  name: string;
+  alias?: string;
+  kind: QueryAnalysisSourceKind;
+  columns: string[];
+}
+
+export interface SetOperationBranchFact {
+  index: number;
+  projections: ProjectionFact[];
+}
+
+export interface SetOperationFact {
+  kind: 'union' | 'intersect' | 'except' | string;
+  all: boolean;
+  distinct: boolean;
+  outputColumns: string[];
+  branches: SetOperationBranchFact[];
+}
+
+export interface QueryAnalysis {
+  shape: QueryShape;
+  ctes: string[];
+  projections: ProjectionFact[];
+  relations: RelationFact[];
+  setOperations: SetOperationFact[];
+}
+
+export interface QueryAnalysisResult {
+  success: boolean;
+  analysis?: QueryAnalysis;
+  error?: string;
+}
+
 type WasmBindings = typeof wasmModule & {
   transpile_value?: (sql: string, read: string, write: string) => unknown;
   transpile_with_options?: (
@@ -165,7 +279,11 @@ type WasmBindings = typeof wasmModule & {
     options: TranspileOptions,
   ) => unknown;
   parse_value?: (sql: string, dialect: string) => unknown;
+  parse_data_type?: (sql: string, dialect: string) => string;
+  parse_data_type_value?: (sql: string, dialect: string) => unknown;
   generate_value?: (ast: unknown, dialect: string) => unknown;
+  generate_data_type?: (dataTypeJson: string, dialect: string) => string;
+  generate_data_type_value?: (dataType: unknown, dialect: string) => unknown;
   format_sql_value?: (sql: string, dialect: string) => unknown;
   format_sql_with_options?: (
     sql: string,
@@ -189,6 +307,8 @@ type WasmBindings = typeof wasmModule & {
     dialect: string,
     schema_json: string,
   ) => unknown;
+  analyze_query?: (sql: string, options_json: string) => string;
+  analyze_query_value?: (sql: string, options: AnalyzeQueryOptions) => unknown;
 };
 
 const wasm = wasmModule as WasmBindings;
@@ -223,11 +343,45 @@ function parseFailure(context: string, error: unknown): ParseResult {
   };
 }
 
+function dataTypeFailure(context: string, error: unknown): DataTypeResult {
+  return {
+    success: false,
+    dataType: undefined,
+    error: `WASM ${context} failed: ${errorMessage(error)}`,
+    errorLine: undefined,
+    errorColumn: undefined,
+  };
+}
+
+function generateDataTypeFailure(
+  context: string,
+  error: unknown,
+): GenerateDataTypeResult {
+  return {
+    success: false,
+    sql: undefined,
+    error: `WASM ${context} failed: ${errorMessage(error)}`,
+    errorLine: undefined,
+    errorColumn: undefined,
+  };
+}
+
 function decodeWasmPayload<T>(payload: unknown): T {
   if (typeof payload === 'string') {
     return JSON.parse(payload) as T;
   }
   return payload as T;
+}
+
+function queryAnalysisFailure(
+  context: string,
+  error: unknown,
+): QueryAnalysisResult {
+  return {
+    success: false,
+    analysis: undefined,
+    error: `WASM ${context} failed: ${errorMessage(error)}`,
+  };
 }
 
 /**
@@ -342,6 +496,42 @@ export function parse(
 }
 
 /**
+ * Parse a standalone SQL data type.
+ *
+ * @param sql - The data type string to parse
+ * @param dialect - The dialect to use
+ * @returns The parsed DataType AST node
+ *
+ * @example
+ * ```typescript
+ * const result = parseDataType("DECIMAL(10, 2)", Dialect.DuckDB);
+ * console.log(result.dataType);
+ * ```
+ */
+export function parseDataType(
+  sql: string,
+  dialect: Dialect = Dialect.Generic,
+): DataTypeResult {
+  try {
+    if (typeof wasm.parse_data_type_value === 'function') {
+      return decodeWasmPayload<DataTypeResult>(
+        wasm.parse_data_type_value(sql, dialect),
+      );
+    }
+
+    const result = JSON.parse(
+      wasm.parse_data_type(sql, dialect),
+    ) as DataTypeResult & { dataType?: string | DataType };
+    if (result.success && typeof result.dataType === 'string') {
+      result.dataType = JSON.parse(result.dataType) as DataType;
+    }
+    return result as DataTypeResult;
+  } catch (error) {
+    return dataTypeFailure('parseDataType', error);
+  }
+}
+
+/**
  * Tokenize SQL into a token stream.
  *
  * @param sql - The SQL string to tokenize
@@ -403,6 +593,40 @@ export function generate(
     return JSON.parse(wasm.generate(astJson, dialect)) as TranspileResult;
   } catch (error) {
     return transpileFailure('generate', error);
+  }
+}
+
+/**
+ * Generate SQL from a standalone DataType AST node.
+ *
+ * @param dataType - The DataType object to render
+ * @param dialect - The target dialect
+ * @returns The generated data type SQL
+ *
+ * @example
+ * ```typescript
+ * const parsed = parseDataType("VARCHAR(255)", Dialect.DuckDB);
+ * const rendered = generateDataType(parsed.dataType!, Dialect.PostgreSQL);
+ * // rendered.sql = "VARCHAR(255)"
+ * ```
+ */
+export function generateDataType(
+  dataType: DataType,
+  dialect: Dialect = Dialect.Generic,
+): GenerateDataTypeResult {
+  try {
+    if (typeof wasm.generate_data_type_value === 'function') {
+      return decodeWasmPayload<GenerateDataTypeResult>(
+        wasm.generate_data_type_value(dataType, dialect),
+      );
+    }
+
+    const dataTypeJson = JSON.stringify(dataType);
+    return JSON.parse(
+      wasm.generate_data_type(dataTypeJson, dialect),
+    ) as GenerateDataTypeResult;
+  } catch (error) {
+    return generateDataTypeFailure('generateDataType', error);
   }
 }
 
@@ -497,6 +721,40 @@ export function getDialects(): string[] {
  */
 export function getVersion(): string {
   return wasm.version();
+}
+
+/**
+ * Return compact query analysis facts for a SELECT or set operation.
+ */
+export function analyzeQuery(
+  sql: string,
+  options: AnalyzeQueryOptions = {},
+): QueryAnalysisResult {
+  try {
+    const normalized: AnalyzeQueryOptions = {
+      dialect: Dialect.Generic,
+      ...options,
+    };
+
+    if (typeof wasm.analyze_query_value === 'function') {
+      return decodeWasmPayload<QueryAnalysisResult>(
+        wasm.analyze_query_value(sql, normalized),
+      );
+    }
+
+    if (typeof wasm.analyze_query === 'function') {
+      return JSON.parse(
+        wasm.analyze_query(sql, JSON.stringify(normalized)),
+      ) as QueryAnalysisResult;
+    }
+
+    return {
+      success: false,
+      error: 'analyze_query not available in this WASM build',
+    };
+  } catch (error) {
+    return queryAnalysisFailure('analyzeQuery', error);
+  }
 }
 
 /**
@@ -617,6 +875,16 @@ export class Polyglot {
   }
 
   /**
+   * Parse a standalone SQL data type.
+   */
+  parseDataType(
+    sql: string,
+    dialect: Dialect = Dialect.Generic,
+  ): DataTypeResult {
+    return parseDataType(sql, dialect);
+  }
+
+  /**
    * Tokenize SQL into a token stream.
    */
   tokenize(sql: string, dialect: Dialect = Dialect.Generic): TokenizeResult {
@@ -628,6 +896,16 @@ export class Polyglot {
    */
   generate(ast: any, dialect: Dialect = Dialect.Generic): TranspileResult {
     return generate(ast, dialect);
+  }
+
+  /**
+   * Generate SQL from a standalone DataType AST node.
+   */
+  generateDataType(
+    dataType: DataType,
+    dialect: Dialect = Dialect.Generic,
+  ): GenerateDataTypeResult {
+    return generateDataType(dataType, dialect);
   }
 
   /**
@@ -672,6 +950,16 @@ export class Polyglot {
     schema?: ValidationSchema,
   ): AnnotateTypesResult {
     return annotateTypes(sql, dialect, schema);
+  }
+
+  /**
+   * Return compact query analysis facts for a SELECT or set operation.
+   */
+  analyzeQuery(
+    sql: string,
+    options: AnalyzeQueryOptions = {},
+  ): QueryAnalysisResult {
+    return analyzeQuery(sql, options);
   }
 }
 
@@ -813,6 +1101,7 @@ export type {
   SetOperationType,
   StepKind,
 } from './planner';
+export type { DataType } from './generated/DataType';
 // Re-export planner module
 export { plan } from './planner';
 export type {
@@ -846,10 +1135,13 @@ export default {
   isInitialized,
   transpile,
   parse,
+  parseDataType,
   tokenize,
   generate,
+  generateDataType,
   format,
   annotateTypes,
+  analyzeQuery,
   getDialects,
   getVersion,
   lineage,

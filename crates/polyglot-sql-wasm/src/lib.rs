@@ -6,10 +6,10 @@
 pub mod builders;
 
 use polyglot_sql::{
-    ast_transforms,
+    analyze_query as core_analyze_query, ast_transforms,
     dialects::{Dialect, DialectType, TranspileOptions},
     diff::{diff_with_config, DiffConfig, Edit},
-    expressions::Expression,
+    expressions::{DataType, Expression},
     format as core_format, format_with_options as core_format_with_options,
     lineage::{self, LineageNode},
     mapping_schema_from_validation_schema,
@@ -20,9 +20,9 @@ use polyglot_sql::{
         OpenLineageDataset, OpenLineageOptions, OpenLineageWarning,
     },
     planner::{Plan, Step},
-    validate_with_schema as core_validate_with_schema,
-    FormatGuardOptions as CoreFormatGuardOptions, QualifyTablesOptions, RenameTablesOptions,
-    SchemaValidationOptions as CoreSchemaValidationOptions, Token,
+    validate_with_schema as core_validate_with_schema, AnalyzeQueryOptions,
+    FormatGuardOptions as CoreFormatGuardOptions, QualifyTablesOptions, QueryAnalysis,
+    RenameTablesOptions, SchemaValidationOptions as CoreSchemaValidationOptions, Token,
     ValidationOptions as CoreValidationOptions, ValidationResult as CoreValidationResult,
     ValidationSchema as CoreValidationSchema,
 };
@@ -76,6 +76,57 @@ pub struct ParseResult {
 pub struct ParseValueResult {
     pub success: bool,
     pub ast: Option<Vec<Expression>>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_start: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_end: Option<usize>,
+}
+
+/// Result type for standalone data type parse operations.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataTypeResult {
+    pub success: bool,
+    pub data_type: Option<String>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_start: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_end: Option<usize>,
+}
+
+/// Result type for standalone data type parse operations with structured values.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataTypeValueResult {
+    pub success: bool,
+    pub data_type: Option<DataType>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_start: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_end: Option<usize>,
+}
+
+/// Result type for standalone data type generation.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateDataTypeResult {
+    pub success: bool,
+    pub sql: Option<String>,
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_line: Option<usize>,
@@ -352,6 +403,98 @@ fn parse_value_internal(sql: &str, dialect: &str) -> ParseValueResult {
     }
 }
 
+/// Parse a standalone SQL data type and return a JSON string payload.
+#[wasm_bindgen]
+pub fn parse_data_type(sql: &str, dialect: &str) -> String {
+    set_panic_hook();
+
+    let result = parse_data_type_internal(sql, dialect);
+    serialize_result(&result)
+}
+
+/// Parse a standalone SQL data type and return a structured JS value payload.
+#[wasm_bindgen]
+pub fn parse_data_type_value(sql: &str, dialect: &str) -> JsValue {
+    set_panic_hook();
+
+    let result = parse_data_type_value_internal(sql, dialect);
+    serialize_result_value(&result)
+}
+
+fn parse_data_type_internal(sql: &str, dialect: &str) -> DataTypeResult {
+    let result = parse_data_type_value_internal(sql, dialect);
+    match result.data_type {
+        Some(data_type) => match serde_json::to_string(&data_type) {
+            Ok(data_type_json) => DataTypeResult {
+                success: true,
+                data_type: Some(data_type_json),
+                error: None,
+                error_line: None,
+                error_column: None,
+                error_start: None,
+                error_end: None,
+            },
+            Err(e) => DataTypeResult {
+                success: false,
+                data_type: None,
+                error: Some(format!("Failed to serialize DataType: {}", e)),
+                error_line: None,
+                error_column: None,
+                error_start: None,
+                error_end: None,
+            },
+        },
+        None => DataTypeResult {
+            success: result.success,
+            data_type: None,
+            error: result.error,
+            error_line: result.error_line,
+            error_column: result.error_column,
+            error_start: result.error_start,
+            error_end: result.error_end,
+        },
+    }
+}
+
+fn parse_data_type_value_internal(sql: &str, dialect: &str) -> DataTypeValueResult {
+    let dialect_type = match dialect.parse::<DialectType>() {
+        Ok(d) => d,
+        Err(e) => {
+            return DataTypeValueResult {
+                success: false,
+                data_type: None,
+                error: Some(format!("Invalid dialect: {}", e)),
+                error_line: e.line(),
+                error_column: e.column(),
+                error_start: e.start(),
+                error_end: e.end(),
+            };
+        }
+    };
+
+    let d = Dialect::get(dialect_type);
+    match d.parse_data_type(sql) {
+        Ok(data_type) => DataTypeValueResult {
+            success: true,
+            data_type: Some(data_type),
+            error: None,
+            error_line: None,
+            error_column: None,
+            error_start: None,
+            error_end: None,
+        },
+        Err(e) => DataTypeValueResult {
+            success: false,
+            data_type: None,
+            error: Some(e.to_string()),
+            error_line: e.line(),
+            error_column: e.column(),
+            error_start: e.start(),
+            error_end: e.end(),
+        },
+    }
+}
+
 /// Generate SQL from an AST (provided as JSON).
 ///
 /// # Arguments
@@ -407,6 +550,54 @@ pub fn generate_value(ast: JsValue, dialect: &str) -> JsValue {
     serialize_result_value(&result)
 }
 
+/// Generate SQL from a standalone DataType JSON object.
+#[wasm_bindgen]
+pub fn generate_data_type(data_type_json: &str, dialect: &str) -> String {
+    set_panic_hook();
+
+    let result = generate_data_type_internal(data_type_json, dialect);
+    serialize_result(&result)
+}
+
+/// Generate SQL from a standalone DataType represented as a structured JS value.
+#[wasm_bindgen]
+pub fn generate_data_type_value(data_type: JsValue, dialect: &str) -> JsValue {
+    set_panic_hook();
+
+    let dialect_type = match dialect.parse::<DialectType>() {
+        Ok(d) => d,
+        Err(e) => {
+            return serialize_result_value(&GenerateDataTypeResult {
+                success: false,
+                sql: None,
+                error: Some(format!("Invalid dialect: {}", e)),
+                error_line: e.line(),
+                error_column: e.column(),
+                error_start: e.start(),
+                error_end: e.end(),
+            });
+        }
+    };
+
+    let data_type: DataType = match serde_wasm_bindgen::from_value(data_type) {
+        Ok(data_type) => data_type,
+        Err(e) => {
+            return serialize_result_value(&GenerateDataTypeResult {
+                success: false,
+                sql: None,
+                error: Some(format!("Invalid DataType value: {}", e)),
+                error_line: None,
+                error_column: None,
+                error_start: None,
+                error_end: None,
+            });
+        }
+    };
+
+    let result = generate_data_type_with_dialect(data_type, dialect_type);
+    serialize_result_value(&result)
+}
+
 fn generate_internal(ast_json: &str, dialect: &str) -> TranspileResult {
     let dialect_type = match dialect.parse::<DialectType>() {
         Ok(d) => d,
@@ -439,6 +630,67 @@ fn generate_internal(ast_json: &str, dialect: &str) -> TranspileResult {
     };
 
     generate_from_expressions_with_dialect(expressions, dialect_type)
+}
+
+fn generate_data_type_internal(data_type_json: &str, dialect: &str) -> GenerateDataTypeResult {
+    let dialect_type = match dialect.parse::<DialectType>() {
+        Ok(d) => d,
+        Err(e) => {
+            return GenerateDataTypeResult {
+                success: false,
+                sql: None,
+                error: Some(format!("Invalid dialect: {}", e)),
+                error_line: e.line(),
+                error_column: e.column(),
+                error_start: e.start(),
+                error_end: e.end(),
+            };
+        }
+    };
+
+    let data_type: DataType = match serde_json::from_str(data_type_json) {
+        Ok(data_type) => data_type,
+        Err(e) => {
+            return GenerateDataTypeResult {
+                success: false,
+                sql: None,
+                error: Some(format!("Invalid DataType JSON: {}", e)),
+                error_line: None,
+                error_column: None,
+                error_start: None,
+                error_end: None,
+            };
+        }
+    };
+
+    generate_data_type_with_dialect(data_type, dialect_type)
+}
+
+fn generate_data_type_with_dialect(
+    data_type: DataType,
+    dialect_type: DialectType,
+) -> GenerateDataTypeResult {
+    let d = Dialect::get(dialect_type);
+    match d.generate(&Expression::DataType(data_type)) {
+        Ok(sql) => GenerateDataTypeResult {
+            success: true,
+            sql: Some(sql),
+            error: None,
+            error_line: None,
+            error_column: None,
+            error_start: None,
+            error_end: None,
+        },
+        Err(e) => GenerateDataTypeResult {
+            success: false,
+            sql: None,
+            error: Some(e.to_string()),
+            error_line: e.line(),
+            error_column: e.column(),
+            error_start: e.start(),
+            error_end: e.end(),
+        },
+    }
 }
 
 fn generate_from_expressions_with_dialect(
@@ -952,6 +1204,14 @@ pub struct SourceTablesResult {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QueryAnalysisResult {
+    pub success: bool,
+    pub analysis: Option<QueryAnalysis>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenLineageColumnLineageResult {
     pub success: bool,
     pub facet: Option<ColumnLineageDatasetFacet>,
@@ -1212,6 +1472,60 @@ fn source_tables_internal(sql: &str, column: &str, dialect: &str) -> SourceTable
             error: Some(e.to_string()),
         },
     }
+}
+
+/// Return compact query analysis facts for a SELECT or set operation.
+#[wasm_bindgen]
+pub fn analyze_query(sql: &str, options_json: &str) -> String {
+    set_panic_hook();
+
+    let result = match parse_analyze_query_options(options_json) {
+        Ok(options) => analyze_query_internal(sql, options),
+        Err(error) => QueryAnalysisResult {
+            success: false,
+            analysis: None,
+            error: Some(error),
+        },
+    };
+
+    serialize_result(&result)
+}
+
+/// Return compact query analysis facts as a structured JS value.
+#[wasm_bindgen]
+pub fn analyze_query_value(sql: &str, options: JsValue) -> JsValue {
+    set_panic_hook();
+
+    let result = match serde_wasm_bindgen::from_value::<AnalyzeQueryOptions>(options) {
+        Ok(options) => analyze_query_internal(sql, options),
+        Err(error) => QueryAnalysisResult {
+            success: false,
+            analysis: None,
+            error: Some(format!("Invalid analyzeQuery options: {error}")),
+        },
+    };
+
+    serialize_result_value(&result)
+}
+
+fn analyze_query_internal(sql: &str, options: AnalyzeQueryOptions) -> QueryAnalysisResult {
+    match core_analyze_query(sql, options) {
+        Ok(analysis) => QueryAnalysisResult {
+            success: true,
+            analysis: Some(analysis),
+            error: None,
+        },
+        Err(error) => QueryAnalysisResult {
+            success: false,
+            analysis: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn parse_analyze_query_options(options_json: &str) -> Result<AnalyzeQueryOptions, String> {
+    serde_json::from_str::<AnalyzeQueryOptions>(options_json)
+        .map_err(|e| format!("Invalid analyzeQuery options JSON: {e}"))
 }
 
 // ============================================================================
@@ -2174,6 +2488,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_data_type() {
+        let result = parse_data_type("DECIMAL(10, 2)", "duckdb");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(parsed["success"], true);
+        let data_type_json = parsed["dataType"].as_str().expect("data type json string");
+        let data_type: serde_json::Value =
+            serde_json::from_str(data_type_json).expect("valid data type json");
+        assert_eq!(data_type["data_type"], "decimal");
+        assert_eq!(data_type["precision"], 10);
+        assert_eq!(data_type["scale"], 2);
+    }
+
+    #[test]
+    fn test_generate_data_type() {
+        let parsed = parse_data_type("VARCHAR(255)", "duckdb");
+        let parsed: serde_json::Value = serde_json::from_str(&parsed).expect("valid json");
+        let data_type_json = parsed["dataType"].as_str().expect("data type json string");
+
+        let result = generate_data_type(data_type_json, "postgres");
+        let generated: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(generated["success"], true);
+        assert_eq!(generated["sql"], "VARCHAR(255)");
+    }
+
+    #[test]
+    fn test_parse_data_type_rejects_trailing_sql() {
+        let result = parse_data_type("DECIMAL(10, 2) SELECT 1", "duckdb");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(parsed["success"], false);
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unexpected token after data type"));
+    }
+
+    #[test]
     fn test_parse_postgres_prepare_and_execute() {
         let prepare = parse(
             "PREPARE leak (int) AS SELECT id FROM sensitive_table WHERE id = $1",
@@ -2957,6 +3310,32 @@ mod tests {
             result
         );
         assert!(result.contains("\"runId\""), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_analyze_query() {
+        let result = analyze_query("SELECT a FROM t", r#"{"dialect":"generic"}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["analysis"]["shape"], "select");
+        assert_eq!(parsed["analysis"]["projections"][0]["name"], "a");
+        assert_eq!(
+            parsed["analysis"]["projections"][0]["upstream"][0]["column"],
+            "a"
+        );
+    }
+
+    #[test]
+    fn test_analyze_query_invalid_options() {
+        let result = analyze_query("SELECT 1", "{not json}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(parsed["success"], false);
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Invalid analyzeQuery options JSON"));
     }
 
     // ============================================================================

@@ -5,11 +5,76 @@
 ///
 /// Related: https://github.com/tobilg/polyglot/issues/164
 use polyglot_sql::dialects::DialectType;
-use polyglot_sql::{parse_one, transpile};
+use polyglot_sql::{generate, parse_one, transpile};
 
 fn parse_and_generate(sql: &str) -> String {
     let result = transpile(sql, DialectType::Snowflake, DialectType::Snowflake).unwrap();
     result.join(";\n")
+}
+
+fn parse_then_generate(sql: &str) -> String {
+    let expr = parse_one(sql, DialectType::Snowflake).expect("Snowflake SQL should parse");
+    generate(&expr, DialectType::Snowflake).expect("Snowflake AST should generate")
+}
+
+// =====================================================================
+// Date/time difference semantics
+// =====================================================================
+
+#[test]
+fn test_snowflake_datediff_direct_generate_preserves_start_end_order() {
+    for (sql, expected) in [
+        (
+            "SELECT DATEDIFF('day', '2024-01-01', '2024-01-10')",
+            "SELECT DATEDIFF(DAY, '2024-01-01', '2024-01-10')",
+        ),
+        (
+            "SELECT DATEDIFF(day, a.START_DT, a.END_DT)",
+            "SELECT DATEDIFF(DAY, a.START_DT, a.END_DT)",
+        ),
+        (
+            "SELECT DATE_DIFF('day', a.START_DT, a.END_DT)",
+            "SELECT DATEDIFF(DAY, a.START_DT, a.END_DT)",
+        ),
+        (
+            "SELECT TIMEDIFF('hour', a.START_DT, a.END_DT)",
+            "SELECT DATEDIFF(HOUR, a.START_DT, a.END_DT)",
+        ),
+        (
+            "SELECT TIMESTAMPDIFF('minute', a.START_DT, a.END_DT)",
+            "SELECT DATEDIFF(MINUTE, a.START_DT, a.END_DT)",
+        ),
+    ] {
+        assert_eq!(parse_then_generate(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn test_snowflake_datediff_direct_generate_preserves_nested_order() {
+    for (sql, expected) in [
+        (
+            "SELECT AVG(DATEDIFF(day, a.START_DT, a.END_DT)) FROM events AS a",
+            "SELECT AVG(DATEDIFF(DAY, a.START_DT, a.END_DT)) FROM events AS a",
+        ),
+        (
+            "SELECT CASE WHEN DATEDIFF(day, a.START_DT, a.END_DT) > 7 THEN 1 ELSE 0 END FROM events AS a",
+            "SELECT CASE WHEN DATEDIFF(DAY, a.START_DT, a.END_DT) > 7 THEN 1 ELSE 0 END FROM events AS a",
+        ),
+        (
+            "SELECT a.ID FROM events AS a ORDER BY DATEDIFF(day, a.START_DT, a.END_DT) DESC",
+            "SELECT a.ID FROM events AS a ORDER BY DATEDIFF(DAY, a.START_DT, a.END_DT) DESC",
+        ),
+    ] {
+        assert_eq!(parse_then_generate(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn test_snowflake_datediff_transpile_identity_preserves_start_end_order() {
+    assert_eq!(
+        parse_and_generate("SELECT DATEDIFF('day', '2024-01-01', '2024-01-10')"),
+        "SELECT DATEDIFF(DAY, '2024-01-01', '2024-01-10')"
+    );
 }
 
 // =====================================================================

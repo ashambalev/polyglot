@@ -11,6 +11,7 @@ mod lineage;
 mod openlineage;
 mod optimize;
 mod parse;
+mod query_analysis;
 mod tokenize;
 mod transforms;
 mod transpile;
@@ -24,6 +25,7 @@ fn _polyglot_sql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(transpile::transpile, m)?)?;
     m.add_function(wrap_pyfunction!(parse::parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse::parse_one, m)?)?;
+    m.add_function(wrap_pyfunction!(parse::parse_data_type, m)?)?;
     m.add_function(wrap_pyfunction!(generate::generate, m)?)?;
     m.add_function(wrap_pyfunction!(format::format_sql, m)?)?;
     m.add_function(wrap_pyfunction!(validate::validate, m)?)?;
@@ -37,6 +39,7 @@ fn _polyglot_sql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(openlineage::openlineage_job_event, m)?)?;
     m.add_function(wrap_pyfunction!(openlineage::openlineage_run_event, m)?)?;
+    m.add_function(wrap_pyfunction!(query_analysis::analyze_query, m)?)?;
     m.add_function(wrap_pyfunction!(diff::diff, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize::tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(annotate_types::annotate_types, m)?)?;

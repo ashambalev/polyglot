@@ -67,6 +67,21 @@ func TestOpenLineageOptionsDefaults(t *testing.T) {
 	}
 }
 
+func TestAnalyzeQueryOptionsDefaults(t *testing.T) {
+	payload, err := marshalAnalyzeQueryOptions(AnalyzeQueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["dialect"] != "generic" {
+		t.Fatalf("dialect = %#v", decoded["dialect"])
+	}
+}
+
 func TestDefaultClientMissingReturnsError(t *testing.T) {
 	ClearDefaultClient()
 	if _, err := DefaultClient(); !errors.Is(err, ErrNoDefaultClient) {
@@ -75,6 +90,15 @@ func TestDefaultClientMissingReturnsError(t *testing.T) {
 	_, err := Transpile("SELECT 1", "generic", "generic")
 	if !errors.Is(err, ErrNoDefaultClient) {
 		t.Fatalf("err = %v, want ErrNoDefaultClient", err)
+	}
+	if _, err := ParseDataType("INT", "generic"); !errors.Is(err, ErrNoDefaultClient) {
+		t.Fatalf("ParseDataType err = %v, want ErrNoDefaultClient", err)
+	}
+	if _, err := GenerateDataType(json.RawMessage(`{"data_type":"int"}`), "generic"); !errors.Is(err, ErrNoDefaultClient) {
+		t.Fatalf("GenerateDataType err = %v, want ErrNoDefaultClient", err)
+	}
+	if _, err := AnalyzeQuery("SELECT 1", AnalyzeQueryOptions{}); !errors.Is(err, ErrNoDefaultClient) {
+		t.Fatalf("AnalyzeQuery err = %v, want ErrNoDefaultClient", err)
 	}
 }
 

@@ -51,6 +51,25 @@ const { sql } = generate(ast, Dialect.PostgreSQL);
 console.log(sql[0]); // SELECT 1 + 2
 ```
 
+### Data Types
+
+Parse and render standalone SQL data type fragments without wrapping them in a
+statement.
+
+```typescript
+import {
+  parseDataType,
+  generateDataType,
+  Dialect,
+} from '@polyglot-sql/sdk';
+
+const parsed = parseDataType('DECIMAL(10, 2)', Dialect.DuckDB);
+if (parsed.success) {
+  const rendered = generateDataType(parsed.dataType, Dialect.PostgreSQL);
+  console.log(rendered.sql); // DECIMAL(10, 2)
+}
+```
+
 ### Format
 
 ```typescript
@@ -582,6 +601,29 @@ columns are marked as `table`, CTEs as `cte`, derived queries as
 `derived_table`, and virtual sources such as BigQuery `UNNEST(...) AS alias`
 are marked as `virtual`.
 
+## Compact Query Analysis
+
+Use `analyzeQuery` when you need summary facts instead of the full AST or full
+lineage graph:
+
+```typescript
+import { analyzeQuery, Dialect } from '@polyglot-sql/sdk';
+
+const result = analyzeQuery('SELECT CAST(total AS TEXT) AS total_text FROM orders', {
+  dialect: Dialect.Generic,
+  schema: {
+    tables: [
+      { name: 'orders', columns: [{ name: 'total', type: 'INT' }] },
+    ],
+  },
+});
+
+if (result.success) {
+  console.log(result.analysis.projections[0].transformKind); // 'cast'
+  console.log(result.analysis.relations[0].name);            // 'orders'
+}
+```
+
 ## OpenLineage Output
 
 Generate OpenLineage-compatible JSON payloads from SQL analysis. The SDK only
@@ -668,6 +710,7 @@ import { Polyglot, Dialect } from '@polyglot-sql/sdk';
 const pg = Polyglot.getInstance();
 const result = pg.transpile('SELECT 1', Dialect.MySQL, Dialect.PostgreSQL);
 const formatted = pg.format('SELECT a,b FROM t');
+const dataType = pg.parseDataType('VARCHAR(255)', Dialect.DuckDB);
 const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic, {
   maxInputBytes: 2 * 1024 * 1024,
   maxSetOpChain: 128,
@@ -683,6 +726,8 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `transpile(sql, read, write, options?)` | Transpile SQL between dialects |
 | `parse(sql, dialect?)` | Parse SQL into AST |
 | `generate(ast, dialect?)` | Generate SQL from AST |
+| `parseDataType(sql, dialect?)` | Parse one standalone SQL data type |
+| `generateDataType(dataType, dialect?)` | Generate SQL from a parsed data type |
 | `format(sql, dialect?)` | Pretty-print SQL |
 | `formatWithOptions(sql, dialect?, options?)` | Pretty-print SQL with guard overrides |
 | `tokenize(sql, dialect?)` | Tokenize SQL into a token stream with source spans |
@@ -698,6 +743,7 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `lineage(column, sql, dialect?, trimSelects?)` | Trace column lineage through a query |
 | `lineageWithSchema(column, sql, schema, dialect?, trimSelects?)` | Trace lineage with schema-based qualification |
 | `getSourceTables(column, sql, dialect?)` | Get source tables for a column |
+| `analyzeQuery(sql, options?)` | Return compact projection, relation, CTE, set-operation, and upstream-reference facts |
 | `openLineageColumnLineage(sql, options)` | Build an OpenLineage columnLineage facet and datasets |
 | `openLineageJobEvent(sql, options)` | Build an OpenLineage JobEvent payload |
 | `openLineageRunEvent(sql, options)` | Build an OpenLineage RunEvent payload |

@@ -20,6 +20,18 @@ pub extern "C" fn polyglot_parse_one(sql: *const c_char, dialect: *const c_char)
     }
 }
 
+/// Parse a standalone SQL data type into a JSON DataType object.
+#[no_mangle]
+pub extern "C" fn polyglot_parse_data_type(
+    sql: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    match std::panic::catch_unwind(|| parse_data_type_impl(sql, dialect)) {
+        Ok(result) => result,
+        Err(panic) => panic_result(panic),
+    }
+}
+
 fn parse_impl(sql: *const c_char, dialect: *const c_char) -> PolyglotResult {
     let sql = match unsafe { required_arg(sql, "sql") } {
         Ok(value) => value,
@@ -37,6 +49,27 @@ fn parse_impl(sql: *const c_char, dialect: *const c_char) -> PolyglotResult {
 
     match dialect.parse(&sql) {
         Ok(expressions) => ok_json_result(&expressions),
+        Err(error) => err_result(STATUS_PARSE_ERROR, error.to_string()),
+    }
+}
+
+fn parse_data_type_impl(sql: *const c_char, dialect: *const c_char) -> PolyglotResult {
+    let sql = match unsafe { required_arg(sql, "sql") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect_name = match unsafe { required_arg(dialect, "dialect") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+
+    let dialect = match dialect_by_name(&dialect_name) {
+        Ok(dialect) => dialect,
+        Err(result) => return result,
+    };
+
+    match dialect.parse_data_type(&sql) {
+        Ok(data_type) => ok_json_result(&data_type),
         Err(error) => err_result(STATUS_PARSE_ERROR, error.to_string()),
     }
 }

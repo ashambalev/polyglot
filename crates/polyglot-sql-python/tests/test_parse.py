@@ -95,6 +95,32 @@ def test_parse_one_unknown_dialect_raises_value_error():
         polyglot_sql.parse_one("SELECT 1", dialect="not_a_dialect")
 
 
+def test_parse_data_type_returns_data_type_expression():
+    data_type = polyglot_sql.parse_data_type("DECIMAL(10, 2)", dialect="duckdb")
+
+    assert isinstance(data_type, polyglot_sql.DataType)
+    assert data_type.sql("duckdb") == "DECIMAL(10, 2)"
+
+
+def test_parse_one_into_data_type_matches_sqlglot_compatibility_path():
+    data_type = polyglot_sql.parse_one(
+        "VARCHAR(255)", dialect="duckdb", into=polyglot_sql.DataType
+    )
+
+    assert isinstance(data_type, polyglot_sql.DataType)
+    assert data_type.sql("duckdb") == "TEXT(255)"
+
+
+def test_parse_one_into_only_supports_data_type():
+    with pytest.raises(NotImplementedError):
+        polyglot_sql.parse_one("a", into=polyglot_sql.Column)
+
+
+def test_parse_data_type_rejects_trailing_sql():
+    with pytest.raises(polyglot_sql.ParseError):
+        polyglot_sql.parse_data_type("DECIMAL(10, 2) SELECT 1", dialect="duckdb")
+
+
 def test_parse_invalid_sql_raises_parse_error():
     with pytest.raises(polyglot_sql.ParseError):
         polyglot_sql.parse("SELECT FROM", dialect="postgres")

@@ -21,6 +21,7 @@ Release notes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
 - **Fluent builder API** for constructing queries programmatically
 - **Validation** with syntax, semantic, and schema-aware checks
 - **Column lineage** and OpenLineage-compatible payload generation
+- **Compact query analysis** facts for projections, relations, CTEs, and set operations
 - **AST visitor** utilities for walking, transforming, and analyzing queries
 - **Stack-safety hardening** on native targets via default-on `stacker`
 - **C FFI** shared/static library for multi-language bindings (`polyglot-sql-ffi`)
@@ -178,6 +179,14 @@ own infrastructure.
 - TypeScript SDK examples: [`packages/sdk/README.md`](packages/sdk/README.md#openlineage-output)
 - Python examples: [`crates/polyglot-sql-python/README.md`](crates/polyglot-sql-python/README.md)
 - Go examples: [`packages/go/README.md`](packages/go/README.md#openlineage)
+
+## Compact Query Analysis
+
+For applications that need summary facts instead of a full AST or full lineage
+graph, `analyze_query` / `analyzeQuery` returns a compact payload with output
+projections, root relations, CTE names, set-operation branches, transform kinds,
+optional type hints, and upstream column references. The API is additive and uses
+the same optional `ValidationSchema` shape as schema-aware validation and lineage.
 
 ## Format Guard Rails
 

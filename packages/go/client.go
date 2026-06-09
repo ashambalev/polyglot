@@ -140,6 +140,15 @@ func (c *Client) Generate(ast json.RawMessage, dialect string, options ...Genera
 	})
 }
 
+func (c *Client) GenerateDataType(dataType json.RawMessage, dialect string) (string, error) {
+	if err := rejectNUL(string(dataType), dialect); err != nil {
+		return "", err
+	}
+	return c.callPayload("generate_data_type", func(lib *ffi.Library) ffi.Result {
+		return lib.GenerateDataType(string(dataType), defaultDialect(dialect))
+	})
+}
+
 func (c *Client) Validate(sql, dialect string) (ValidationResult, error) {
 	if err := rejectNUL(sql, dialect); err != nil {
 		return ValidationResult{}, err
@@ -218,6 +227,15 @@ func (c *Client) ParseOne(sql, dialect string) (json.RawMessage, error) {
 	}
 	return c.callRaw("parse_one", func(lib *ffi.Library) ffi.Result {
 		return lib.ParseOne(sql, defaultDialect(dialect))
+	})
+}
+
+func (c *Client) ParseDataType(sql, dialect string) (json.RawMessage, error) {
+	if err := rejectNUL(sql, dialect); err != nil {
+		return nil, err
+	}
+	return c.callRaw("parse_data_type", func(lib *ffi.Library) ffi.Result {
+		return lib.ParseDataType(sql, defaultDialect(dialect))
 	})
 }
 
@@ -365,6 +383,21 @@ func (c *Client) OpenLineageRunEvent(sql string, options OpenLineageOptions) (Op
 	return result, err
 }
 
+func (c *Client) AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error) {
+	optionsJSON, err := marshalAnalyzeQueryOptions(options)
+	if err != nil {
+		return QueryAnalysis{}, err
+	}
+	if err := rejectNUL(sql, optionsJSON); err != nil {
+		return QueryAnalysis{}, err
+	}
+	var analysis QueryAnalysis
+	err = c.callJSON("analyze_query", func(lib *ffi.Library) ffi.Result {
+		return lib.AnalyzeQuery(sql, optionsJSON)
+	}, &analysis)
+	return analysis, err
+}
+
 func (c *Client) callStringSlice(operation string, call func(*ffi.Library) ffi.Result) ([]string, error) {
 	var output []string
 	if err := c.callJSON(operation, call, &output); err != nil {
@@ -455,6 +488,13 @@ func marshalOpenLineageOptions(options OpenLineageOptions) (string, error) {
 	}
 	if options.DatasetMappings == nil {
 		options.DatasetMappings = map[string]OpenLineageDatasetID{}
+	}
+	return marshalOptions(options)
+}
+
+func marshalAnalyzeQueryOptions(options AnalyzeQueryOptions) (string, error) {
+	if strings.TrimSpace(options.Dialect) == "" {
+		options.Dialect = "generic"
 	}
 	return marshalOptions(options)
 }

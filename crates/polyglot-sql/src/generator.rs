@@ -19705,9 +19705,15 @@ impl Generator {
             self.write_simple_interval_unit(unit, false); // Use singular form for DATEDIFF
             self.write(", ");
         }
-        self.generate_expression(&f.this)?;
-        self.write(", ");
-        self.generate_expression(&f.expression)?;
+        if self.config.dialect == Some(DialectType::Snowflake) {
+            self.generate_expression(&f.expression)?;
+            self.write(", ");
+            self.generate_expression(&f.this)?;
+        } else {
+            self.generate_expression(&f.this)?;
+            self.write(", ");
+            self.generate_expression(&f.expression)?;
+        }
         self.write(")");
         Ok(())
     }

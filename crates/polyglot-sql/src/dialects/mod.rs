@@ -158,9 +158,9 @@ pub use trino::TrinoDialect;
 pub use tsql::TSQLDialect;
 
 use crate::error::Result;
-use crate::expressions::Expression;
 #[cfg(feature = "transpile")]
 use crate::expressions::{ColumnConstraint, Function, Identifier, Literal};
+use crate::expressions::{DataType, Expression};
 #[cfg(any(
     feature = "transpile",
     feature = "ast-tools",
@@ -3934,6 +3934,20 @@ impl Dialect {
         };
         let mut parser = Parser::with_source(tokens, config, sql.to_string());
         parser.parse()
+    }
+
+    /// Parse a standalone SQL data type using this dialect's tokenizer and parser.
+    ///
+    /// This accepts type strings such as `DECIMAL(10, 2)`, `INT[]`, or
+    /// `STRUCT(a INT, b VARCHAR)` without requiring a surrounding statement.
+    pub fn parse_data_type(&self, sql: &str) -> Result<DataType> {
+        let tokens = self.tokenizer.tokenize(sql)?;
+        let config = crate::parser::ParserConfig {
+            dialect: Some(self.dialect_type),
+            ..Default::default()
+        };
+        let mut parser = Parser::with_source(tokens, config, sql.to_string());
+        parser.parse_standalone_data_type()
     }
 
     /// Tokenize SQL using this dialect's tokenizer configuration.

@@ -235,6 +235,25 @@ fn lineage_from_expression(
     )
 }
 
+pub(crate) fn lineage_by_index_from_expression(
+    column_index: usize,
+    sql: &Expression,
+    dialect: Option<DialectType>,
+    trim_selects: bool,
+) -> Result<LineageNode> {
+    let sql = lineage_effective_expression(sql);
+    let scope = build_scope(sql);
+    to_node(
+        ColumnRef::Index(column_index),
+        &scope,
+        dialect,
+        "",
+        "",
+        "",
+        trim_selects,
+    )
+}
+
 fn lineage_effective_expression(sql: &Expression) -> &Expression {
     match sql {
         Expression::Prepare(prepare) => &prepare.statement,

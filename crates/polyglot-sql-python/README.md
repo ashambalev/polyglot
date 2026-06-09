@@ -29,6 +29,15 @@ polyglot_sql.generate(ast, dialect="mysql")
 ```
 
 ```python
+data_type = polyglot_sql.parse_data_type("DECIMAL(10, 2)", dialect="duckdb")
+data_type.sql("postgres")
+# "DECIMAL(10, 2)"
+
+# SQLGlot-compatible narrow form for data types only:
+polyglot_sql.parse_one("VARCHAR(255)", dialect="duckdb", into=polyglot_sql.DataType)
+```
+
+```python
 polyglot_sql.format_sql("SELECT a,b FROM t WHERE x=1", dialect="postgres")
 ```
 
@@ -87,6 +96,24 @@ print(payload["facet"]["fields"])
 OpenLineage helpers only produce compatible payloads. Transport and client
 emission are intentionally out of scope.
 
+```python
+analysis = polyglot_sql.analyze_query(
+    "SELECT CAST(total AS TEXT) AS total_text FROM orders",
+    {
+        "dialect": "generic",
+        "schema": {
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [{"name": "total", "type": "INT"}],
+                }
+            ]
+        },
+    },
+)
+print(analysis["projections"][0]["transformKind"])  # "cast"
+```
+
 ## API Reference
 
 All functions are exported from `polyglot_sql`.
@@ -94,6 +121,8 @@ All functions are exported from `polyglot_sql`.
 - `transpile(sql: str, read: str = "generic", write: str = "generic", *, pretty: bool = False) -> list[str]`
 - `parse(sql: str, dialect: str = "generic") -> list[dict]`
 - `parse_one(sql: str, dialect: str = "generic") -> dict`
+- `parse_one(sql: str, dialect: str = "generic", *, into=polyglot_sql.DataType) -> DataType` (only `DataType` is supported for `into`)
+- `parse_data_type(sql: str, dialect: str = "generic") -> DataType`
 - `generate(ast: dict | list[dict], dialect: str = "generic", *, pretty: bool = False) -> list[str]`
 - `format_sql(sql: str, dialect: str = "generic", *, max_input_bytes: int | None = None, max_tokens: int | None = None, max_ast_nodes: int | None = None, max_set_op_chain: int | None = None) -> str`
 - `format(sql: str, dialect: str = "generic", *, max_input_bytes: int | None = None, max_tokens: int | None = None, max_ast_nodes: int | None = None, max_set_op_chain: int | None = None) -> str` (alias of `format_sql`)
@@ -101,6 +130,7 @@ All functions are exported from `polyglot_sql`.
 - `optimize(sql: str, dialect: str = "generic") -> str`
 - `lineage(column: str, sql: str, dialect: str = "generic") -> dict`
 - `source_tables(column: str, sql: str, dialect: str = "generic") -> list[str]`
+- `analyze_query(sql: str, options: dict | None = None, dialect: str = "generic") -> dict`
 - `openlineage_column_lineage(sql: str, options: dict) -> dict`
 - `openlineage_job_event(sql: str, options: dict) -> dict`
 - `openlineage_run_event(sql: str, options: dict) -> dict`

@@ -1,8 +1,8 @@
 use crate::errors::{parse_statement_count_error, unknown_dialect_error, GenerateError};
 use crate::expr::PyExpression;
 use polyglot_sql::dialects::Dialect;
-use polyglot_sql::{Expression, UnsupportedLevel};
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
+use polyglot_sql::{DataType, Expression, UnsupportedLevel};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use pythonize::{depythonize, pythonize};
@@ -95,6 +95,21 @@ pub fn parse_on_large_stack(
     .map_err(crate::errors::map_parse_error)
 }
 
+/// Parse a standalone SQL data type on the persistent large-stack worker.
+pub fn parse_data_type_on_large_stack(
+    py: Python<'_>,
+    dialect: &Dialect,
+    sql: &str,
+) -> PyResult<DataType> {
+    let dialect_type = dialect.dialect_type();
+    let sql_owned = sql.to_owned();
+    run_on_large_stack(py, move || {
+        let d = Dialect::get(dialect_type);
+        d.parse_data_type(&sql_owned)
+    })?
+    .map_err(crate::errors::map_parse_error)
+}
+
 pub fn resolve_dialect(name: &str) -> PyResult<Dialect> {
     Dialect::get_by_name(name).ok_or_else(|| unknown_dialect_error(name))
 }
@@ -130,15 +145,6 @@ pub fn normalize_unsupported_level(
             ))),
         },
     }
-}
-
-pub fn reject_parse_into(into: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-    if into.is_some() {
-        return Err(PyNotImplementedError::new_err(
-            "parse_one(into=...) is not supported in polyglot_sql",
-        ));
-    }
-    Ok(())
 }
 
 pub fn to_python_object<T>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>>

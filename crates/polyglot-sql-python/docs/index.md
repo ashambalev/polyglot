@@ -39,6 +39,31 @@ ast.find(polyglot_sql.Column).name  # "a"
 ast.sql("mysql")         # "SELECT a AS x, b FROM t WHERE c > 1"
 ```
 
+### Parse standalone data types
+
+```python
+data_type = polyglot_sql.parse_data_type("DECIMAL(10, 2)", dialect="duckdb")
+data_type.sql("postgres")  # "DECIMAL(10, 2)"
+
+# SQLGlot-compatible shorthand, limited to DataType.
+same = polyglot_sql.parse_one(
+    "VARCHAR(255)",
+    dialect="duckdb",
+    into=polyglot_sql.DataType,
+)
+same.sql("postgres")  # "VARCHAR(255)"
+```
+
+### Analyze query summary facts
+
+```python
+analysis = polyglot_sql.analyze_query(
+    "SELECT total FROM orders",
+    {"dialect": "generic"},
+)
+analysis["projections"][0]["upstream"]
+```
+
 ### Traverse the AST
 
 ```python

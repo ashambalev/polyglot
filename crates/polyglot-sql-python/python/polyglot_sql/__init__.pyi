@@ -1,4 +1,4 @@
-from typing import Any as TypingAny
+from typing import Any as TypingAny, overload
 
 
 class PolyglotError(Exception):
@@ -1385,29 +1385,73 @@ def parse(
     ...
 
 
+@overload
 def parse_one(
     sql: str,
     read: str | None = None,
     dialect: str | None = None,
     *,
-    into: TypingAny | None = None,
+    into: type[DataType],
+    error_level: str | None = None,
+) -> DataType:
+    ...
+
+@overload
+def parse_one(
+    sql: str,
+    read: str | None = None,
+    dialect: str | None = None,
+    *,
+    into: None = None,
     error_level: str | None = None,
 ) -> Expression:
+    ...
+
+def parse_one(
+    sql: str,
+    read: str | None = None,
+    dialect: str | None = None,
+    *,
+    into: type[DataType] | None = None,
+    error_level: str | None = None,
+) -> Expression | DataType:
     """Parse a single SQL statement into an ``Expression`` AST node.
 
     Args:
         sql: Exactly one SQL statement.
         read: Source dialect. Alias for *dialect*.
         dialect: Source dialect (e.g. ``"postgres"``). Defaults to ``"generic"``.
-        into: Reserved for future use.
+        into: Set to ``polyglot_sql.DataType`` to parse a standalone data type.
         error_level: ``"raise"`` (default), ``"warn"``, or ``"ignore"``.
 
     Returns:
-        A typed ``Expression`` object (e.g. ``Select``).
+        A typed ``Expression`` object (e.g. ``Select``) or ``DataType`` when
+        ``into=polyglot_sql.DataType`` is used.
 
     Raises:
         ParseError: If the input contains zero or multiple statements.
         ValueError: If the dialect name is unknown.
+    """
+    ...
+
+
+def parse_data_type(
+    sql: str,
+    read: str | None = None,
+    dialect: str | None = None,
+    *,
+    error_level: str | None = None,
+) -> DataType:
+    """Parse a standalone SQL data type string.
+
+    Args:
+        sql: A data type string such as ``"DECIMAL(10, 2)"``.
+        read: Source dialect. Alias for *dialect*.
+        dialect: Source dialect (e.g. ``"duckdb"``). Defaults to ``"generic"``.
+        error_level: ``"raise"`` (default), ``"warn"``, or ``"ignore"``.
+
+    Returns:
+        A typed ``DataType`` expression that can be rendered with ``.sql()``.
     """
     ...
 
@@ -1579,6 +1623,20 @@ def source_tables(column: str, sql: str, dialect: str = "generic") -> list[str]:
 
     Returns:
         A list of table name strings.
+    """
+    ...
+
+
+def analyze_query(
+    sql: str,
+    options: dict[str, TypingAny] | None = None,
+    dialect: str = "generic",
+) -> dict[str, TypingAny]:
+    """Return compact query analysis facts for a SELECT or set operation.
+
+    Options use camelCase keys and currently support ``dialect`` and optional
+    ``schema`` in the same ValidationSchema shape accepted by schema-aware
+    validation and lineage APIs.
     """
     ...
 

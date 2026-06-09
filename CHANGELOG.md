@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.1] - 2026-06-09
+
+### Added
+- Standalone data-type parsing and generation convenience APIs across Rust,
+  Python, C FFI, WASM/TypeScript, and Go, including Rust
+  `parse_data_type` / `generate_data_type`, Python `parse_data_type` and
+  `parse_one(..., into=polyglot_sql.DataType)`, FFI
+  `polyglot_parse_data_type` / `polyglot_generate_data_type`, TypeScript
+  `parseDataType` / `generateDataType`, and Go
+  `ParseDataType` / `GenerateDataType`.
+- Compact query-analysis convenience APIs across Rust, Python, C FFI,
+  WASM/TypeScript, and Go, returning high-level query facts such as shape,
+  projections, relations, CTEs, set-operation branches, and upstream column
+  references without requiring callers to consume the full AST or lineage graph.
+- Optional schema-aware query analysis that qualifies references and includes
+  inferred projection types when validation schema metadata is supplied.
+- PostgreSQL replication protocol command parsing for `BASE_BACKUP`,
+  `CREATE_REPLICATION_SLOT`, `DROP_REPLICATION_SLOT`, `IDENTIFY_SYSTEM`,
+  `READ_REPLICATION_SLOT`, `START_REPLICATION`, and `TIMELINE_HISTORY`.
+- Regression coverage and documentation for the new data-type and query-analysis
+  APIs across the Rust core and native SDKs.
+
+### Fixed
+- Snowflake `DATEDIFF`, `DATE_DIFF`, `TIMEDIFF`, and `TIMESTAMPDIFF`
+  identity generation now preserves Snowflake's start/end argument order in
+  direct, nested, aggregate, `CASE`, and `ORDER BY` contexts.
+- T-SQL `SET STATISTICS TIME|IO|XML|PROFILE ON|OFF` statements now parse and
+  round-trip as command statements, including comma-separated forms such as
+  `SET STATISTICS IO, TIME ON`, while preserving structured parsing for simple
+  options like `SET NOCOUNT ON`.
+- PostgreSQL replication protocol commands now parse and generate instead of
+  failing on command-style syntax such as
+  `CREATE_REPLICATION_SLOT ... LOGICAL ...` and `START_REPLICATION ...`.
+
 ## [0.5.0] - 2026-06-07
 
 ### Added

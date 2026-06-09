@@ -740,6 +740,28 @@ impl Parser {
         Ok(statements)
     }
 
+    /// Parse exactly one standalone data type from the token stream.
+    ///
+    /// This entry point is intended for callers that need to parse native type
+    /// strings such as `DECIMAL(10, 2)` without wrapping them in a SQL statement
+    /// or `CAST(...)` expression.
+    pub fn parse_standalone_data_type(&mut self) -> Result<DataType> {
+        let data_type = self.parse_data_type()?;
+
+        if self.check(TokenType::Semicolon) {
+            self.skip();
+        }
+
+        if !self.is_at_end() {
+            return Err(self.parse_error(format!(
+                "Unexpected token after data type: {}",
+                self.peek().text
+            )));
+        }
+
+        Ok(data_type)
+    }
+
     /// Parse a single SQL statement from the current position in the token stream.
     ///
     /// Dispatches to the appropriate sub-parser based on the leading keyword
@@ -24338,9 +24360,22 @@ impl Parser {
 
     /// Parse SET statement
     fn parse_set(&mut self) -> Result<Expression> {
+        let statement_start = self.current;
         self.expect(TokenType::Set)?;
 
         let mut items = Vec::new();
+
+        // T-SQL: SET STATISTICS TIME|IO|XML|PROFILE ON|OFF. The existing SET
+        // parser handles simple options like SET NOCOUNT ON, but these
+        // multi-token STATISTICS options are better preserved as commands.
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL)
+        ) && self.check_identifier("STATISTICS")
+        {
+            self.current = statement_start;
+            return self.fallback_to_command(statement_start);
+        }
 
         // ClickHouse: SET DEFAULT ROLE ... TO user - parse as command
         if matches!(

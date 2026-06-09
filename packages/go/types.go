@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.5.0"
+const sdkVersion = "0.5.1"
 
 func Version() string {
 	return sdkVersion
@@ -33,6 +33,11 @@ type FormatOptions struct {
 type OptimizeOptions struct{}
 
 type GenerateOptions struct{}
+
+type AnalyzeQueryOptions struct {
+	Dialect string            `json:"dialect,omitempty"`
+	Schema  *ValidationSchema `json:"schema,omitempty"`
+}
 
 type ValidationResult struct {
 	Valid  bool              `json:"valid"`
@@ -100,6 +105,55 @@ type LineageNode struct {
 	SourceKind        string          `json:"source_kind"`
 	SourceAlias       *string         `json:"source_alias,omitempty"`
 	ReferenceNodeName string          `json:"reference_node_name"`
+}
+
+type QueryAnalysis struct {
+	Shape         string             `json:"shape"`
+	CTEs          []string           `json:"ctes"`
+	Projections   []ProjectionFact   `json:"projections"`
+	Relations     []RelationFact     `json:"relations"`
+	SetOperations []SetOperationFact `json:"setOperations"`
+}
+
+type ProjectionFact struct {
+	Index         int                   `json:"index"`
+	Name          *string               `json:"name"`
+	IsStar        bool                  `json:"isStar"`
+	StarTable     *string               `json:"starTable"`
+	TransformKind string                `json:"transformKind"`
+	CastType      *string               `json:"castType"`
+	TypeHint      *string               `json:"typeHint"`
+	Upstream      []ColumnReferenceFact `json:"upstream"`
+}
+
+type ColumnReferenceFact struct {
+	SourceName  *string `json:"sourceName"`
+	SourceAlias *string `json:"sourceAlias"`
+	SourceKind  string  `json:"sourceKind"`
+	Table       *string `json:"table"`
+	Column      string  `json:"column"`
+	Unqualified bool    `json:"unqualified"`
+	Confidence  string  `json:"confidence"`
+}
+
+type RelationFact struct {
+	Name    string   `json:"name"`
+	Alias   *string  `json:"alias"`
+	Kind    string   `json:"kind"`
+	Columns []string `json:"columns"`
+}
+
+type SetOperationFact struct {
+	Kind          string                   `json:"kind"`
+	All           bool                     `json:"all"`
+	Distinct      bool                     `json:"distinct"`
+	OutputColumns []string                 `json:"outputColumns"`
+	Branches      []SetOperationBranchFact `json:"branches"`
+}
+
+type SetOperationBranchFact struct {
+	Index       int              `json:"index"`
+	Projections []ProjectionFact `json:"projections"`
 }
 
 type RenameTablesOptions struct {

@@ -1,10 +1,10 @@
 use polyglot_sql_ffi::{
-    polyglot_dialect_count, polyglot_dialect_list, polyglot_diff, polyglot_format,
-    polyglot_format_with_options, polyglot_free_result, polyglot_free_string,
-    polyglot_free_validation_result, polyglot_generate, polyglot_lineage,
-    polyglot_lineage_with_schema, polyglot_openlineage_column_lineage,
+    polyglot_analyze_query, polyglot_dialect_count, polyglot_dialect_list, polyglot_diff,
+    polyglot_format, polyglot_format_with_options, polyglot_free_result, polyglot_free_string,
+    polyglot_free_validation_result, polyglot_generate, polyglot_generate_data_type,
+    polyglot_lineage, polyglot_lineage_with_schema, polyglot_openlineage_column_lineage,
     polyglot_openlineage_job_event, polyglot_openlineage_run_event, polyglot_optimize,
-    polyglot_parse, polyglot_parse_one, polyglot_qualify_tables,
+    polyglot_parse, polyglot_parse_data_type, polyglot_parse_one, polyglot_qualify_tables,
     polyglot_rename_tables_with_options, polyglot_source_tables, polyglot_transpile,
     polyglot_transpile_with_options, polyglot_validate, polyglot_version, PolyglotResult,
     PolyglotValidationResult,
@@ -317,6 +317,13 @@ fn test_null_pointer_inputs_on_other_apis() {
         openlineage_options.as_ptr(),
     ));
     assert_eq!(status, 5);
+
+    let analyze_options = c("{}");
+    let (status, _, _) = consume_result(polyglot_analyze_query(
+        ptr::null(),
+        analyze_options.as_ptr(),
+    ));
+    assert_eq!(status, 5);
 }
 
 #[test]
@@ -338,6 +345,52 @@ fn test_parse_one_multiple_statements_fails() {
     let (status, _, error) = consume_result(polyglot_parse_one(sql.as_ptr(), dialect.as_ptr()));
     assert_eq!(status, 1);
     assert!(error.is_some());
+}
+
+#[test]
+fn test_parse_data_type_returns_json_object() {
+    let sql = c("DECIMAL(10, 2)");
+    let dialect = c("duckdb");
+    let (status, data, error) =
+        consume_result(polyglot_parse_data_type(sql.as_ptr(), dialect.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+
+    let payload = data.expect("missing data type payload");
+    let parsed: Value = serde_json::from_str(&payload).expect("invalid data type json");
+    assert_eq!(parsed["data_type"], "decimal");
+    assert_eq!(parsed["precision"], 10);
+    assert_eq!(parsed["scale"], 2);
+}
+
+#[test]
+fn test_generate_data_type_renders_sql() {
+    let sql = c("VARCHAR(255)");
+    let duckdb = c("duckdb");
+    let postgres = c("postgres");
+
+    let (parse_status, parse_data, parse_error) =
+        consume_result(polyglot_parse_data_type(sql.as_ptr(), duckdb.as_ptr()));
+    assert_eq!(parse_status, 0, "parse_error={parse_error:?}");
+
+    let data_type_json = c(&parse_data.expect("missing data type payload"));
+    let (gen_status, gen_data, gen_error) = consume_result(polyglot_generate_data_type(
+        data_type_json.as_ptr(),
+        postgres.as_ptr(),
+    ));
+    assert_eq!(gen_status, 0, "gen_error={gen_error:?}");
+    assert_eq!(gen_data.expect("missing generated type"), "VARCHAR(255)");
+}
+
+#[test]
+fn test_parse_data_type_rejects_trailing_sql() {
+    let sql = c("DECIMAL(10, 2) SELECT 1");
+    let dialect = c("duckdb");
+    let (status, _, error) =
+        consume_result(polyglot_parse_data_type(sql.as_ptr(), dialect.as_ptr()));
+    assert_eq!(status, 1);
+    assert!(error
+        .expect("missing error")
+        .contains("Unexpected token after data type"));
 }
 
 #[test]
@@ -618,6 +671,33 @@ fn test_source_tables_postgres_prepare_body() {
             .any(|table| table.eq_ignore_ascii_case("sensitive_table")),
         "tables={tables:?}"
     );
+}
+
+#[test]
+fn test_analyze_query_happy_path() {
+    let sql = c("SELECT o.total FROM orders o");
+    let options = c(r#"{"dialect":"generic"}"#);
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let analysis: Value =
+        serde_json::from_str(&data.expect("missing analyze_query payload")).expect("invalid json");
+    assert_eq!(analysis["shape"], "select");
+    assert_eq!(analysis["projections"][0]["name"], "total");
+    assert_eq!(analysis["projections"][0]["upstream"][0]["column"], "total");
+}
+
+#[test]
+fn test_analyze_query_invalid_options_json() {
+    let sql = c("SELECT 1");
+    let options = c("{not json}");
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 6);
+    assert!(data.is_none());
+    assert!(error
+        .expect("missing error")
+        .contains("Invalid analyze_query options JSON"));
 }
 
 #[test]

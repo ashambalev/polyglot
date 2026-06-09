@@ -102,8 +102,10 @@ typedef struct {
 - `polyglot_transpile_with_options(sql, from_dialect, to_dialect, options_json)` (`TranspileOptions` JSON, e.g. `{"pretty": true, "unsupportedLevel": "raise"}`)
 - `polyglot_parse(sql, dialect)`
 - `polyglot_parse_one(sql, dialect)`
+- `polyglot_parse_data_type(sql, dialect)`
 - `polyglot_tokenize(sql, dialect)`
 - `polyglot_generate(ast_json, dialect)` (expects `Vec<Expression>` JSON)
+- `polyglot_generate_data_type(data_type_json, dialect)` (expects `DataType` JSON)
 - `polyglot_qualify_tables(ast_json, options_json)` (expects `Vec<Expression>` JSON)
 - `polyglot_rename_tables_with_options(ast_json, mapping_json, options_json)` (expects `Vec<Expression>` JSON)
 - `polyglot_format(sql, dialect)`
@@ -113,6 +115,7 @@ typedef struct {
 - `polyglot_lineage(column_name, sql, dialect)`
 - `polyglot_lineage_with_schema(column_name, sql, schema_json, dialect)` (`ValidationSchema` JSON)
 - `polyglot_source_tables(column_name, sql, dialect)`
+- `polyglot_analyze_query(sql, options_json)` (`AnalyzeQueryOptions` JSON)
 - `polyglot_openlineage_column_lineage(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_job_event(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_run_event(sql, options_json)` (`OpenLineageOptions` JSON)
@@ -164,8 +167,10 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_transpile`: JSON array of SQL strings
 - `polyglot_parse`: JSON `Vec<Expression>`
 - `polyglot_parse_one`: JSON `Expression`
+- `polyglot_parse_data_type`: JSON `DataType`
 - `polyglot_tokenize`: JSON `Vec<Token>` (each token has `token_type`, `text`, `span`, `comments`, `trailing_comments`)
 - `polyglot_generate`: JSON array of SQL strings
+- `polyglot_generate_data_type`: SQL string
 - `polyglot_qualify_tables`: JSON `Vec<Expression>`
 - `polyglot_rename_tables_with_options`: JSON `Vec<Expression>`
 - `polyglot_format`: JSON array of SQL strings
@@ -174,6 +179,7 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_lineage`: JSON `LineageNode`
 - `polyglot_lineage_with_schema`: JSON `LineageNode`
 - `polyglot_source_tables`: JSON array of source table names
+- `polyglot_analyze_query`: JSON `QueryAnalysis`
 - `polyglot_openlineage_column_lineage`: JSON `OpenLineageColumnLineageResult`
 - `polyglot_openlineage_job_event`: JSON `OpenLineageEventResult`
 - `polyglot_openlineage_run_event`: JSON `OpenLineageEventResult`

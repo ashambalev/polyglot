@@ -57,16 +57,45 @@ parse_one(
     read: str | None = None,
     dialect: str | None = None,
     *,
-    into: Any | None = None,
+    into: type[DataType] | None = None,
     error_level: str | None = None,
-) -> Expression
+) -> Expression | DataType
 ```
 
 Parse a single SQL statement into an `Expression` AST node. Raises `ParseError` if the input contains zero or multiple statements.
+`into` is intentionally limited to `polyglot_sql.DataType` for SQLGlot-compatible standalone type parsing.
 
 ```python
 ast = polyglot_sql.parse_one("SELECT a, b FROM t", dialect="postgres")
 isinstance(ast, polyglot_sql.Select)  # True
+
+data_type = polyglot_sql.parse_one(
+    "DECIMAL(10, 2)",
+    dialect="duckdb",
+    into=polyglot_sql.DataType,
+)
+isinstance(data_type, polyglot_sql.DataType)  # True
+data_type.sql("postgres")  # "DECIMAL(10, 2)"
+```
+
+### `parse_data_type`
+
+```python
+parse_data_type(
+    sql: str,
+    read: str | None = None,
+    dialect: str | None = None,
+    *,
+    error_level: str | None = None,
+) -> DataType
+```
+
+Parse exactly one standalone SQL data type. Trailing SQL is rejected instead of
+being parsed as a statement.
+
+```python
+data_type = polyglot_sql.parse_data_type("VARCHAR(255)", dialect="duckdb")
+data_type.sql("postgres")  # "VARCHAR(255)"
 ```
 
 ### `generate`

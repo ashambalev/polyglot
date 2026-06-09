@@ -97,3 +97,8 @@ packages/sdk/coverage/
 crates/polyglot-sql/tests/sqlglot_fixtures/
 crates/polyglot-sql/tests/custom_fixtures/clickhouse/
 tools/sqlglot-compare/fixtures/extracted/
+
+# Other
+.codex-tmp/
+.vscode/
+.claude/

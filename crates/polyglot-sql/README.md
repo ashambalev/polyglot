@@ -7,6 +7,7 @@ Part of the [Polyglot](https://github.com/tobilg/polyglot) project.
 ## Features
 
 - **Parse** SQL into a fully-typed AST with 200+ expression types
+- **Parse standalone data types** such as `DECIMAL(10, 2)` without a statement wrapper
 - **Generate** SQL from AST nodes for any target dialect
 - **Transpile** between any pair of 32 dialects in one call
 - **Format** / pretty-print SQL
@@ -14,6 +15,7 @@ Part of the [Polyglot](https://github.com/tobilg/polyglot) project.
 - **AST traversal** utilities (DFS/BFS iterators, transform, walk)
 - **Validation** with syntax checking and error location reporting
 - **Schema** module for column resolution and type annotation
+- **Compact query analysis** for projection, relation, CTE, set-operation, and upstream-reference facts
 
 ## Usage
 
@@ -23,12 +25,12 @@ By default, `polyglot-sql` enables the full public API. Parser-only consumers ca
 disable default features and opt into only the dialect parsers they need:
 
 ```toml
-polyglot-sql = { version = "0.4", default-features = false }
+polyglot-sql = { version = "0.5", default-features = false }
 ```
 
 ```toml
 polyglot-sql = {
-    version = "0.4",
+    version = "0.5",
     default-features = false,
     features = ["dialect-clickhouse"],
 }
@@ -42,14 +44,14 @@ Examples:
 ```toml
 # Parse and generate SQL for one dialect.
 polyglot-sql = {
-    version = "0.4",
+    version = "0.5",
     default-features = false,
     features = ["generate", "dialect-clickhouse"],
 }
 
 # Cross-dialect transpilation.
 polyglot-sql = {
-    version = "0.4",
+    version = "0.5",
     default-features = false,
     features = ["transpile", "dialect-clickhouse", "dialect-postgresql"],
 }
@@ -102,6 +104,19 @@ let ast = parse("SELECT 1 + 2", DialectType::Generic).unwrap();
 let sql = generate(&ast[0], DialectType::Postgres).unwrap();
 assert_eq!(sql, "SELECT 1 + 2");
 ```
+
+### Standalone Data Types
+
+```rust
+use polyglot_sql::{generate_data_type, parse_data_type, DialectType};
+
+let data_type = parse_data_type("DECIMAL(10, 2)", DialectType::DuckDB).unwrap();
+let sql = generate_data_type(&data_type, DialectType::Postgres).unwrap();
+assert_eq!(sql, "DECIMAL(10, 2)");
+```
+
+`parse_data_type` parses exactly one type string and rejects trailing SQL. Type
+rendering requires the `generate` feature, which is enabled by default.
 
 ### Format With Guard Options
 
@@ -294,6 +309,26 @@ Schema-aware validation emits stable codes such as:
 - `E200`/`E201` for unknown tables/columns
 - `E210-E217` and `W210-W216` for type checks
 - `E220`, `E221`, `W220`, `W221`, `W222` for reference/FK checks
+
+### Compact Query Analysis
+
+Use `analyze_query` when you need high-level facts without consuming the full AST
+or full lineage graph:
+
+```rust
+use polyglot_sql::{analyze_query, AnalyzeQueryOptions, DialectType, QueryShape};
+
+let analysis = analyze_query(
+    "SELECT o.total AS total FROM orders o",
+    AnalyzeQueryOptions {
+        dialect: DialectType::Generic,
+        schema: None,
+    },
+).unwrap();
+
+assert_eq!(analysis.shape, QueryShape::Select);
+assert_eq!(analysis.projections[0].name.as_deref(), Some("total"));
+```
 
 ### Tokenize
 

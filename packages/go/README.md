@@ -8,10 +8,11 @@ native libraries at runtime. Build or download the matching FFI library yourself
 and point the SDK at it.
 
 Important: `go get github.com/tobilg/polyglot/packages/go` installs only the Go
-module. Runtime calls such as `Transpile`, `Parse`, `Validate`, lineage, and
-OpenLineage generation require a separate `polyglot-sql-ffi` shared library
-(`.so`, `.dylib`, or `.dll`) that matches the SDK release version. Provide that
-library with `Open(path)` or `POLYGLOT_SQL_FFI_PATH` plus `OpenDefault()`.
+module. Runtime calls such as `Transpile`, `Parse`, `ParseDataType`,
+`Validate`, lineage, and OpenLineage generation require a separate
+`polyglot-sql-ffi` shared library (`.so`, `.dylib`, or `.dll`) that matches the
+SDK release version. Provide that library with `Open(path)` or
+`POLYGLOT_SQL_FFI_PATH` plus `OpenDefault()`.
 
 ## Install
 
@@ -20,7 +21,7 @@ go get github.com/tobilg/polyglot/packages/go
 ```
 
 Go module releases use nested tags that match the root Polyglot release, for
-example `packages/go/v0.4.0`.
+example `packages/go/v0.5.0`.
 
 ## Native Library Setup
 
@@ -114,6 +115,7 @@ These methods are available on `*Client` and as package-level wrappers:
 | `Format(sql, dialect string, options ...FormatOptions) ([]string, error)` | Format SQL for a dialect, with optional formatting guards. |
 | `Optimize(sql, dialect string, options ...OptimizeOptions) ([]string, error)` | Apply optimizer rewrites and return SQL. |
 | `Generate(ast json.RawMessage, dialect string, options ...GenerateOptions) ([]string, error)` | Generate SQL from a JSON AST returned by `Parse` or related APIs. |
+| `GenerateDataType(dataType json.RawMessage, dialect string) (string, error)` | Generate SQL from a JSON `DataType` returned by `ParseDataType`. |
 | `Validate(sql, dialect string) (ValidationResult, error)` | Validate SQL and return diagnostics as data when validation fails. |
 | `Dialects() ([]string, error)` | Return supported dialect names. |
 | `DialectCount() (int, error)` | Return the number of supported dialects. |
@@ -148,6 +150,7 @@ parts they need:
 | --- | --- |
 | `Parse(sql, dialect string) (json.RawMessage, error)` | Parse one or more SQL statements into a JSON AST array. |
 | `ParseOne(sql, dialect string) (json.RawMessage, error)` | Parse one SQL statement into a single JSON AST node. |
+| `ParseDataType(sql, dialect string) (json.RawMessage, error)` | Parse exactly one standalone SQL data type into a JSON `DataType`. |
 | `Tokenize(sql, dialect string) (json.RawMessage, error)` | Tokenize SQL and return token JSON. |
 | `AnnotateTypes(sql, dialect string, schema *ValidationSchema) (json.RawMessage, error)` | Parse SQL and annotate expression types, optionally using schema metadata. |
 | `Diff(sql1, sql2, dialect string) (json.RawMessage, error)` | Return an AST diff between two SQL strings. |
@@ -179,6 +182,24 @@ if err != nil {
 }
 
 fmt.Println(len(ast), len(one), len(tokens), len(annotated), len(diff))
+```
+
+### Standalone Data Types
+
+Data type parsing returns raw JSON because `DataType` is part of the AST model.
+Use `GenerateDataType` to render that JSON for a target dialect.
+
+```go
+dataType, err := client.ParseDataType("DECIMAL(10, 2)", "duckdb")
+if err != nil {
+	log.Fatal(err)
+}
+
+sql, err := client.GenerateDataType(dataType, "postgres")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(sql) // DECIMAL(10, 2)
 ```
 
 ### AST Transforms
@@ -225,6 +246,7 @@ fmt.Println(sql[0])
 | `Lineage(column, sql, dialect string) (LineageNode, error)` | Return a lineage tree for a selected output column. |
 | `LineageWithSchema(column, sql string, schema ValidationSchema, dialect string) (LineageNode, error)` | Return lineage using schema metadata for improved resolution. |
 | `SourceTables(column, sql, dialect string) ([]string, error)` | Return source table names for a selected output column. |
+| `AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error)` | Return compact projection, relation, CTE, set-operation, and upstream-reference facts. |
 
 ```go
 node, err := client.Lineage("total", "SELECT o.total FROM orders o", "generic")
@@ -237,6 +259,31 @@ if err != nil {
 	log.Fatal(err)
 }
 fmt.Println(node.Name, tables)
+```
+
+```go
+schema := polyglot.ValidationSchema{
+	Tables: []polyglot.SchemaTable{
+		{
+			Name: "orders",
+			Columns: []polyglot.SchemaColumn{
+				{Name: "total", Type: "INT"},
+			},
+		},
+	},
+}
+
+analysis, err := client.AnalyzeQuery(
+	"SELECT CAST(total AS TEXT) AS total_text FROM orders",
+	polyglot.AnalyzeQueryOptions{
+		Dialect: "generic",
+		Schema:  &schema,
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(analysis.Projections[0].TransformKind) // cast
 ```
 
 `LineageNode.SourceKind` identifies whether a source is a real table, CTE,
@@ -297,6 +344,12 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `FormatOptions` | `MaxInputBytes`, `MaxTokens`, `MaxASTNodes`, `MaxSetOpChain` |
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
+| `AnalyzeQueryOptions` | `Dialect`, `Schema` |
+| `QueryAnalysis` | `Shape`, `CTEs`, `Projections`, `Relations`, `SetOperations` |
+| `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `CastType`, `TypeHint`, `Upstream` |
+| `ColumnReferenceFact` | `SourceName`, `SourceAlias`, `SourceKind`, `Table`, `Column`, `Unqualified`, `Confidence` |
+| `RelationFact` | `Name`, `Alias`, `Kind`, `Columns` |
+| `SetOperationFact` | `Kind`, `All`, `Distinct`, `OutputColumns`, `Branches` |
 | `ValidationResult` | `Valid`, `Errors` |
 | `ValidationError` | `Message`, `Line`, `Column`, `Severity`, `Code`, `Start`, `End` |
 | `ValidationSchema` | `Tables`, `Strict` |

@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  analyzeQuery,
   Dialect,
   format,
   formatWithOptions,
   generate,
+  generateDataType,
   getDialects,
   getSourceTables,
   getVersion,
@@ -15,6 +17,7 @@ import {
   openLineageRunEvent,
   Polyglot,
   parse,
+  parseDataType,
   transpile,
 } from './index';
 
@@ -131,6 +134,47 @@ describe('Polyglot SDK', () => {
     });
   });
 
+  describe('data types', () => {
+    it('should parse a standalone data type', () => {
+      const result = parseDataType('DECIMAL(10, 2)', Dialect.DuckDB);
+
+      expect(result.success).toBe(true);
+      expect(result.dataType).toEqual({
+        data_type: 'decimal',
+        precision: 10,
+        scale: 2,
+      });
+    });
+
+    it('should generate a standalone data type for a target dialect', () => {
+      const parsed = parseDataType('VARCHAR(255)', Dialect.DuckDB);
+      expect(parsed.success).toBe(true);
+
+      const result = generateDataType(parsed.dataType!, Dialect.PostgreSQL);
+
+      expect(result.success).toBe(true);
+      expect(result.sql).toBe('VARCHAR(255)');
+    });
+
+    it('should reject trailing SQL after a data type', () => {
+      const result = parseDataType('DECIMAL(10, 2) SELECT 1', Dialect.DuckDB);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Unexpected token after data type');
+    });
+
+    it('should expose data type helpers on the Polyglot instance', () => {
+      const polyglot = Polyglot.getInstance();
+      const parsed = polyglot.parseDataType('INT[]', Dialect.DuckDB);
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.dataType?.data_type).toBe('array');
+      expect(polyglot.generateDataType(parsed.dataType!, Dialect.DuckDB).sql).toBe(
+        'INT[]',
+      );
+    });
+  });
+
   describe('lineage helpers', () => {
     it('should mark BigQuery UNNEST aliases as virtual lineage sources', () => {
       const result = lineage(
@@ -157,6 +201,30 @@ describe('Polyglot SDK', () => {
 
       expect(result.success).toBe(true);
       expect(result.tables).toContain('sensitive_table');
+    });
+  });
+
+  describe('analyzeQuery', () => {
+    it('should return compact projection facts', () => {
+      const result = analyzeQuery('SELECT a FROM t');
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.shape).toBe('select');
+      expect(result.analysis?.projections[0]).toMatchObject({
+        name: 'a',
+        transformKind: 'direct',
+      });
+      expect(result.analysis?.projections[0].upstream[0].column).toBe('a');
+    });
+
+    it('should expose analyzeQuery on the Polyglot instance', () => {
+      const polyglot = Polyglot.getInstance();
+      const result = polyglot.analyzeQuery('SELECT a FROM t', {
+        dialect: Dialect.Generic,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.relations[0].name).toBe('t');
     });
   });
 

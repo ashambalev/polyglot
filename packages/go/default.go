@@ -70,6 +70,14 @@ func Generate(ast json.RawMessage, dialect string, options ...GenerateOptions) (
 	return client.Generate(ast, dialect, options...)
 }
 
+func GenerateDataType(dataType json.RawMessage, dialect string) (string, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return "", err
+	}
+	return client.GenerateDataType(dataType, dialect)
+}
+
 func Validate(sql, dialect string) (ValidationResult, error) {
 	client, err := DefaultClient()
 	if err != nil {
@@ -108,6 +116,14 @@ func ParseOne(sql, dialect string) (json.RawMessage, error) {
 		return nil, err
 	}
 	return client.ParseOne(sql, dialect)
+}
+
+func ParseDataType(sql, dialect string) (json.RawMessage, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.ParseDataType(sql, dialect)
 }
 
 func Tokenize(sql, dialect string) (json.RawMessage, error) {
@@ -196,4 +212,12 @@ func OpenLineageRunEvent(sql string, options OpenLineageOptions) (OpenLineageEve
 		return OpenLineageEventResult{}, err
 	}
 	return client.OpenLineageRunEvent(sql, options)
+}
+
+func AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return QueryAnalysis{}, err
+	}
+	return client.AnalyzeQuery(sql, options)
 }

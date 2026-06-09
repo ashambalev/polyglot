@@ -213,11 +213,48 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	assertValidJSON(t, "ParseOne", parsedOne)
 
+	dataType, err := client.ParseDataType("DECIMAL(10, 2)", "duckdb")
+	if err != nil {
+		t.Fatalf("ParseDataType: %v", err)
+	}
+	assertValidJSON(t, "ParseDataType", dataType)
+
+	var decodedDataType map[string]any
+	if err := json.Unmarshal(dataType, &decodedDataType); err != nil {
+		t.Fatalf("decode ParseDataType: %v", err)
+	}
+	if decodedDataType["data_type"] != "decimal" {
+		t.Fatalf("unexpected data type payload: %#v", decodedDataType)
+	}
+
+	generatedType, err := client.GenerateDataType(dataType, "postgres")
+	if err != nil {
+		t.Fatalf("GenerateDataType: %v", err)
+	}
+	if generatedType != "DECIMAL(10, 2)" {
+		t.Fatalf("GenerateDataType = %q", generatedType)
+	}
+
+	if _, err := client.ParseDataType("DECIMAL(10, 2) SELECT 1", "duckdb"); err == nil {
+		t.Fatal("ParseDataType accepted trailing SQL")
+	}
+
 	tokens, err := client.Tokenize("SELECT a FROM t", "generic")
 	if err != nil {
 		t.Fatalf("Tokenize: %v", err)
 	}
 	assertValidJSON(t, "Tokenize", tokens)
+
+	analysis, err := client.AnalyzeQuery("SELECT a FROM t", AnalyzeQueryOptions{})
+	if err != nil {
+		t.Fatalf("AnalyzeQuery: %v", err)
+	}
+	if analysis.Shape != "select" || len(analysis.Projections) != 1 {
+		t.Fatalf("unexpected AnalyzeQuery result: %#v", analysis)
+	}
+	if analysis.Projections[0].Name == nil || *analysis.Projections[0].Name != "a" {
+		t.Fatalf("unexpected AnalyzeQuery projection: %#v", analysis.Projections[0])
+	}
 }
 
 func TestIntegrationLineageAndOpenLineage(t *testing.T) {
@@ -415,11 +452,33 @@ func TestIntegrationPackageLevelAPI(t *testing.T) {
 	}
 	assertValidJSON(t, "ParseOne wrapper", parsedOne)
 
+	dataType, err := ParseDataType("VARCHAR(255)", "duckdb")
+	if err != nil {
+		t.Fatalf("ParseDataType wrapper: %v", err)
+	}
+	assertValidJSON(t, "ParseDataType wrapper", dataType)
+
+	generatedType, err := GenerateDataType(dataType, "postgres")
+	if err != nil {
+		t.Fatalf("GenerateDataType wrapper: %v", err)
+	}
+	if generatedType != "VARCHAR(255)" {
+		t.Fatalf("unexpected GenerateDataType wrapper result: %q", generatedType)
+	}
+
 	tokens, err := Tokenize("SELECT a FROM old_table", "generic")
 	if err != nil {
 		t.Fatalf("Tokenize wrapper: %v", err)
 	}
 	assertValidJSON(t, "Tokenize wrapper", tokens)
+
+	analysis, err := AnalyzeQuery("SELECT a FROM t", AnalyzeQueryOptions{})
+	if err != nil {
+		t.Fatalf("AnalyzeQuery wrapper: %v", err)
+	}
+	if analysis.Shape != "select" || len(analysis.Projections) != 1 {
+		t.Fatalf("unexpected AnalyzeQuery wrapper result: %#v", analysis)
+	}
 
 	generated, err := Generate(parsed, "generic")
 	if err != nil {

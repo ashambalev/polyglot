@@ -33,6 +33,59 @@ BEGIN CATCH
 END CATCH"#;
 
 // ---------------------------------------------------------------------------
+// T-SQL SET options
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tsql_set_statistics_options_parse_as_commands() {
+    for sql in [
+        "SET STATISTICS TIME ON",
+        "SET STATISTICS TIME OFF",
+        "SET STATISTICS IO ON",
+        "SET STATISTICS IO OFF",
+        "SET STATISTICS XML ON",
+        "SET STATISTICS XML OFF",
+        "SET STATISTICS PROFILE ON",
+        "SET STATISTICS PROFILE OFF",
+        "SET STATISTICS IO, TIME ON",
+    ] {
+        let ast = parse(sql, DialectType::TSQL).expect("SET STATISTICS should parse");
+        assert_eq!(ast.len(), 1);
+        assert!(
+            matches!(ast[0], Expression::Command(_)),
+            "expected Command for {sql}, got {}",
+            ast[0].variant_name()
+        );
+        assert_eq!(generate_tsql(&ast[0]), sql);
+    }
+}
+
+#[test]
+fn tsql_set_statistics_consumes_only_current_statement() {
+    let ast =
+        parse("SET STATISTICS TIME ON; SELECT 1", DialectType::TSQL).expect("batch should parse");
+
+    assert_eq!(ast.len(), 2);
+    assert!(matches!(ast[0], Expression::Command(_)));
+    assert!(matches!(ast[1], Expression::Select(_)));
+    assert_eq!(generate_tsql(&ast[0]), "SET STATISTICS TIME ON");
+}
+
+#[test]
+fn tsql_simple_set_options_remain_structured() {
+    for sql in ["SET NOCOUNT ON", "SET XACT_ABORT ON", "SET ANSI_NULLS OFF"] {
+        let ast = parse(sql, DialectType::TSQL).expect("T-SQL SET option should parse");
+        assert_eq!(ast.len(), 1);
+        assert!(
+            matches!(ast[0], Expression::SetStatement(_)),
+            "expected SetStatement for {sql}, got {}",
+            ast[0].variant_name()
+        );
+        assert_eq!(generate_tsql(&ast[0]), sql);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PostgreSQL LATERAL joins -> T-SQL APPLY
 // ---------------------------------------------------------------------------
 
