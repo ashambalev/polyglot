@@ -675,16 +675,36 @@ fn test_source_tables_postgres_prepare_body() {
 
 #[test]
 fn test_analyze_query_happy_path() {
-    let sql = c("SELECT o.total FROM orders o");
-    let options = c(r#"{"dialect":"generic"}"#);
+    let sql = c("SELECT o.id, SUM(o.amount) AS amount_sum FROM orders AS o GROUP BY o.id");
+    let options = c(r#"{
+            "dialect":"generic",
+            "schema":{
+                "tables":[
+                    {
+                        "name":"orders",
+                        "columns":[
+                            {"name":"id","type":"INT"},
+                            {"name":"amount","type":"DECIMAL(10,2)"}
+                        ]
+                    }
+                ]
+            }
+        }"#);
     let (status, data, error) =
         consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
     assert_eq!(status, 0, "error={error:?}");
     let analysis: Value =
         serde_json::from_str(&data.expect("missing analyze_query payload")).expect("invalid json");
     assert_eq!(analysis["shape"], "select");
-    assert_eq!(analysis["projections"][0]["name"], "total");
-    assert_eq!(analysis["projections"][0]["upstream"][0]["column"], "total");
+    assert_eq!(analysis["baseTables"][0]["name"], "orders");
+    assert_eq!(analysis["baseTables"][0]["alias"], "o");
+    assert_eq!(analysis["projections"][0]["upstream"][0]["table"], "orders");
+    assert_eq!(
+        analysis["projections"][0]["upstream"][0]["sourceAlias"],
+        "o"
+    );
+    assert_eq!(analysis["projections"][1]["transformKind"], "aggregation");
+    assert_eq!(analysis["projections"][1]["typeHint"], "DECIMAL(10, 2)");
 }
 
 #[test]

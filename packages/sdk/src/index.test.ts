@@ -217,6 +217,51 @@ describe('Polyglot SDK', () => {
       expect(result.analysis?.projections[0].upstream[0].column).toBe('a');
     });
 
+    it('should expose full compact analysis facts with schema', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'orders',
+            columns: [
+              { name: 'id', type: 'INT' },
+              { name: 'amount', type: 'DECIMAL(10,2)' },
+            ],
+          },
+        ],
+      };
+
+      const result = analyzeQuery(
+        'SELECT o.id, SUM(o.amount) AS total_amount FROM orders AS o GROUP BY o.id',
+        { dialect: Dialect.Generic, schema },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.baseTables).toMatchObject([
+        {
+          name: 'orders',
+          alias: 'o',
+          kind: 'table',
+        },
+      ]);
+      expect(result.analysis?.projections[0].upstream[0]).toMatchObject({
+        table: 'orders',
+        sourceAlias: 'o',
+        column: 'id',
+        confidence: 'resolved',
+      });
+      expect(result.analysis?.projections[1]).toMatchObject({
+        transformKind: 'aggregation',
+        typeHint: 'DECIMAL(10, 2)',
+      });
+    });
+
+    it('should accept a dialect shorthand argument', () => {
+      const result = analyzeQuery('SELECT 1', Dialect.DuckDB);
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.shape).toBe('select');
+    });
+
     it('should expose analyzeQuery on the Polyglot instance', () => {
       const polyglot = Polyglot.getInstance();
       const result = polyglot.analyzeQuery('SELECT a FROM t', {

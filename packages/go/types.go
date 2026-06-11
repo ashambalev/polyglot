@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.5.1"
+const sdkVersion = "0.5.2"
 
 func Version() string {
 	return sdkVersion
@@ -112,6 +112,7 @@ type QueryAnalysis struct {
 	CTEs          []string           `json:"ctes"`
 	Projections   []ProjectionFact   `json:"projections"`
 	Relations     []RelationFact     `json:"relations"`
+	BaseTables    []RelationFact     `json:"baseTables"`
 	SetOperations []SetOperationFact `json:"setOperations"`
 }
 

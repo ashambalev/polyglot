@@ -604,24 +604,32 @@ are marked as `virtual`.
 ## Compact Query Analysis
 
 Use `analyzeQuery` when you need summary facts instead of the full AST or full
-lineage graph:
+lineage graph. `relations` contains sources visible in the analyzed scope;
+`baseTables` contains deduplicated physical dependencies across nested CTEs,
+derived tables, subqueries, and set-operation branches. With a schema,
+parseable detailed type strings such as `DECIMAL(10,2)` are preserved in
+projection `typeHint` values.
 
 ```typescript
 import { analyzeQuery, Dialect } from '@polyglot-sql/sdk';
 
-const result = analyzeQuery('SELECT CAST(total AS TEXT) AS total_text FROM orders', {
+const result = analyzeQuery('SELECT SUM(o.amount) AS total FROM orders AS o', {
   dialect: Dialect.Generic,
   schema: {
     tables: [
-      { name: 'orders', columns: [{ name: 'total', type: 'INT' }] },
+      { name: 'orders', columns: [{ name: 'amount', type: 'DECIMAL(10,2)' }] },
     ],
   },
 });
 
 if (result.success) {
-  console.log(result.analysis.projections[0].transformKind); // 'cast'
-  console.log(result.analysis.relations[0].name);            // 'orders'
+  console.log(result.analysis.projections[0].transformKind); // 'aggregation'
+  console.log(result.analysis.projections[0].typeHint);      // 'DECIMAL(10, 2)'
+  console.log(result.analysis.baseTables[0].name);           // 'orders'
+  console.log(result.analysis.baseTables[0].alias);          // 'o'
 }
+
+const duckdbSummary = analyzeQuery('SELECT 1', Dialect.DuckDB);
 ```
 
 ## OpenLineage Output
@@ -743,7 +751,7 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | `lineage(column, sql, dialect?, trimSelects?)` | Trace column lineage through a query |
 | `lineageWithSchema(column, sql, schema, dialect?, trimSelects?)` | Trace lineage with schema-based qualification |
 | `getSourceTables(column, sql, dialect?)` | Get source tables for a column |
-| `analyzeQuery(sql, options?)` | Return compact projection, relation, CTE, set-operation, and upstream-reference facts |
+| `analyzeQuery(sql, optionsOrDialect?)` | Return compact projection, visible relation, transitive base-table, CTE, set-operation, and upstream-reference facts |
 | `openLineageColumnLineage(sql, options)` | Build an OpenLineage columnLineage facet and datasets |
 | `openLineageJobEvent(sql, options)` | Build an OpenLineage JobEvent payload |
 | `openLineageRunEvent(sql, options)` | Build an OpenLineage RunEvent payload |

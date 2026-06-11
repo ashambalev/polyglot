@@ -184,9 +184,12 @@ own infrastructure.
 
 For applications that need summary facts instead of a full AST or full lineage
 graph, `analyze_query` / `analyzeQuery` returns a compact payload with output
-projections, root relations, CTE names, set-operation branches, transform kinds,
-optional type hints, and upstream column references. The API is additive and uses
-the same optional `ValidationSchema` shape as schema-aware validation and lineage.
+projections, direct visible relations, transitive physical `baseTables`, CTE
+names, set-operation branches, transform kinds, optional type hints, and
+upstream column references. The API is additive and uses the same optional
+`ValidationSchema` shape as schema-aware validation and lineage. Validation uses
+broad type families, while query analysis preserves detailed schema type strings
+such as `DECIMAL(10,2)` for `typeHint` values when they can be parsed.
 
 ## Format Guard Rails
 

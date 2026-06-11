@@ -726,7 +726,11 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             if let Some(source) = cte_source {
                 scope.add_source_info(name, source.clone());
             } else {
-                scope.add_source(name, expr.clone(), false);
+                let mut source = SourceInfo::new(expr.clone(), false, SourceKind::Table);
+                if let Some(alias) = &table.alias {
+                    source = source.with_alias(alias.name.clone());
+                }
+                scope.add_source_info(name, source);
             }
         }
         Expression::Subquery(subquery) => {

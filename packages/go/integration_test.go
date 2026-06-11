@@ -49,6 +49,7 @@ func integrationSchema() ValidationSchema {
 				Columns: []SchemaColumn{
 					{Name: "order_id", Type: "INT"},
 					{Name: "user_id", Type: "INT"},
+					{Name: "amount", Type: "DECIMAL(10,2)"},
 					{Name: "total", Type: "INT"},
 				},
 			},
@@ -254,6 +255,26 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	if analysis.Projections[0].Name == nil || *analysis.Projections[0].Name != "a" {
 		t.Fatalf("unexpected AnalyzeQuery projection: %#v", analysis.Projections[0])
+	}
+
+	analysis, err = client.AnalyzeQuery(
+		"SELECT o.order_id, SUM(o.amount) AS amount_sum FROM orders AS o GROUP BY o.order_id",
+		AnalyzeQueryOptions{Schema: integrationSchemaPtr()},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery with schema: %v", err)
+	}
+	if len(analysis.BaseTables) != 1 || analysis.BaseTables[0].Name != "orders" {
+		t.Fatalf("unexpected AnalyzeQuery baseTables: %#v", analysis.BaseTables)
+	}
+	if analysis.Projections[0].Upstream[0].SourceAlias == nil || *analysis.Projections[0].Upstream[0].SourceAlias != "o" {
+		t.Fatalf("unexpected AnalyzeQuery source alias: %#v", analysis.Projections[0].Upstream)
+	}
+	if analysis.Projections[1].TransformKind != "aggregation" {
+		t.Fatalf("unexpected AnalyzeQuery transform kind: %#v", analysis.Projections[1])
+	}
+	if analysis.Projections[1].TypeHint == nil || *analysis.Projections[1].TypeHint != "DECIMAL(10, 2)" {
+		t.Fatalf("unexpected AnalyzeQuery type hint: %#v", analysis.Projections[1])
 	}
 }
 

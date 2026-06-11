@@ -35,6 +35,32 @@ def test_analyze_query_accepts_schema_options():
     assert result["projections"][0]["castType"] == "TEXT"
 
 
+def test_analyze_query_reports_base_tables_aliases_aggregates_and_precise_types():
+    schema = {
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type": "INT"},
+                    {"name": "amount", "type": "DECIMAL(10,2)"},
+                ],
+            }
+        ]
+    }
+
+    result = polyglot_sql.analyze_query(
+        "SELECT o.id, SUM(o.amount) AS amount_sum FROM orders AS o GROUP BY o.id",
+        {"schema": schema, "dialect": "generic"},
+    )
+
+    assert result["baseTables"][0]["name"] == "orders"
+    assert result["baseTables"][0]["alias"] == "o"
+    assert result["projections"][0]["upstream"][0]["table"] == "orders"
+    assert result["projections"][0]["upstream"][0]["sourceAlias"] == "o"
+    assert result["projections"][1]["transformKind"] == "aggregation"
+    assert result["projections"][1]["typeHint"] == "DECIMAL(10, 2)"
+
+
 def test_analyze_query_unknown_dialect_raises_value_error():
     with pytest.raises(ValueError):
         polyglot_sql.analyze_query("SELECT 1", dialect="not_a_dialect")

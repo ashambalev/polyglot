@@ -98,21 +98,29 @@ emission are intentionally out of scope.
 
 ```python
 analysis = polyglot_sql.analyze_query(
-    "SELECT CAST(total AS TEXT) AS total_text FROM orders",
+    "SELECT SUM(o.amount) AS total FROM orders AS o",
     {
         "dialect": "generic",
         "schema": {
             "tables": [
                 {
                     "name": "orders",
-                    "columns": [{"name": "total", "type": "INT"}],
+                    "columns": [{"name": "amount", "type": "DECIMAL(10,2)"}],
                 }
             ]
         },
     },
 )
-print(analysis["projections"][0]["transformKind"])  # "cast"
+print(analysis["projections"][0]["transformKind"])  # "aggregation"
+print(analysis["projections"][0]["typeHint"])       # "DECIMAL(10, 2)"
+print(analysis["baseTables"][0]["name"])            # "orders"
 ```
+
+`analysis["relations"]` reports sources visible in the analyzed scope.
+`analysis["baseTables"]` reports deduplicated physical table dependencies across
+nested CTEs, derived tables, subqueries, and set-operation branches. Validation
+uses broad type families, while query analysis preserves parseable detailed
+schema type strings for projection `typeHint` values.
 
 ## API Reference
 

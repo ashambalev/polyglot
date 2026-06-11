@@ -4,6 +4,41 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.2] - 2026-06-11
+
+### Added
+- `QueryAnalysis` now includes `baseTables` / `base_tables`, a deduplicated
+  list of transitive physical table dependencies collected across root queries,
+  CTEs, derived tables, scalar subqueries, and set-operation branches.
+- TypeScript SDK `analyzeQuery` now accepts a dialect shorthand argument such as
+  `analyzeQuery(sql, Dialect.DuckDB)` in addition to the existing options
+  object.
+- Regression coverage for query-analysis aliases, qualified star expansion,
+  schema-driven star expansion, aggregate classification, precise type hints,
+  and transitive base-table reporting across Rust, C FFI, WASM/TypeScript,
+  Python, and Go.
+
+### Changed
+- Compact query analysis now preserves parseable detailed validation-schema
+  type strings such as `DECIMAL(10,2)` for projection `typeHint` values while
+  leaving schema-aware validation's broad type-family behavior unchanged.
+- Query-analysis documentation now distinguishes direct visible `relations`
+  from transitive physical `baseTables` across Rust, Python, C FFI,
+  WASM/TypeScript, and Go.
+
+### Fixed
+- Physical table aliases such as `orders AS o` are now preserved in
+  query-analysis upstream references as `sourceAlias` while keeping the physical
+  table identity as `orders`.
+- Qualified star projections such as `o.*` now expand and trace only the
+  matching source instead of all sources in the query.
+- Schema-aware analysis now resolves columns qualified by query aliases before
+  type annotation, so aliased table references keep correct upstream tables and
+  type hints.
+- Typed aggregate AST variants such as `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
+  `COUNT_IF`, `SUM_IF`, `STRING_AGG`, `GROUP_CONCAT`, and `LISTAGG` are now
+  classified as `aggregation` transforms in compact query analysis.
+
 ## [0.5.1] - 2026-06-09
 
 ### Added

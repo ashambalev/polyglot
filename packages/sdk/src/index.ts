@@ -255,6 +255,7 @@ export interface QueryAnalysis {
   ctes: string[];
   projections: ProjectionFact[];
   relations: RelationFact[];
+  baseTables: RelationFact[];
   setOperations: SetOperationFact[];
 }
 
@@ -381,6 +382,21 @@ function queryAnalysisFailure(
     success: false,
     analysis: undefined,
     error: `WASM ${context} failed: ${errorMessage(error)}`,
+  };
+}
+
+type AnalyzeQueryInput = AnalyzeQueryOptions | Dialect | string;
+
+function normalizeAnalyzeQueryOptions(
+  optionsOrDialect: AnalyzeQueryInput = {},
+): AnalyzeQueryOptions {
+  if (typeof optionsOrDialect === 'string') {
+    return { dialect: optionsOrDialect };
+  }
+
+  return {
+    dialect: Dialect.Generic,
+    ...optionsOrDialect,
   };
 }
 
@@ -728,13 +744,18 @@ export function getVersion(): string {
  */
 export function analyzeQuery(
   sql: string,
-  options: AnalyzeQueryOptions = {},
+  dialect: Dialect | string,
+): QueryAnalysisResult;
+export function analyzeQuery(
+  sql: string,
+  options?: AnalyzeQueryOptions,
+): QueryAnalysisResult;
+export function analyzeQuery(
+  sql: string,
+  optionsOrDialect: AnalyzeQueryInput = {},
 ): QueryAnalysisResult {
   try {
-    const normalized: AnalyzeQueryOptions = {
-      dialect: Dialect.Generic,
-      ...options,
-    };
+    const normalized = normalizeAnalyzeQueryOptions(optionsOrDialect);
 
     if (typeof wasm.analyze_query_value === 'function') {
       return decodeWasmPayload<QueryAnalysisResult>(
@@ -955,11 +976,13 @@ export class Polyglot {
   /**
    * Return compact query analysis facts for a SELECT or set operation.
    */
+  analyzeQuery(sql: string, dialect: Dialect | string): QueryAnalysisResult;
+  analyzeQuery(sql: string, options?: AnalyzeQueryOptions): QueryAnalysisResult;
   analyzeQuery(
     sql: string,
-    options: AnalyzeQueryOptions = {},
+    optionsOrDialect: AnalyzeQueryInput = {},
   ): QueryAnalysisResult {
-    return analyzeQuery(sql, options);
+    return analyzeQuery(sql, normalizeAnalyzeQueryOptions(optionsOrDialect));
   }
 }
 

@@ -653,21 +653,23 @@ fn expand_stars(
 
     for expr in &select.expressions {
         match expr {
-            Expression::Star(_) => {
+            Expression::Star(star) => {
                 has_star = true;
-                for source_name in &ordered_sources {
-                    if let Ok(columns) = resolver.get_source_columns(source_name) {
+                if let Some(table) = &star.table {
+                    let table_name = &table.name;
+                    if !ordered_sources.contains(table_name) {
+                        return Err(QualifyColumnsError::UnknownTable(table_name.clone()));
+                    }
+                    if let Ok(columns) = resolver.get_source_columns(table_name) {
                         if columns.contains(&"*".to_string()) || columns.is_empty() {
                             return Ok(());
                         }
                         for col_name in &columns {
                             if coalesced_columns.contains(col_name) {
-                                // Already emitted as COALESCE, skip
                                 continue;
                             }
                             if let Some(tables) = column_tables.get(col_name) {
-                                if tables.contains(source_name) {
-                                    // Emit COALESCE and mark as coalesced
+                                if tables.contains(table_name) {
                                     coalesced_columns.insert(col_name.clone());
                                     let coalesce = make_coalesce(col_name, tables);
                                     new_selections.push(Expression::Alias(Box::new(Alias {
@@ -684,7 +686,41 @@ fn expand_stars(
                                 }
                             }
                             new_selections
-                                .push(create_qualified_column(col_name, Some(source_name)));
+                                .push(create_qualified_column(col_name, Some(table_name)));
+                        }
+                    }
+                } else {
+                    for source_name in &ordered_sources {
+                        if let Ok(columns) = resolver.get_source_columns(source_name) {
+                            if columns.contains(&"*".to_string()) || columns.is_empty() {
+                                return Ok(());
+                            }
+                            for col_name in &columns {
+                                if coalesced_columns.contains(col_name) {
+                                    // Already emitted as COALESCE, skip
+                                    continue;
+                                }
+                                if let Some(tables) = column_tables.get(col_name) {
+                                    if tables.contains(source_name) {
+                                        // Emit COALESCE and mark as coalesced
+                                        coalesced_columns.insert(col_name.clone());
+                                        let coalesce = make_coalesce(col_name, tables);
+                                        new_selections.push(Expression::Alias(Box::new(Alias {
+                                            this: coalesce,
+                                            alias: Identifier::new(col_name),
+                                            column_aliases: vec![],
+                                            alias_explicit_as: false,
+                                            alias_keyword: None,
+                                            pre_alias_comments: vec![],
+                                            trailing_comments: vec![],
+                                            inferred_type: None,
+                                        })));
+                                        continue;
+                                    }
+                                }
+                                new_selections
+                                    .push(create_qualified_column(col_name, Some(source_name)));
+                            }
                         }
                     }
                 }

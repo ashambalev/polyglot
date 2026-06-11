@@ -313,21 +313,35 @@ Schema-aware validation emits stable codes such as:
 ### Compact Query Analysis
 
 Use `analyze_query` when you need high-level facts without consuming the full AST
-or full lineage graph:
+or full lineage graph. `relations` reports sources visible in the analyzed
+scope, while `base_tables` reports deduplicated physical table dependencies
+across CTEs, derived tables, subqueries, and set-operation branches. When a
+`ValidationSchema` is supplied, detailed type strings such as `DECIMAL(10,2)`
+are preserved in projection `type_hint` values when parseable.
 
 ```rust
 use polyglot_sql::{analyze_query, AnalyzeQueryOptions, DialectType, QueryShape};
 
+let schema: polyglot_sql::ValidationSchema = serde_json::from_value(serde_json::json!({
+    "tables": [{
+        "name": "orders",
+        "columns": [{"name": "amount", "type": "DECIMAL(10,2)"}]
+    }]
+})).unwrap();
+
 let analysis = analyze_query(
-    "SELECT o.total AS total FROM orders o",
+    "SELECT SUM(o.amount) AS total FROM orders o",
     AnalyzeQueryOptions {
         dialect: DialectType::Generic,
-        schema: None,
+        schema: Some(schema),
     },
 ).unwrap();
 
 assert_eq!(analysis.shape, QueryShape::Select);
 assert_eq!(analysis.projections[0].name.as_deref(), Some("total"));
+assert_eq!(analysis.projections[0].transform_kind, polyglot_sql::TransformKind::Aggregation);
+assert_eq!(analysis.base_tables[0].name, "orders");
+assert_eq!(analysis.base_tables[0].alias.as_deref(), Some("o"));
 ```
 
 ### Tokenize

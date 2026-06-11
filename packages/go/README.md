@@ -246,7 +246,7 @@ fmt.Println(sql[0])
 | `Lineage(column, sql, dialect string) (LineageNode, error)` | Return a lineage tree for a selected output column. |
 | `LineageWithSchema(column, sql string, schema ValidationSchema, dialect string) (LineageNode, error)` | Return lineage using schema metadata for improved resolution. |
 | `SourceTables(column, sql, dialect string) ([]string, error)` | Return source table names for a selected output column. |
-| `AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error)` | Return compact projection, relation, CTE, set-operation, and upstream-reference facts. |
+| `AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error)` | Return compact projection, visible relation, transitive base-table, CTE, set-operation, and upstream-reference facts. |
 
 ```go
 node, err := client.Lineage("total", "SELECT o.total FROM orders o", "generic")
@@ -267,14 +267,14 @@ schema := polyglot.ValidationSchema{
 		{
 			Name: "orders",
 			Columns: []polyglot.SchemaColumn{
-				{Name: "total", Type: "INT"},
+				{Name: "amount", Type: "DECIMAL(10,2)"},
 			},
 		},
 	},
 }
 
 analysis, err := client.AnalyzeQuery(
-	"SELECT CAST(total AS TEXT) AS total_text FROM orders",
+	"SELECT SUM(o.amount) AS total FROM orders AS o",
 	polyglot.AnalyzeQueryOptions{
 		Dialect: "generic",
 		Schema:  &schema,
@@ -283,12 +283,22 @@ analysis, err := client.AnalyzeQuery(
 if err != nil {
 	log.Fatal(err)
 }
-fmt.Println(analysis.Projections[0].TransformKind) // cast
+fmt.Println(analysis.Projections[0].TransformKind) // aggregation
+fmt.Println(*analysis.Projections[0].TypeHint)     // DECIMAL(10, 2)
+fmt.Println(analysis.BaseTables[0].Name)           // orders
+fmt.Println(*analysis.BaseTables[0].Alias)         // o
 ```
 
 `LineageNode.SourceKind` identifies whether a source is a real table, CTE,
 derived table, virtual source, or unknown. `LineageNode.SourceAlias` is set for
-virtual sources such as BigQuery `UNNEST(...) AS alias`.
+physical table aliases such as `orders AS o` and virtual sources such as
+BigQuery `UNNEST(...) AS alias`.
+
+For `AnalyzeQuery`, `Relations` reports sources visible in the analyzed scope.
+`BaseTables` reports deduplicated physical table dependencies across nested CTEs,
+derived tables, subqueries, and set-operation branches. Schema-aware validation
+uses broad type families, while query analysis preserves parseable detailed
+schema type strings for projection `TypeHint` values.
 
 ### OpenLineage
 
@@ -345,7 +355,7 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
 | `AnalyzeQueryOptions` | `Dialect`, `Schema` |
-| `QueryAnalysis` | `Shape`, `CTEs`, `Projections`, `Relations`, `SetOperations` |
+| `QueryAnalysis` | `Shape`, `CTEs`, `Projections`, `Relations`, `BaseTables`, `SetOperations` |
 | `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `CastType`, `TypeHint`, `Upstream` |
 | `ColumnReferenceFact` | `SourceName`, `SourceAlias`, `SourceKind`, `Table`, `Column`, `Unqualified`, `Confidence` |
 | `RelationFact` | `Name`, `Alias`, `Kind`, `Columns` |

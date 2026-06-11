@@ -3314,15 +3314,44 @@ mod tests {
 
     #[test]
     fn test_analyze_query() {
-        let result = analyze_query("SELECT a FROM t", r#"{"dialect":"generic"}"#);
+        let result = analyze_query(
+            "SELECT o.id, SUM(o.amount) AS amount_sum FROM orders AS o GROUP BY o.id",
+            r#"{
+                "dialect":"generic",
+                "schema":{
+                    "tables":[
+                        {
+                            "name":"orders",
+                            "columns":[
+                                {"name":"id","type":"INT"},
+                                {"name":"amount","type":"DECIMAL(10,2)"}
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
 
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["analysis"]["shape"], "select");
-        assert_eq!(parsed["analysis"]["projections"][0]["name"], "a");
+        assert_eq!(parsed["analysis"]["baseTables"][0]["name"], "orders");
+        assert_eq!(parsed["analysis"]["baseTables"][0]["alias"], "o");
         assert_eq!(
-            parsed["analysis"]["projections"][0]["upstream"][0]["column"],
-            "a"
+            parsed["analysis"]["projections"][0]["upstream"][0]["table"],
+            "orders"
+        );
+        assert_eq!(
+            parsed["analysis"]["projections"][0]["upstream"][0]["sourceAlias"],
+            "o"
+        );
+        assert_eq!(
+            parsed["analysis"]["projections"][1]["transformKind"],
+            "aggregation"
+        );
+        assert_eq!(
+            parsed["analysis"]["projections"][1]["typeHint"],
+            "DECIMAL(10, 2)"
         );
     }
 

@@ -116,6 +116,11 @@ typedef struct {
 - `polyglot_lineage_with_schema(column_name, sql, schema_json, dialect)` (`ValidationSchema` JSON)
 - `polyglot_source_tables(column_name, sql, dialect)`
 - `polyglot_analyze_query(sql, options_json)` (`AnalyzeQueryOptions` JSON)
+  returns compact `QueryAnalysis` JSON. `relations` contains sources visible in
+  the analyzed scope, and `baseTables` contains deduplicated physical table
+  dependencies from nested CTEs, derived tables, subqueries, and set-operation
+  branches. With a schema, parseable detailed type strings such as
+  `DECIMAL(10,2)` are preserved in projection `typeHint` values.
 - `polyglot_openlineage_column_lineage(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_job_event(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_run_event(sql, options_json)` (`OpenLineageOptions` JSON)

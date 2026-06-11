@@ -1098,9 +1098,22 @@ pub fn is_select(expr: &Expression) -> bool {
     matches!(expr, Expression::Select(_))
 }
 
-/// Returns `true` if `expr` is an aggregate function ([`Expression::AggregateFunction`]).
+/// Returns `true` if `expr` is an aggregate function.
 pub fn is_aggregate(expr: &Expression) -> bool {
-    matches!(expr, Expression::AggregateFunction(_))
+    matches!(
+        expr,
+        Expression::AggregateFunction(_)
+            | Expression::Count(_)
+            | Expression::Sum(_)
+            | Expression::Avg(_)
+            | Expression::Min(_)
+            | Expression::Max(_)
+            | Expression::GroupConcat(_)
+            | Expression::StringAgg(_)
+            | Expression::ListAgg(_)
+            | Expression::CountIf(_)
+            | Expression::SumIf(_)
+    )
 }
 
 /// Returns `true` if `expr` is a window function ([`Expression::WindowFunction`]).

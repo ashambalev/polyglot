@@ -58,11 +58,26 @@ same.sql("postgres")  # "VARCHAR(255)"
 
 ```python
 analysis = polyglot_sql.analyze_query(
-    "SELECT total FROM orders",
-    {"dialect": "generic"},
+    "SELECT SUM(o.amount) AS total FROM orders AS o",
+    {
+        "dialect": "generic",
+        "schema": {
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [{"name": "amount", "type": "DECIMAL(10,2)"}],
+                }
+            ]
+        },
+    },
 )
-analysis["projections"][0]["upstream"]
+analysis["projections"][0]["transformKind"]  # "aggregation"
+analysis["projections"][0]["typeHint"]       # "DECIMAL(10, 2)"
+analysis["baseTables"][0]["name"]            # "orders"
 ```
+
+`relations` reports sources visible in the analyzed scope. `baseTables` reports
+deduplicated physical table dependencies across nested scopes.
 
 ### Traverse the AST
 

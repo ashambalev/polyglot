@@ -11,11 +11,11 @@ use crate::expressions::{DataType, Expression, TableRef, With};
 use crate::lineage::{lineage_by_index_from_expression, LineageNode};
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
-use crate::schema::Schema;
+use crate::schema::{MappingSchema, Schema};
 use crate::scope::{build_scope, Scope, SourceInfo, SourceKind};
 use crate::traversal::{contains_aggregate, ExpressionWalk};
 use crate::validation::{mapping_schema_from_validation_schema, ValidationSchema};
-use crate::{parse_one, Error, Result};
+use crate::{parse_data_type, parse_one, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -37,6 +37,7 @@ pub struct QueryAnalysis {
     pub ctes: Vec<String>,
     pub projections: Vec<ProjectionFact>,
     pub relations: Vec<RelationFact>,
+    pub base_tables: Vec<RelationFact>,
     pub set_operations: Vec<SetOperationFact>,
 }
 
@@ -134,7 +135,7 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     let mapping_schema = options
         .schema
         .as_ref()
-        .map(mapping_schema_from_validation_schema);
+        .map(|schema| analysis_mapping_schema(schema, options.dialect));
 
     if let Some(schema) = mapping_schema.as_ref() {
         let qualify_options = QualifyColumnsOptions::new().with_dialect(options.dialect);
@@ -142,12 +143,31 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
             .map_err(|e| Error::internal(format!("query analysis qualification failed: {e}")))?;
     }
 
+    let annotation_schema = mapping_schema.as_ref().map(|schema| {
+        let mut alias_schema = schema.clone();
+        add_scope_aliases_to_schema(
+            &build_scope(&expression),
+            schema,
+            &mut alias_schema,
+            options.dialect,
+        );
+        alias_schema
+    });
+
     annotate_types(
         &mut expression,
-        mapping_schema.as_ref().map(|s| s as _),
+        annotation_schema
+            .as_ref()
+            .map(|schema| schema as &dyn Schema),
         Some(options.dialect),
     );
-    crate::lineage::expand_cte_stars(&mut expression, mapping_schema.as_ref().map(|s| s as _));
+    crate::lineage::expand_cte_stars(
+        &mut expression,
+        annotation_schema
+            .as_ref()
+            .or(mapping_schema.as_ref())
+            .map(|schema| schema as &dyn Schema),
+    );
 
     let scope = build_scope(&expression);
     let shape = if is_set_operation(&expression) {
@@ -161,8 +181,104 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         ctes: collect_cte_names(&expression),
         projections: projection_facts_for_query(&expression, &scope, options.dialect),
         relations: relation_facts(&scope, mapping_schema.as_ref()),
+        base_tables: base_table_facts(&scope, mapping_schema.as_ref()),
         set_operations: set_operation_facts(&expression, &scope, options.dialect),
     })
+}
+
+fn analysis_mapping_schema(schema: &ValidationSchema, dialect: DialectType) -> MappingSchema {
+    let broad_schema = mapping_schema_from_validation_schema(schema);
+    let mut mapping_schema = MappingSchema::with_dialect(dialect);
+
+    for table in &schema.tables {
+        let table_names = validation_table_names(table);
+        if table_names.is_empty() {
+            continue;
+        }
+
+        let fallback_table = table_names[0].as_str();
+        let columns: Vec<(String, DataType)> = table
+            .columns
+            .iter()
+            .map(|column| {
+                let data_type = parse_analysis_data_type(&column.data_type, dialect)
+                    .unwrap_or_else(|| {
+                        broad_schema
+                            .get_column_type(fallback_table, &column.name)
+                            .unwrap_or(DataType::Unknown)
+                    });
+                (column.name.to_ascii_lowercase(), data_type)
+            })
+            .collect();
+
+        for table_name in table_names {
+            let _ = mapping_schema.add_table(&table_name, &columns, Some(dialect));
+        }
+    }
+
+    mapping_schema
+}
+
+fn validation_table_names(table: &crate::validation::SchemaTable) -> Vec<String> {
+    let mut names = Vec::new();
+
+    names.push(table.name.to_ascii_lowercase());
+    if let Some(schema_name) = &table.schema {
+        names.push(format!(
+            "{}.{}",
+            schema_name.to_ascii_lowercase(),
+            table.name.to_ascii_lowercase()
+        ));
+    }
+    for alias in &table.aliases {
+        names.push(alias.to_ascii_lowercase());
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn parse_analysis_data_type(data_type: &str, dialect: DialectType) -> Option<DataType> {
+    let trimmed = data_type.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    parse_data_type(trimmed, dialect).ok()
+}
+
+fn add_scope_aliases_to_schema(
+    scope: &Scope,
+    source_schema: &MappingSchema,
+    target_schema: &mut MappingSchema,
+    dialect: DialectType,
+) {
+    for child_scope in scope.traverse() {
+        for (source_name, source) in &child_scope.sources {
+            if source.kind != SourceKind::Table {
+                continue;
+            }
+            if let Some(table_name) = source_table_name(source) {
+                if source_name == &table_name {
+                    continue;
+                }
+                if let Ok(column_names) = source_schema.column_names(&table_name) {
+                    let columns: Vec<(String, DataType)> = column_names
+                        .iter()
+                        .map(|column| {
+                            (
+                                column.clone(),
+                                source_schema
+                                    .get_column_type(&table_name, column)
+                                    .unwrap_or(DataType::Unknown),
+                            )
+                        })
+                        .collect();
+                    let _ = target_schema.add_table(source_name, &columns, Some(dialect));
+                }
+            }
+        }
+    }
 }
 
 fn effective_query(expression: Expression) -> Expression {
@@ -619,6 +735,38 @@ fn collect_relation_facts(
     for branch_scope in &scope.union_scopes {
         collect_relation_facts(branch_scope, mapping_schema, seen, relations);
     }
+}
+
+fn base_table_facts(
+    scope: &Scope,
+    mapping_schema: Option<&crate::schema::MappingSchema>,
+) -> Vec<RelationFact> {
+    let mut relations = Vec::new();
+    let mut seen = HashSet::new();
+
+    for child_scope in scope.traverse() {
+        for source in child_scope.sources.values() {
+            if source.kind != SourceKind::Table {
+                continue;
+            }
+
+            let Some(table_name) = source_table_name(source) else {
+                continue;
+            };
+
+            if seen.insert(table_name.clone()) {
+                relations.push(RelationFact {
+                    name: table_name,
+                    alias: source.alias.clone().or_else(|| source_alias(source)),
+                    kind: SourceKind::Table,
+                    columns: source_columns(source, mapping_schema),
+                });
+            }
+        }
+    }
+
+    relations.sort_by(|left, right| left.name.cmp(&right.name));
+    relations
 }
 
 fn source_columns(

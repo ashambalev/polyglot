@@ -772,12 +772,32 @@ fn to_node_inner(
     apply_scope_context(&mut node, scope, source_name, reference_node_name);
 
     // 5. Star handling — add downstream for each source
-    if matches!(&select_expr, Expression::Star(_)) {
+    if let Expression::Star(star) = &select_expr {
+        let star_table = star
+            .table
+            .as_ref()
+            .map(|identifier| identifier.name.as_str());
         for (name, source_info) in &scope.sources {
+            if let Some(star_table) = star_table {
+                let table_matches = name.eq_ignore_ascii_case(star_table)
+                    || source_info
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(star_table))
+                    || matches!(
+                        &source_info.expression,
+                        Expression::Table(table_ref)
+                            if table_name_from_table_ref(table_ref).eq_ignore_ascii_case(star_table)
+                    );
+                if !table_matches {
+                    continue;
+                }
+            }
+
             let mut child = LineageNode::new(
                 format!("{}.*", name),
                 Expression::Star(crate::expressions::Star {
-                    table: None,
+                    table: star.table.clone(),
                     except: None,
                     replace: None,
                     rename: None,
