@@ -58,26 +58,63 @@ same.sql("postgres")  # "VARCHAR(255)"
 
 ```python
 analysis = polyglot_sql.analyze_query(
-    "SELECT SUM(o.amount) AS total FROM orders AS o",
+    "WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base",
     {
         "dialect": "generic",
         "schema": {
             "tables": [
                 {
                     "name": "orders",
-                    "columns": [{"name": "amount", "type": "DECIMAL(10,2)"}],
+                    "columns": [
+                        {"name": "id", "type": "INT", "nullable": False},
+                        {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
+                    ],
                 }
             ]
         },
     },
 )
-analysis["projections"][0]["transformKind"]  # "aggregation"
-analysis["projections"][0]["typeHint"]       # "DECIMAL(10, 2)"
+analysis["cteFacts"][0]["bodySql"]           # "SELECT id, amount FROM orders"
+analysis["starProjections"][0]["expandedColumns"]  # ["id", "amount"]
+analysis["projections"][0]["nullability"]    # "non_null"
 analysis["baseTables"][0]["name"]            # "orders"
 ```
 
 `relations` reports sources visible in the analyzed scope. `baseTables` reports
 deduplicated physical table dependencies across nested scopes.
+`cteFacts` reports top-level CTE definitions, `starProjections` records original
+star projections and schema-expanded columns, and each projection has
+conservative `nullability`: `"non_null"`, `"nullable"`, or `"unknown"`.
+
+Validation schema dictionaries use this shape:
+
+```python
+schema = {
+    "strict": True,
+    "tables": [
+        {
+            "name": "orders",
+            "schema": "analytics",
+            "aliases": ["o"],
+            "primaryKey": ["id"],
+            "uniqueKeys": [["external_id"]],
+            "foreignKeys": [
+                {
+                    "columns": ["customer_id"],
+                    "references": {"table": "customers", "columns": ["id"]},
+                }
+            ],
+            "columns": [
+                {"name": "id", "type": "INT", "nullable": False, "primaryKey": True},
+                {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
+            ],
+        }
+    ],
+}
+```
+
+Use the `type` key for column types. `dataType` / `data_type` are not accepted
+aliases in this payload.
 
 ### Traverse the AST
 

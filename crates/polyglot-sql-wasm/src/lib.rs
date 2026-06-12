@@ -3323,8 +3323,8 @@ mod tests {
                         {
                             "name":"orders",
                             "columns":[
-                                {"name":"id","type":"INT"},
-                                {"name":"amount","type":"DECIMAL(10,2)"}
+                                {"name":"id","type":"INT","nullable":false},
+                                {"name":"amount","type":"DECIMAL(10,2)","nullable":true}
                             ]
                         }
                     ]
@@ -3352,6 +3352,50 @@ mod tests {
         assert_eq!(
             parsed["analysis"]["projections"][1]["typeHint"],
             "DECIMAL(10, 2)"
+        );
+        assert_eq!(
+            parsed["analysis"]["projections"][0]["nullability"],
+            "non_null"
+        );
+
+        let result = analyze_query(
+            "WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base",
+            r#"{
+                "dialect":"generic",
+                "schema":{
+                    "tables":[
+                        {
+                            "name":"orders",
+                            "columns":[
+                                {"name":"id","type":"INT","nullable":false},
+                                {"name":"amount","type":"DECIMAL(10,2)","nullable":true}
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["analysis"]["cteFacts"][0]["name"], "base");
+        assert_eq!(
+            parsed["analysis"]["cteFacts"][0]["bodySql"],
+            "SELECT id, amount FROM orders"
+        );
+        assert_eq!(parsed["analysis"]["cteFacts"][0]["outputColumns"][0], "id");
+        assert_eq!(
+            parsed["analysis"]["cteFacts"][0]["outputColumns"][1],
+            "amount"
+        );
+        assert_eq!(parsed["analysis"]["starProjections"][0]["index"], 0);
+        assert_eq!(
+            parsed["analysis"]["starProjections"][0]["expandedColumns"][0],
+            "id"
+        );
+        assert_eq!(
+            parsed["analysis"]["starProjections"][0]["expandedColumns"][1],
+            "amount"
         );
     }
 

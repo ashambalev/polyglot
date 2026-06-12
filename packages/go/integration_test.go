@@ -35,21 +35,24 @@ func integrationLibraryPath(t *testing.T) string {
 }
 
 func integrationSchema() ValidationSchema {
+	nullable := true
+	nonNull := false
+
 	return ValidationSchema{
 		Tables: []SchemaTable{
 			{
 				Name: "users",
 				Columns: []SchemaColumn{
-					{Name: "id", Type: "INT"},
-					{Name: "name", Type: "TEXT"},
+					{Name: "id", Type: "INT", PrimaryKey: true},
+					{Name: "name", Type: "TEXT", Nullable: &nonNull},
 				},
 			},
 			{
 				Name: "orders",
 				Columns: []SchemaColumn{
-					{Name: "order_id", Type: "INT"},
+					{Name: "order_id", Type: "INT", Nullable: &nonNull},
 					{Name: "user_id", Type: "INT"},
-					{Name: "amount", Type: "DECIMAL(10,2)"},
+					{Name: "amount", Type: "DECIMAL(10,2)", Nullable: &nullable},
 					{Name: "total", Type: "INT"},
 				},
 			},
@@ -275,6 +278,26 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	if analysis.Projections[1].TypeHint == nil || *analysis.Projections[1].TypeHint != "DECIMAL(10, 2)" {
 		t.Fatalf("unexpected AnalyzeQuery type hint: %#v", analysis.Projections[1])
+	}
+	if analysis.Projections[0].Nullability != "non_null" {
+		t.Fatalf("unexpected AnalyzeQuery nullability: %#v", analysis.Projections[0])
+	}
+
+	analysis, err = client.AnalyzeQuery(
+		"WITH base AS (SELECT order_id, amount FROM orders) SELECT * FROM base",
+		AnalyzeQueryOptions{Schema: integrationSchemaPtr()},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery with CTE/star: %v", err)
+	}
+	if len(analysis.CTEFacts) != 1 || analysis.CTEFacts[0].Name != "base" {
+		t.Fatalf("unexpected AnalyzeQuery CTE facts: %#v", analysis.CTEFacts)
+	}
+	if analysis.CTEFacts[0].BodySQL != "SELECT order_id, amount FROM orders" {
+		t.Fatalf("unexpected AnalyzeQuery CTE body SQL: %#v", analysis.CTEFacts[0])
+	}
+	if len(analysis.StarProjections) != 1 || len(analysis.StarProjections[0].ExpandedColumns) != 2 {
+		t.Fatalf("unexpected AnalyzeQuery star projections: %#v", analysis.StarProjections)
 	}
 }
 

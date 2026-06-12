@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.5.2"
+const sdkVersion = "0.5.3"
 
 func Version() string {
 	return sdkVersion
@@ -108,12 +108,14 @@ type LineageNode struct {
 }
 
 type QueryAnalysis struct {
-	Shape         string             `json:"shape"`
-	CTEs          []string           `json:"ctes"`
-	Projections   []ProjectionFact   `json:"projections"`
-	Relations     []RelationFact     `json:"relations"`
-	BaseTables    []RelationFact     `json:"baseTables"`
-	SetOperations []SetOperationFact `json:"setOperations"`
+	Shape           string               `json:"shape"`
+	CTEs            []string             `json:"ctes"`
+	CTEFacts        []CTEFact            `json:"cteFacts"`
+	Projections     []ProjectionFact     `json:"projections"`
+	Relations       []RelationFact       `json:"relations"`
+	BaseTables      []RelationFact       `json:"baseTables"`
+	StarProjections []StarProjectionFact `json:"starProjections"`
+	SetOperations   []SetOperationFact   `json:"setOperations"`
 }
 
 type ProjectionFact struct {
@@ -124,7 +126,21 @@ type ProjectionFact struct {
 	TransformKind string                `json:"transformKind"`
 	CastType      *string               `json:"castType"`
 	TypeHint      *string               `json:"typeHint"`
+	Nullability   string                `json:"nullability"`
 	Upstream      []ColumnReferenceFact `json:"upstream"`
+}
+
+type CTEFact struct {
+	Name          string   `json:"name"`
+	Columns       []string `json:"columns"`
+	BodySQL       string   `json:"bodySql"`
+	OutputColumns []string `json:"outputColumns"`
+}
+
+type StarProjectionFact struct {
+	Index           int      `json:"index"`
+	Table           *string  `json:"table"`
+	ExpandedColumns []string `json:"expandedColumns"`
 }
 
 type ColumnReferenceFact struct {

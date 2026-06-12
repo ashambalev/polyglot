@@ -24377,6 +24377,34 @@ impl Parser {
             return self.fallback_to_command(statement_start);
         }
 
+        // T-SQL: SET IDENTITY_INSERT schema.table ON|OFF.
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL)
+        ) && self.match_identifier("IDENTITY_INSERT")
+        {
+            let table = self.parse_table_ref()?;
+            let state = if self.check(TokenType::On) || self.check_keyword_text("OFF") {
+                self.advance().text.to_uppercase()
+            } else {
+                return Err(self.parse_error("Expected ON or OFF after SET IDENTITY_INSERT table"));
+            };
+
+            items.push(SetItem {
+                name: Expression::Identifier(Identifier::new("IDENTITY_INSERT")),
+                value: Expression::Tuple(Box::new(crate::expressions::Tuple {
+                    expressions: vec![
+                        Expression::Table(Box::new(table)),
+                        Expression::Identifier(Identifier::new(state)),
+                    ],
+                })),
+                kind: None,
+                no_equals: true,
+            });
+
+            return Ok(Expression::SetStatement(Box::new(SetStatement { items })));
+        }
+
         // ClickHouse: SET DEFAULT ROLE ... TO user - parse as command
         if matches!(
             self.config.dialect,

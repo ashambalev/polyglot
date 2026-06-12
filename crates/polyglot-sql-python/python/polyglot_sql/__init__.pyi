@@ -1636,7 +1636,12 @@ def analyze_query(
 
     Options use camelCase keys and currently support ``dialect`` and optional
     ``schema`` in the same ValidationSchema shape accepted by schema-aware
-    validation and lineage APIs.
+    validation and lineage APIs. Schema columns use the ``type`` key for type
+    strings; ``dataType`` and ``data_type`` are not accepted aliases.
+
+    The returned dict includes ``relations``, transitive ``baseTables``,
+    top-level ``cteFacts``, original ``starProjections``, and projection
+    ``nullability`` values of ``"non_null"``, ``"nullable"``, or ``"unknown"``.
     """
     ...
 

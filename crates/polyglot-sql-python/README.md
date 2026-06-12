@@ -98,21 +98,25 @@ emission are intentionally out of scope.
 
 ```python
 analysis = polyglot_sql.analyze_query(
-    "SELECT SUM(o.amount) AS total FROM orders AS o",
+    "WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base",
     {
         "dialect": "generic",
         "schema": {
             "tables": [
                 {
                     "name": "orders",
-                    "columns": [{"name": "amount", "type": "DECIMAL(10,2)"}],
+                    "columns": [
+                        {"name": "id", "type": "INT", "nullable": False},
+                        {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
+                    ],
                 }
             ]
         },
     },
 )
-print(analysis["projections"][0]["transformKind"])  # "aggregation"
-print(analysis["projections"][0]["typeHint"])       # "DECIMAL(10, 2)"
+print(analysis["cteFacts"][0]["bodySql"])           # "SELECT id, amount FROM orders"
+print(analysis["starProjections"][0]["expandedColumns"])  # ["id", "amount"]
+print(analysis["projections"][0]["nullability"])    # "non_null"
 print(analysis["baseTables"][0]["name"])            # "orders"
 ```
 
@@ -120,7 +124,40 @@ print(analysis["baseTables"][0]["name"])            # "orders"
 `analysis["baseTables"]` reports deduplicated physical table dependencies across
 nested CTEs, derived tables, subqueries, and set-operation branches. Validation
 uses broad type families, while query analysis preserves parseable detailed
-schema type strings for projection `typeHint` values.
+schema type strings for projection `typeHint` values. `analysis["cteFacts"]`
+reports top-level CTE definitions, `analysis["starProjections"]` records the
+original star projections and schema-expanded columns, and each projection has
+conservative `nullability`: `"non_null"`, `"nullable"`, or `"unknown"`.
+
+Validation schema dictionaries use:
+
+```python
+schema = {
+    "strict": True,
+    "tables": [
+        {
+            "name": "orders",
+            "schema": "analytics",
+            "aliases": ["o"],
+            "primaryKey": ["id"],
+            "uniqueKeys": [["external_id"]],
+            "foreignKeys": [
+                {
+                    "columns": ["customer_id"],
+                    "references": {"table": "customers", "columns": ["id"]},
+                }
+            ],
+            "columns": [
+                {"name": "id", "type": "INT", "nullable": False, "primaryKey": True},
+                {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
+            ],
+        }
+    ],
+}
+```
+
+Use the `type` key for column types. `dataType` / `data_type` are not accepted
+aliases in this payload.
 
 ## API Reference
 

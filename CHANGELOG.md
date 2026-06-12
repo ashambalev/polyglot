@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.3] - 2026-06-11
+
+### Added
+- `QueryAnalysis` now includes `cteFacts` / `cte_facts` for top-level CTE names,
+  declared columns, original body SQL, and output columns.
+- `QueryAnalysis` now includes `starProjections` / `star_projections` to retain
+  provenance for original top-level `*` and `table.*` projections after schema
+  expansion.
+- `ProjectionFact` now includes conservative `nullability` classification:
+  `non_null`, `nullable`, or `unknown`.
+- Regression coverage for CTE facts, star projection provenance, and projection
+  nullability across Rust, C FFI, WASM/TypeScript, Python, and Go.
+- Regression coverage for `baseTables` discovery inside inline derived tables
+  and derived-table set operations.
+
+### Changed
+- Validation schema documentation now explicitly covers the accepted JSON shape,
+  including the `type` column key and nullability/constraint metadata.
+
+### Fixed
+- `QueryAnalysis.baseTables` now descends into inline derived tables
+  (`FROM (SELECT ...) AS alias`), including derived-table set operations, so
+  physical backing tables are reported consistently with CTE-backed queries.
+- T-SQL parsing now accepts structured `SET IDENTITY_INSERT <table> ON|OFF`
+  statements and round-trips them without falling back to an opaque command.
+
 ## [0.5.2] - 2026-06-11
 
 ### Added

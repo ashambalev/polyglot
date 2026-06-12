@@ -608,29 +608,71 @@ lineage graph. `relations` contains sources visible in the analyzed scope;
 `baseTables` contains deduplicated physical dependencies across nested CTEs,
 derived tables, subqueries, and set-operation branches. With a schema,
 parseable detailed type strings such as `DECIMAL(10,2)` are preserved in
-projection `typeHint` values.
+projection `typeHint` values. `cteFacts` reports top-level CTE definitions,
+`starProjections` records original star projections and schema-expanded
+columns, and each projection includes conservative `nullability`: `'non_null'`,
+`'nullable'`, or `'unknown'`.
 
 ```typescript
 import { analyzeQuery, Dialect } from '@polyglot-sql/sdk';
 
-const result = analyzeQuery('SELECT SUM(o.amount) AS total FROM orders AS o', {
-  dialect: Dialect.Generic,
-  schema: {
-    tables: [
-      { name: 'orders', columns: [{ name: 'amount', type: 'DECIMAL(10,2)' }] },
-    ],
+const result = analyzeQuery(
+  'WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base',
+  {
+    dialect: Dialect.Generic,
+    schema: {
+      tables: [
+        {
+          name: 'orders',
+          columns: [
+            { name: 'id', type: 'INT', nullable: false },
+            { name: 'amount', type: 'DECIMAL(10,2)', nullable: true },
+          ],
+        },
+      ],
+    },
   },
-});
+);
 
 if (result.success) {
-  console.log(result.analysis.projections[0].transformKind); // 'aggregation'
-  console.log(result.analysis.projections[0].typeHint);      // 'DECIMAL(10, 2)'
-  console.log(result.analysis.baseTables[0].name);           // 'orders'
-  console.log(result.analysis.baseTables[0].alias);          // 'o'
+  console.log(result.analysis.cteFacts[0].bodySql);                // 'SELECT id, amount FROM orders'
+  console.log(result.analysis.starProjections[0].expandedColumns); // ['id', 'amount']
+  console.log(result.analysis.projections[0].nullability);         // 'non_null'
+  console.log(result.analysis.baseTables[0].name);                 // 'orders'
 }
 
 const duckdbSummary = analyzeQuery('SELECT 1', Dialect.DuckDB);
 ```
+
+`ValidationSchema` objects use this shape:
+
+```typescript
+const schema = {
+  strict: true,
+  tables: [
+    {
+      name: 'orders',
+      schema: 'analytics',
+      aliases: ['o'],
+      primaryKey: ['id'],
+      uniqueKeys: [['external_id']],
+      foreignKeys: [
+        {
+          columns: ['customer_id'],
+          references: { table: 'customers', columns: ['id'] },
+        },
+      ],
+      columns: [
+        { name: 'id', type: 'INT', nullable: false, primaryKey: true },
+        { name: 'amount', type: 'DECIMAL(10,2)', nullable: true },
+      ],
+    },
+  ],
+};
+```
+
+Use the `type` key for column types. `dataType` / `data_type` are not accepted
+aliases in this payload.
 
 ## OpenLineage Output
 

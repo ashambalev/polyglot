@@ -223,8 +223,8 @@ describe('Polyglot SDK', () => {
           {
             name: 'orders',
             columns: [
-              { name: 'id', type: 'INT' },
-              { name: 'amount', type: 'DECIMAL(10,2)' },
+              { name: 'id', type: 'INT', nullable: false },
+              { name: 'amount', type: 'DECIMAL(10,2)', nullable: true },
             ],
           },
         ],
@@ -252,6 +252,38 @@ describe('Polyglot SDK', () => {
       expect(result.analysis?.projections[1]).toMatchObject({
         transformKind: 'aggregation',
         typeHint: 'DECIMAL(10, 2)',
+      });
+      expect(result.analysis?.projections[0].nullability).toBe('non_null');
+      expect(result.analysis?.projections[1].nullability).toBe('unknown');
+    });
+
+    it('should expose CTE facts and star projection provenance', () => {
+      const schema = {
+        tables: [
+          {
+            name: 'orders',
+            columns: [
+              { name: 'id', type: 'INT', nullable: false },
+              { name: 'amount', type: 'DECIMAL(10,2)', nullable: true },
+            ],
+          },
+        ],
+      };
+
+      const result = analyzeQuery(
+        'WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base',
+        { dialect: Dialect.Generic, schema },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.cteFacts[0]).toMatchObject({
+        name: 'base',
+        bodySql: 'SELECT id, amount FROM orders',
+        outputColumns: ['id', 'amount'],
+      });
+      expect(result.analysis?.starProjections[0]).toMatchObject({
+        index: 0,
+        expandedColumns: ['id', 'amount'],
       });
     });
 

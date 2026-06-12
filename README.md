@@ -185,11 +185,43 @@ own infrastructure.
 For applications that need summary facts instead of a full AST or full lineage
 graph, `analyze_query` / `analyzeQuery` returns a compact payload with output
 projections, direct visible relations, transitive physical `baseTables`, CTE
-names, set-operation branches, transform kinds, optional type hints, and
-upstream column references. The API is additive and uses the same optional
-`ValidationSchema` shape as schema-aware validation and lineage. Validation uses
-broad type families, while query analysis preserves detailed schema type strings
-such as `DECIMAL(10,2)` for `typeHint` values when they can be parsed.
+names and top-level `cteFacts`, original `starProjections`, set-operation
+branches, transform kinds, conservative projection `nullability`, optional type
+hints, and upstream column references. The API is additive and uses the same
+optional `ValidationSchema` shape as schema-aware validation and lineage.
+Validation uses broad type families, while query analysis preserves detailed
+schema type strings such as `DECIMAL(10,2)` for `typeHint` values when they can
+be parsed.
+
+Validation schema JSON uses:
+
+```json
+{
+  "strict": true,
+  "tables": [
+    {
+      "name": "orders",
+      "schema": "analytics",
+      "aliases": ["o"],
+      "primaryKey": ["id"],
+      "uniqueKeys": [["external_id"]],
+      "foreignKeys": [
+        {
+          "columns": ["customer_id"],
+          "references": { "table": "customers", "columns": ["id"] }
+        }
+      ],
+      "columns": [
+        { "name": "id", "type": "INT", "nullable": false, "primaryKey": true },
+        { "name": "amount", "type": "DECIMAL(10,2)", "nullable": true }
+      ]
+    }
+  ]
+}
+```
+
+Use the `type` key for column types in JSON. `dataType` / `data_type` are not
+accepted aliases for this schema payload.
 
 ## Format Guard Rails
 

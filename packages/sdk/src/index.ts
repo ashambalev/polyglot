@@ -208,6 +208,7 @@ export type TransformKind =
   | 'expression'
   | 'star';
 export type ReferenceConfidence = 'resolved' | 'ambiguous' | 'unknown';
+export type ProjectionNullability = 'non_null' | 'nullable' | 'unknown';
 
 export interface ColumnReferenceFact {
   sourceName?: string;
@@ -227,7 +228,21 @@ export interface ProjectionFact {
   transformKind: TransformKind;
   castType?: string;
   typeHint?: string;
+  nullability: ProjectionNullability;
   upstream: ColumnReferenceFact[];
+}
+
+export interface CteFact {
+  name: string;
+  columns: string[];
+  bodySql: string;
+  outputColumns: string[];
+}
+
+export interface StarProjectionFact {
+  index: number;
+  table?: string;
+  expandedColumns: string[];
 }
 
 export interface RelationFact {
@@ -253,9 +268,11 @@ export interface SetOperationFact {
 export interface QueryAnalysis {
   shape: QueryShape;
   ctes: string[];
+  cteFacts: CteFact[];
   projections: ProjectionFact[];
   relations: RelationFact[];
   baseTables: RelationFact[];
+  starProjections: StarProjectionFact[];
   setOperations: SetOperationFact[];
 }
 

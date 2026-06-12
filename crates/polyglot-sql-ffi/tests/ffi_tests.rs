@@ -683,8 +683,8 @@ fn test_analyze_query_happy_path() {
                     {
                         "name":"orders",
                         "columns":[
-                            {"name":"id","type":"INT"},
-                            {"name":"amount","type":"DECIMAL(10,2)"}
+                            {"name":"id","type":"INT","nullable":false},
+                            {"name":"amount","type":"DECIMAL(10,2)","nullable":true}
                         ]
                     }
                 ]
@@ -705,6 +705,45 @@ fn test_analyze_query_happy_path() {
     );
     assert_eq!(analysis["projections"][1]["transformKind"], "aggregation");
     assert_eq!(analysis["projections"][1]["typeHint"], "DECIMAL(10, 2)");
+    assert_eq!(analysis["projections"][0]["nullability"], "non_null");
+}
+
+#[test]
+fn test_analyze_query_cte_facts_and_star_projections() {
+    let sql = c("WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base");
+    let options = c(r#"{
+            "dialect":"generic",
+            "schema":{
+                "tables":[
+                    {
+                        "name":"orders",
+                        "columns":[
+                            {"name":"id","type":"INT","nullable":false},
+                            {"name":"amount","type":"DECIMAL(10,2)","nullable":true}
+                        ]
+                    }
+                ]
+            }
+        }"#);
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let analysis: Value =
+        serde_json::from_str(&data.expect("missing analyze_query payload")).expect("invalid json");
+
+    assert_eq!(analysis["cteFacts"][0]["name"], "base");
+    assert_eq!(
+        analysis["cteFacts"][0]["bodySql"],
+        "SELECT id, amount FROM orders"
+    );
+    assert_eq!(analysis["cteFacts"][0]["outputColumns"][0], "id");
+    assert_eq!(analysis["cteFacts"][0]["outputColumns"][1], "amount");
+    assert_eq!(analysis["starProjections"][0]["index"], 0);
+    assert_eq!(analysis["starProjections"][0]["expandedColumns"][0], "id");
+    assert_eq!(
+        analysis["starProjections"][0]["expandedColumns"][1],
+        "amount"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use polyglot_sql::generator::{Generator, GeneratorConfig};
 use polyglot_sql::{
-    get_all_tables, parse, transpile, DialectType, Expression, ExpressionWalk, Parser,
+    get_all_tables, parse, transpile, validate, DialectType, Expression, ExpressionWalk, Parser,
 };
 
 fn pg_to_tsql(sql: &str) -> String {
@@ -82,6 +82,52 @@ fn tsql_simple_set_options_remain_structured() {
             ast[0].variant_name()
         );
         assert_eq!(generate_tsql(&ast[0]), sql);
+    }
+}
+
+#[test]
+fn tsql_set_identity_insert_remains_structured() {
+    for state in ["ON", "OFF"] {
+        let sql = format!("SET IDENTITY_INSERT dbo.Employees {state}");
+        let sql_with_semicolon = format!("{sql};");
+        let ast = parse(&sql_with_semicolon, DialectType::TSQL)
+            .expect("SET IDENTITY_INSERT should parse");
+        assert_eq!(ast.len(), 1);
+
+        let Expression::SetStatement(set) = &ast[0] else {
+            panic!(
+                "expected SetStatement for {sql}, got {}",
+                ast[0].variant_name()
+            );
+        };
+
+        assert_eq!(set.items.len(), 1);
+        let item = &set.items[0];
+        assert_eq!(item.name.to_string(), "IDENTITY_INSERT");
+        assert!(item.no_equals);
+
+        let Expression::Tuple(value) = &item.value else {
+            panic!("expected tuple value for SET IDENTITY_INSERT");
+        };
+        assert_eq!(value.expressions.len(), 2);
+
+        let Expression::Table(table) = &value.expressions[0] else {
+            panic!("expected table target for SET IDENTITY_INSERT");
+        };
+        assert_eq!(
+            table.schema.as_ref().map(|schema| schema.name.as_str()),
+            Some("dbo")
+        );
+        assert_eq!(table.name.name, "Employees");
+        assert_eq!(value.expressions[1].to_string(), state);
+
+        assert_eq!(generate_tsql(&ast[0]), sql);
+        assert_eq!(
+            transpile(&sql_with_semicolon, DialectType::TSQL, DialectType::TSQL)
+                .expect("transpile")[0],
+            sql
+        );
+        assert!(validate(&sql_with_semicolon, DialectType::TSQL).valid);
     }
 }
 

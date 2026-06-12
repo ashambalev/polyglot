@@ -120,7 +120,10 @@ typedef struct {
   the analyzed scope, and `baseTables` contains deduplicated physical table
   dependencies from nested CTEs, derived tables, subqueries, and set-operation
   branches. With a schema, parseable detailed type strings such as
-  `DECIMAL(10,2)` are preserved in projection `typeHint` values.
+  `DECIMAL(10,2)` are preserved in projection `typeHint` values. `cteFacts`
+  reports top-level CTE definitions, `starProjections` records original star
+  projections and schema-expanded columns, and each projection includes
+  conservative `nullability`: `"non_null"`, `"nullable"`, or `"unknown"`.
 - `polyglot_openlineage_column_lineage(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_job_event(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_run_event(sql, options_json)` (`OpenLineageOptions` JSON)
@@ -190,6 +193,37 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_openlineage_run_event`: JSON `OpenLineageEventResult`
 - `polyglot_diff`: JSON array of diff edits
 - `polyglot_dialect_list`: JSON array of dialect names
+
+`ValidationSchema` JSON used by schema-aware functions and `AnalyzeQueryOptions`
+uses this shape:
+
+```json
+{
+  "strict": true,
+  "tables": [
+    {
+      "name": "orders",
+      "schema": "analytics",
+      "aliases": ["o"],
+      "primaryKey": ["id"],
+      "uniqueKeys": [["external_id"]],
+      "foreignKeys": [
+        {
+          "columns": ["customer_id"],
+          "references": { "table": "customers", "columns": ["id"] }
+        }
+      ],
+      "columns": [
+        { "name": "id", "type": "INT", "nullable": false, "primaryKey": true },
+        { "name": "amount", "type": "DECIMAL(10,2)", "nullable": true }
+      ]
+    }
+  ]
+}
+```
+
+Use the `type` key for column types. `dataType` / `data_type` are not accepted
+aliases in this payload.
 
 `LineageNode` includes `source_kind` and optional `source_alias` metadata so
 wrappers can distinguish physical table sources from virtual sources such as

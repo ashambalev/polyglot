@@ -7,7 +7,7 @@
 
 use crate::ast_transforms::get_output_column_names;
 use crate::dialects::{Dialect, DialectType};
-use crate::expressions::{DataType, Expression, TableRef, With};
+use crate::expressions::{DataType, Expression, JoinKind, TableRef, With};
 use crate::lineage::{lineage_by_index_from_expression, LineageNode};
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
@@ -17,7 +17,7 @@ use crate::traversal::{contains_aggregate, ExpressionWalk};
 use crate::validation::{mapping_schema_from_validation_schema, ValidationSchema};
 use crate::{parse_data_type, parse_one, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Options for [`analyze_query`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,9 +35,11 @@ pub struct AnalyzeQueryOptions {
 pub struct QueryAnalysis {
     pub shape: QueryShape,
     pub ctes: Vec<String>,
+    pub cte_facts: Vec<CteFact>,
     pub projections: Vec<ProjectionFact>,
     pub relations: Vec<RelationFact>,
     pub base_tables: Vec<RelationFact>,
+    pub star_projections: Vec<StarProjectionFact>,
     pub set_operations: Vec<SetOperationFact>,
 }
 
@@ -60,7 +62,27 @@ pub struct ProjectionFact {
     pub transform_kind: TransformKind,
     pub cast_type: Option<String>,
     pub type_hint: Option<String>,
+    pub nullability: ProjectionNullability,
     pub upstream: Vec<ColumnReferenceFact>,
+}
+
+/// Compact fact about one top-level CTE definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CteFact {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub body_sql: String,
+    pub output_columns: Vec<String>,
+}
+
+/// Compact fact about one original star projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StarProjectionFact {
+    pub index: usize,
+    pub table: Option<String>,
+    pub expanded_columns: Vec<String>,
 }
 
 /// Compact fact about an upstream column reference.
@@ -126,16 +148,29 @@ pub enum ReferenceConfidence {
     Unknown,
 }
 
+/// Conservative nullability classification for one output projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionNullability {
+    NonNull,
+    Nullable,
+    Unknown,
+}
+
 /// Analyze a single SELECT or set-operation query.
 pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAnalysis> {
     let mut expression = parse_one(sql, options.dialect)?;
     expression = effective_query(expression);
     ensure_query(&expression)?;
+    let original_expression = expression.clone();
 
     let mapping_schema = options
         .schema
         .as_ref()
         .map(|schema| analysis_mapping_schema(schema, options.dialect));
+    let schema_info = options.schema.as_ref().map(AnalysisSchemaInfo::from_schema);
+    let cte_facts = top_level_cte_facts(&original_expression, options.dialect)?;
+    let star_projections = star_projection_facts(&original_expression, mapping_schema.as_ref());
 
     if let Some(schema) = mapping_schema.as_ref() {
         let qualify_options = QualifyColumnsOptions::new().with_dialect(options.dialect);
@@ -170,6 +205,10 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     );
 
     let scope = build_scope(&expression);
+    let nullability_context = NullabilityContext {
+        schema: schema_info.as_ref(),
+        nullable_sources: nullable_source_names(&expression),
+    };
     let shape = if is_set_operation(&expression) {
         QueryShape::SetOperation
     } else {
@@ -179,9 +218,16 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     Ok(QueryAnalysis {
         shape,
         ctes: collect_cte_names(&expression),
-        projections: projection_facts_for_query(&expression, &scope, options.dialect),
+        cte_facts,
+        projections: projection_facts_for_query(
+            &expression,
+            &scope,
+            options.dialect,
+            &nullability_context,
+        ),
         relations: relation_facts(&scope, mapping_schema.as_ref()),
         base_tables: base_table_facts(&scope, mapping_schema.as_ref()),
+        star_projections,
         set_operations: set_operation_facts(&expression, &scope, options.dialect),
     })
 }
@@ -281,6 +327,278 @@ fn add_scope_aliases_to_schema(
     }
 }
 
+#[derive(Debug, Clone)]
+struct AnalysisColumnInfo {
+    nullable: Option<bool>,
+    primary_key: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AnalysisSchemaInfo {
+    columns: HashMap<(String, String), AnalysisColumnInfo>,
+}
+
+impl AnalysisSchemaInfo {
+    fn from_schema(schema: &ValidationSchema) -> Self {
+        let mut columns = HashMap::new();
+
+        for table in &schema.tables {
+            let table_names = validation_table_names(table);
+            let primary_keys: HashSet<String> = table
+                .primary_key
+                .iter()
+                .map(|column| column.to_ascii_lowercase())
+                .collect();
+
+            for column in &table.columns {
+                let info = AnalysisColumnInfo {
+                    nullable: column.nullable,
+                    primary_key: column.primary_key
+                        || primary_keys.contains(&column.name.to_ascii_lowercase()),
+                };
+
+                for table_name in &table_names {
+                    columns.insert(
+                        (
+                            normalize_lookup_name(table_name),
+                            normalize_lookup_name(&column.name),
+                        ),
+                        info.clone(),
+                    );
+                }
+            }
+        }
+
+        Self { columns }
+    }
+
+    fn column(&self, table: &str, column: &str) -> Option<&AnalysisColumnInfo> {
+        self.columns
+            .get(&(normalize_lookup_name(table), normalize_lookup_name(column)))
+    }
+}
+
+struct NullabilityContext<'a> {
+    schema: Option<&'a AnalysisSchemaInfo>,
+    nullable_sources: HashSet<String>,
+}
+
+fn top_level_cte_facts(expression: &Expression, dialect: DialectType) -> Result<Vec<CteFact>> {
+    let Some(with_clause) = with_clause(expression) else {
+        return Ok(Vec::new());
+    };
+
+    with_clause
+        .ctes
+        .iter()
+        .map(|cte| {
+            Ok(CteFact {
+                name: cte.alias.name.clone(),
+                columns: cte
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect(),
+                body_sql: Dialect::get(dialect).generate(&cte.this)?,
+                output_columns: get_output_column_names(&cte.this),
+            })
+        })
+        .collect()
+}
+
+fn star_projection_facts(
+    expression: &Expression,
+    mapping_schema: Option<&MappingSchema>,
+) -> Vec<StarProjectionFact> {
+    let scope = build_scope(expression);
+    let ordered_sources = ordered_source_names_for_query(expression);
+
+    select_expressions_for_query(expression)
+        .iter()
+        .enumerate()
+        .filter_map(|(index, projection)| {
+            let inner = unwrap_projection_alias(projection);
+            if !projection_is_star(inner) {
+                return None;
+            }
+
+            let table = projection_star_table(inner);
+            let expanded_columns =
+                expanded_star_columns(table.as_deref(), &scope, &ordered_sources, mapping_schema);
+
+            Some(StarProjectionFact {
+                index,
+                table,
+                expanded_columns,
+            })
+        })
+        .collect()
+}
+
+fn expanded_star_columns(
+    star_table: Option<&str>,
+    scope: &Scope,
+    ordered_sources: &[String],
+    mapping_schema: Option<&MappingSchema>,
+) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut source_names: Vec<String> = if ordered_sources.is_empty() {
+        let mut names: Vec<_> = scope.sources.keys().cloned().collect();
+        names.sort();
+        names
+    } else {
+        ordered_sources.to_vec()
+    };
+
+    source_names.dedup();
+
+    for source_name in source_names {
+        let Some(source) = scope.sources.get(&source_name) else {
+            continue;
+        };
+
+        if let Some(star_table) = star_table {
+            let matches = source_name.eq_ignore_ascii_case(star_table)
+                || source
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(star_table))
+                || source_table_name(source)
+                    .is_some_and(|table| table.eq_ignore_ascii_case(star_table));
+
+            if !matches {
+                continue;
+            }
+        }
+
+        columns.extend(source_columns(source, mapping_schema));
+    }
+
+    columns
+}
+
+fn ordered_source_names_for_query(expression: &Expression) -> Vec<String> {
+    match expression {
+        Expression::Select(select) => ordered_source_names_for_select(select),
+        Expression::Union(union) => ordered_source_names_for_query(&union.left),
+        Expression::Intersect(intersect) => ordered_source_names_for_query(&intersect.left),
+        Expression::Except(except) => ordered_source_names_for_query(&except.left),
+        Expression::Subquery(subquery) => ordered_source_names_for_query(&subquery.this),
+        _ => Vec::new(),
+    }
+}
+
+fn ordered_source_names_for_select(select: &crate::expressions::Select) -> Vec<String> {
+    let mut sources = Vec::new();
+
+    if let Some(from) = &select.from {
+        for expression in &from.expressions {
+            if let Some(source_name) = expression_source_name(expression) {
+                sources.push(source_name);
+            }
+        }
+    }
+
+    for join in &select.joins {
+        if let Some(source_name) = expression_source_name(&join.this) {
+            sources.push(source_name);
+        }
+    }
+
+    sources
+}
+
+fn nullable_source_names(expression: &Expression) -> HashSet<String> {
+    match expression {
+        Expression::Select(select) => nullable_source_names_for_select(select),
+        Expression::Union(union) => nullable_source_names(&union.left),
+        Expression::Intersect(intersect) => nullable_source_names(&intersect.left),
+        Expression::Except(except) => nullable_source_names(&except.left),
+        Expression::Subquery(subquery) => nullable_source_names(&subquery.this),
+        _ => HashSet::new(),
+    }
+}
+
+fn nullable_source_names_for_select(select: &crate::expressions::Select) -> HashSet<String> {
+    let mut nullable = HashSet::new();
+    let mut left_sources = Vec::new();
+
+    if let Some(from) = &select.from {
+        for expression in &from.expressions {
+            if let Some(source_name) = expression_source_name(expression) {
+                left_sources.push(source_name);
+            }
+        }
+    }
+
+    for join in &select.joins {
+        let right_source = expression_source_name(&join.this);
+
+        if join_nullable_left(join.kind) {
+            for source_name in &left_sources {
+                nullable.insert(normalize_lookup_name(source_name));
+            }
+        }
+
+        if join_nullable_right(join.kind) {
+            if let Some(source_name) = &right_source {
+                nullable.insert(normalize_lookup_name(source_name));
+            }
+        }
+
+        if let Some(source_name) = right_source {
+            left_sources.push(source_name);
+        }
+    }
+
+    nullable
+}
+
+fn join_nullable_left(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::Right
+            | JoinKind::NaturalRight
+            | JoinKind::AsOfRight
+            | JoinKind::Full
+            | JoinKind::NaturalFull
+            | JoinKind::Outer
+    )
+}
+
+fn join_nullable_right(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::Left
+            | JoinKind::NaturalLeft
+            | JoinKind::AsOfLeft
+            | JoinKind::LeftLateral
+            | JoinKind::OuterApply
+            | JoinKind::LeftArray
+            | JoinKind::Full
+            | JoinKind::NaturalFull
+            | JoinKind::Outer
+    )
+}
+
+fn expression_source_name(expression: &Expression) -> Option<String> {
+    match expression {
+        Expression::Table(table) => table
+            .alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .or_else(|| Some(table.name.name.clone())),
+        Expression::Subquery(subquery) => subquery.alias.as_ref().map(|alias| alias.name.clone()),
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
+        Expression::Cte(cte) => Some(cte.alias.name.clone()),
+        _ => None,
+    }
+}
+
+fn normalize_lookup_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 fn effective_query(expression: Expression) -> Expression {
     match expression {
         Expression::Prepare(prepare) => prepare.statement,
@@ -369,6 +687,7 @@ fn projection_facts_for_query(
     expression: &Expression,
     scope: &Scope,
     dialect: DialectType,
+    nullability_context: &NullabilityContext<'_>,
 ) -> Vec<ProjectionFact> {
     let expressions = select_expressions_for_query(expression);
     let names = get_output_column_names(expression);
@@ -387,6 +706,7 @@ fn projection_facts_for_query(
                 expression,
                 scope,
                 dialect,
+                nullability_context,
             )
         })
         .collect()
@@ -410,6 +730,7 @@ fn projection_fact(
     query: &Expression,
     scope: &Scope,
     dialect: DialectType,
+    nullability_context: &NullabilityContext<'_>,
 ) -> ProjectionFact {
     let inner = unwrap_projection_alias(projection);
     let is_star = projection_is_star(inner);
@@ -430,6 +751,7 @@ fn projection_fact(
             .inferred_type()
             .or_else(|| inner.inferred_type())
             .and_then(|data_type| render_data_type(data_type, dialect)),
+        nullability: projection_nullability(inner, scope, nullability_context),
         upstream,
     }
 }
@@ -522,6 +844,109 @@ fn is_simple_constant(expression: &Expression) -> bool {
         }
         Expression::Neg(unary) | Expression::BitwiseNot(unary) => is_simple_constant(&unary.this),
         _ => false,
+    }
+}
+
+fn projection_nullability(
+    expression: &Expression,
+    scope: &Scope,
+    context: &NullabilityContext<'_>,
+) -> ProjectionNullability {
+    match expression {
+        Expression::Alias(alias) => projection_nullability(&alias.this, scope, context),
+        Expression::Annotated(annotated) => projection_nullability(&annotated.this, scope, context),
+        Expression::Paren(paren) => projection_nullability(&paren.this, scope, context),
+        Expression::Literal(_) | Expression::Boolean(_) => ProjectionNullability::NonNull,
+        Expression::Null(_) => ProjectionNullability::Nullable,
+        Expression::Count(_) | Expression::CountIf(_) => ProjectionNullability::NonNull,
+        Expression::Cast(cast) => projection_nullability(&cast.this, scope, context),
+        Expression::TryCast(_) | Expression::SafeCast(_) => ProjectionNullability::Unknown,
+        Expression::Column(column) => column_nullability(
+            &column.name.name,
+            column.table.as_ref().map(|table| table.name.as_str()),
+            scope,
+            context,
+        ),
+        Expression::Identifier(identifier) => {
+            column_nullability(&identifier.name, None, scope, context)
+        }
+        Expression::Coalesce(func) => coalesce_nullability(&func.expressions, scope, context),
+        _ => ProjectionNullability::Unknown,
+    }
+}
+
+fn column_nullability(
+    column_name: &str,
+    source_name: Option<&str>,
+    scope: &Scope,
+    context: &NullabilityContext<'_>,
+) -> ProjectionNullability {
+    let resolved_source_name = source_name
+        .map(str::to_string)
+        .or_else(|| single_scope_source_name(scope));
+
+    if let Some(source_name) = &resolved_source_name {
+        if context
+            .nullable_sources
+            .contains(&normalize_lookup_name(source_name))
+        {
+            return ProjectionNullability::Nullable;
+        }
+    }
+
+    let Some(schema) = context.schema else {
+        return ProjectionNullability::Unknown;
+    };
+
+    let table_name = resolved_source_name
+        .as_ref()
+        .and_then(|name| scope.sources.get(name).and_then(source_table_name))
+        .or(resolved_source_name);
+
+    let Some(table_name) = table_name else {
+        return ProjectionNullability::Unknown;
+    };
+
+    match schema.column(&table_name, column_name) {
+        Some(info) if info.primary_key || info.nullable == Some(false) => {
+            ProjectionNullability::NonNull
+        }
+        Some(info) if info.nullable == Some(true) => ProjectionNullability::Nullable,
+        Some(_) | None => ProjectionNullability::Unknown,
+    }
+}
+
+fn single_scope_source_name(scope: &Scope) -> Option<String> {
+    if scope.sources.len() == 1 {
+        scope.sources.keys().next().cloned()
+    } else {
+        None
+    }
+}
+
+fn coalesce_nullability(
+    expressions: &[Expression],
+    scope: &Scope,
+    context: &NullabilityContext<'_>,
+) -> ProjectionNullability {
+    if expressions.is_empty() {
+        return ProjectionNullability::Unknown;
+    }
+
+    let mut all_nullable = true;
+
+    for expression in expressions {
+        match projection_nullability(unwrap_projection_alias(expression), scope, context) {
+            ProjectionNullability::NonNull => return ProjectionNullability::NonNull,
+            ProjectionNullability::Nullable => {}
+            ProjectionNullability::Unknown => all_nullable = false,
+        }
+    }
+
+    if all_nullable {
+        ProjectionNullability::Nullable
+    } else {
+        ProjectionNullability::Unknown
     }
 }
 
@@ -744,29 +1169,47 @@ fn base_table_facts(
     let mut relations = Vec::new();
     let mut seen = HashSet::new();
 
-    for child_scope in scope.traverse() {
-        for source in child_scope.sources.values() {
-            if source.kind != SourceKind::Table {
-                continue;
-            }
-
-            let Some(table_name) = source_table_name(source) else {
-                continue;
-            };
-
-            if seen.insert(table_name.clone()) {
-                relations.push(RelationFact {
-                    name: table_name,
-                    alias: source.alias.clone().or_else(|| source_alias(source)),
-                    kind: SourceKind::Table,
-                    columns: source_columns(source, mapping_schema),
-                });
-            }
-        }
-    }
+    collect_base_table_facts(scope, mapping_schema, &mut seen, &mut relations);
 
     relations.sort_by(|left, right| left.name.cmp(&right.name));
     relations
+}
+
+fn collect_base_table_facts(
+    scope: &Scope,
+    mapping_schema: Option<&crate::schema::MappingSchema>,
+    seen: &mut HashSet<String>,
+    relations: &mut Vec<RelationFact>,
+) {
+    for source in scope.sources.values() {
+        if source.kind != SourceKind::Table {
+            continue;
+        }
+
+        let Some(table_name) = source_table_name(source) else {
+            continue;
+        };
+
+        if seen.insert(table_name.clone()) {
+            relations.push(RelationFact {
+                name: table_name,
+                alias: source.alias.clone().or_else(|| source_alias(source)),
+                kind: SourceKind::Table,
+                columns: source_columns(source, mapping_schema),
+            });
+        }
+    }
+
+    for child_scope in scope
+        .cte_scopes
+        .iter()
+        .chain(scope.union_scopes.iter())
+        .chain(scope.table_scopes.iter())
+        .chain(scope.derived_table_scopes.iter())
+        .chain(scope.subquery_scopes.iter())
+    {
+        collect_base_table_facts(child_scope, mapping_schema, seen, relations);
+    }
 }
 
 fn source_columns(
@@ -905,7 +1348,11 @@ fn projection_facts_for_branch(
     } else {
         &branch_scope
     };
-    projection_facts_for_query(expression, scope, dialect)
+    let nullability_context = NullabilityContext {
+        schema: None,
+        nullable_sources: nullable_source_names(expression),
+    };
+    projection_facts_for_query(expression, scope, dialect, &nullability_context)
 }
 
 fn non_empty_string(value: String) -> Option<String> {

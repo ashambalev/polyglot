@@ -1,6 +1,6 @@
 use polyglot_sql::{
-    analyze_query, scope::SourceKind, AnalyzeQueryOptions, DialectType, QueryShape,
-    ReferenceConfidence, TransformKind, ValidationSchema,
+    analyze_query, scope::SourceKind, AnalyzeQueryOptions, DialectType, ProjectionNullability,
+    QueryShape, ReferenceConfidence, TransformKind, ValidationSchema,
 };
 use serde_json::json;
 
@@ -10,25 +10,25 @@ fn schema() -> ValidationSchema {
             {
                 "name": "users",
                 "columns": [
-                    {"name": "id", "type": "INT"},
-                    {"name": "name", "type": "TEXT"}
+                    {"name": "id", "type": "INT", "primaryKey": true},
+                    {"name": "name", "type": "TEXT", "nullable": false}
                 ]
             },
             {
                 "name": "orders",
                 "columns": [
-                    {"name": "id", "type": "INT"},
+                    {"name": "id", "type": "INT", "nullable": false},
                     {"name": "user_id", "type": "INT"},
                     {"name": "customer_id", "type": "INT"},
-                    {"name": "amount", "type": "DECIMAL(10,2)"},
+                    {"name": "amount", "type": "DECIMAL(10,2)", "nullable": true},
                     {"name": "total", "type": "FLOAT"}
                 ]
             },
             {
                 "name": "customers",
                 "columns": [
-                    {"name": "id", "type": "INT"},
-                    {"name": "name", "type": "TEXT"}
+                    {"name": "id", "type": "INT", "nullable": false},
+                    {"name": "name", "type": "TEXT", "nullable": false}
                 ]
             },
             {
@@ -112,6 +112,46 @@ fn analyze_query_follows_cte_lineage() {
     }));
     assert_eq!(analysis.base_tables.len(), 1);
     assert_eq!(analysis.base_tables[0].name, "users");
+}
+
+#[test]
+fn analyze_query_reports_top_level_cte_facts() {
+    let analysis = analyze_query(
+        "WITH base(order_id, amount) AS (SELECT id, amount FROM orders), \
+         nested AS (WITH inner_cte AS (SELECT id FROM users) SELECT id FROM inner_cte) \
+         SELECT order_id FROM base",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Generic,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.cte_facts.len(), 2);
+    assert_eq!(analysis.cte_facts[0].name, "base");
+    assert_eq!(analysis.cte_facts[0].columns, vec!["order_id", "amount"]);
+    assert!(analysis.cte_facts[0]
+        .body_sql
+        .contains("SELECT id, amount FROM orders"));
+    assert_eq!(analysis.cte_facts[0].output_columns, vec!["id", "amount"]);
+
+    assert_eq!(analysis.cte_facts[1].name, "nested");
+    assert!(analysis.cte_facts.iter().all(|cte| cte.name != "inner_cte"));
+}
+
+#[test]
+fn analyze_query_reports_original_cte_body_sql_before_schema_rewrites() {
+    let analysis = analyze_query(
+        "WITH base AS (SELECT amount FROM orders) SELECT amount FROM base",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Generic,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.cte_facts.len(), 1);
+    assert_eq!(analysis.cte_facts[0].body_sql, "SELECT amount FROM orders");
 }
 
 #[test]
@@ -216,6 +256,15 @@ fn analyze_query_limits_qualified_star_to_matching_source() {
         .projections
         .iter()
         .all(|projection| !projection.is_star));
+    assert_eq!(analysis.star_projections.len(), 1);
+    assert_eq!(analysis.star_projections[0].index, 0);
+    assert_eq!(analysis.star_projections[0].table.as_deref(), Some("o"));
+    let mut expanded = analysis.star_projections[0].expanded_columns.clone();
+    expanded.sort();
+    assert_eq!(
+        expanded,
+        vec!["amount", "customer_id", "id", "total", "user_id"]
+    );
     assert!(analysis.projections.iter().all(|projection| {
         projection
             .upstream
@@ -287,6 +336,15 @@ fn analyze_query_expands_unqualified_star_with_schema() {
         .projections
         .iter()
         .all(|projection| !projection.is_star));
+    assert_eq!(analysis.star_projections.len(), 1);
+    assert_eq!(analysis.star_projections[0].index, 0);
+    assert_eq!(analysis.star_projections[0].table, None);
+    let mut expanded = analysis.star_projections[0].expanded_columns.clone();
+    expanded.sort();
+    assert_eq!(
+        expanded,
+        vec!["amount", "customer_id", "id", "total", "user_id"]
+    );
 }
 
 #[test]
@@ -308,6 +366,77 @@ fn analyze_query_classifies_typed_aggregates() {
         analysis.projections[1].transform_kind,
         TransformKind::Aggregation
     );
+    assert_eq!(
+        analysis.projections[0].nullability,
+        ProjectionNullability::NonNull
+    );
+}
+
+#[test]
+fn analyze_query_reports_projection_nullability() {
+    let analysis = analyze_query(
+        "SELECT \
+             COUNT(*) AS rows, \
+             1 AS one, \
+             NULL AS missing, \
+             o.amount, \
+             COALESCE(o.amount, 0) AS amount_fallback, \
+             c.name AS customer_name \
+         FROM orders AS o \
+         LEFT JOIN customers AS c ON o.customer_id = c.id",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Generic,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+
+    let nullability: Vec<_> = analysis
+        .projections
+        .iter()
+        .map(|projection| projection.nullability)
+        .collect();
+
+    assert_eq!(
+        nullability,
+        vec![
+            ProjectionNullability::NonNull,
+            ProjectionNullability::NonNull,
+            ProjectionNullability::Nullable,
+            ProjectionNullability::Nullable,
+            ProjectionNullability::NonNull,
+            ProjectionNullability::Nullable,
+        ]
+    );
+}
+
+#[test]
+fn analyze_query_marks_outer_join_source_columns_nullable() {
+    let right_join = analyze_query(
+        "SELECT u.id FROM users AS u RIGHT JOIN orders AS o ON u.id = o.user_id",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Generic,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        right_join.projections[0].nullability,
+        ProjectionNullability::Nullable
+    );
+
+    let full_join = analyze_query(
+        "SELECT u.id, o.id FROM users AS u FULL JOIN orders AS o ON u.id = o.user_id",
+        AnalyzeQueryOptions {
+            dialect: DialectType::Generic,
+            schema: Some(schema()),
+        },
+    )
+    .unwrap();
+    assert!(full_join
+        .projections
+        .iter()
+        .all(|projection| projection.nullability == ProjectionNullability::Nullable));
 }
 
 #[test]
@@ -337,4 +466,50 @@ fn analyze_query_reports_transitive_base_tables() {
         .relations
         .iter()
         .any(|relation| relation.kind == SourceKind::DerivedTable));
+}
+
+#[test]
+fn analyze_query_reports_base_tables_inside_derived_table() {
+    let analysis = analyze_query(
+        "SELECT x FROM (SELECT id AS x FROM orders) d",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    let base_table_names: Vec<_> = analysis
+        .base_tables
+        .iter()
+        .map(|relation| relation.name.as_str())
+        .collect();
+    assert_eq!(base_table_names, vec!["orders"]);
+    assert!(analysis
+        .relations
+        .iter()
+        .any(|relation| relation.name == "d" && relation.kind == SourceKind::DerivedTable));
+}
+
+#[test]
+fn analyze_query_reports_base_tables_inside_derived_table_set_operation() {
+    let analysis = analyze_query(
+        "SELECT s FROM (SELECT a AS s FROM orders UNION ALL SELECT a AS s FROM users) u",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    let base_table_names: Vec<_> = analysis
+        .base_tables
+        .iter()
+        .map(|relation| relation.name.as_str())
+        .collect();
+    assert_eq!(base_table_names, vec!["orders", "users"]);
+    assert!(analysis
+        .relations
+        .iter()
+        .any(|relation| relation.name == "u" && relation.kind == SourceKind::DerivedTable));
 }

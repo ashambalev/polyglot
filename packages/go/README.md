@@ -262,19 +262,23 @@ fmt.Println(node.Name, tables)
 ```
 
 ```go
+nullable := true
+nonNull := false
+
 schema := polyglot.ValidationSchema{
 	Tables: []polyglot.SchemaTable{
 		{
 			Name: "orders",
 			Columns: []polyglot.SchemaColumn{
-				{Name: "amount", Type: "DECIMAL(10,2)"},
+				{Name: "id", Type: "INT", Nullable: &nonNull},
+				{Name: "amount", Type: "DECIMAL(10,2)", Nullable: &nullable},
 			},
 		},
 	},
 }
 
 analysis, err := client.AnalyzeQuery(
-	"SELECT SUM(o.amount) AS total FROM orders AS o",
+	"WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base",
 	polyglot.AnalyzeQueryOptions{
 		Dialect: "generic",
 		Schema:  &schema,
@@ -283,10 +287,10 @@ analysis, err := client.AnalyzeQuery(
 if err != nil {
 	log.Fatal(err)
 }
-fmt.Println(analysis.Projections[0].TransformKind) // aggregation
-fmt.Println(*analysis.Projections[0].TypeHint)     // DECIMAL(10, 2)
-fmt.Println(analysis.BaseTables[0].Name)           // orders
-fmt.Println(*analysis.BaseTables[0].Alias)         // o
+fmt.Println(analysis.CTEFacts[0].BodySQL)                 // SELECT id, amount FROM orders
+fmt.Println(analysis.StarProjections[0].ExpandedColumns)  // [id amount]
+fmt.Println(analysis.Projections[0].Nullability)          // non_null
+fmt.Println(analysis.BaseTables[0].Name)                  // orders
 ```
 
 `LineageNode.SourceKind` identifies whether a source is a real table, CTE,
@@ -298,7 +302,10 @@ For `AnalyzeQuery`, `Relations` reports sources visible in the analyzed scope.
 `BaseTables` reports deduplicated physical table dependencies across nested CTEs,
 derived tables, subqueries, and set-operation branches. Schema-aware validation
 uses broad type families, while query analysis preserves parseable detailed
-schema type strings for projection `TypeHint` values.
+schema type strings for projection `TypeHint` values. `CTEFacts` reports
+top-level CTE definitions, `StarProjections` records original star projections
+and schema-expanded columns, and `ProjectionFact.Nullability` is one of
+`non_null`, `nullable`, or `unknown`.
 
 ### OpenLineage
 
@@ -355,8 +362,10 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `OptimizeOptions` | Reserved for future optimizer options. |
 | `GenerateOptions` | Reserved for future generator options. |
 | `AnalyzeQueryOptions` | `Dialect`, `Schema` |
-| `QueryAnalysis` | `Shape`, `CTEs`, `Projections`, `Relations`, `BaseTables`, `SetOperations` |
-| `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `CastType`, `TypeHint`, `Upstream` |
+| `QueryAnalysis` | `Shape`, `CTEs`, `CTEFacts`, `Projections`, `Relations`, `BaseTables`, `StarProjections`, `SetOperations` |
+| `ProjectionFact` | `Index`, `Name`, `IsStar`, `StarTable`, `TransformKind`, `CastType`, `TypeHint`, `Nullability`, `Upstream` |
+| `CTEFact` | `Name`, `Columns`, `BodySQL`, `OutputColumns` |
+| `StarProjectionFact` | `Index`, `Table`, `ExpandedColumns` |
 | `ColumnReferenceFact` | `SourceName`, `SourceAlias`, `SourceKind`, `Table`, `Column`, `Unqualified`, `Confidence` |
 | `RelationFact` | `Name`, `Alias`, `Kind`, `Columns` |
 | `SetOperationFact` | `Kind`, `All`, `Distinct`, `OutputColumns`, `Branches` |
@@ -368,6 +377,37 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `SchemaForeignKey` | `Name`, `Columns`, `References` |
 | `SchemaColumnReference` | `Table`, `Column`, `Schema` |
 | `SchemaTableReference` | `Table`, `Columns`, `Schema` |
+
+`ValidationSchema` serializes to the same JSON payload used by Rust, Python,
+FFI, and TypeScript:
+
+```json
+{
+  "strict": true,
+  "tables": [
+    {
+      "name": "orders",
+      "schema": "analytics",
+      "aliases": ["o"],
+      "primaryKey": ["id"],
+      "uniqueKeys": [["external_id"]],
+      "foreignKeys": [
+        {
+          "columns": ["customer_id"],
+          "references": { "table": "customers", "columns": ["id"] }
+        }
+      ],
+      "columns": [
+        { "name": "id", "type": "INT", "nullable": false, "primaryKey": true },
+        { "name": "amount", "type": "DECIMAL(10,2)", "nullable": true }
+      ]
+    }
+  ]
+}
+```
+
+Use the `type` JSON key for column types. `dataType` / `data_type` are not
+accepted aliases in this payload.
 | `LineageNode` | `Name`, `Expression`, `Source`, `Downstream`, `SourceName`, `SourceKind`, `SourceAlias`, `ReferenceNodeName` |
 | `QualifyTablesOptions` | `DB`, `Catalog`, `Dialect`, `CanonicalizeTableAliases`, `AliasUnaliasedTables`, `AliasUnaliasedSubqueries`, `AliasPrefix`, `NormalizeSetOperationSubqueries` |
 | `RenameTablesOptions` | `AliasRenamedTables`, `PreserveExistingAliases` |

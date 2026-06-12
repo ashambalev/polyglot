@@ -41,8 +41,8 @@ def test_analyze_query_reports_base_tables_aliases_aggregates_and_precise_types(
             {
                 "name": "orders",
                 "columns": [
-                    {"name": "id", "type": "INT"},
-                    {"name": "amount", "type": "DECIMAL(10,2)"},
+                    {"name": "id", "type": "INT", "nullable": False},
+                    {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
                 ],
             }
         ]
@@ -59,6 +59,32 @@ def test_analyze_query_reports_base_tables_aliases_aggregates_and_precise_types(
     assert result["projections"][0]["upstream"][0]["sourceAlias"] == "o"
     assert result["projections"][1]["transformKind"] == "aggregation"
     assert result["projections"][1]["typeHint"] == "DECIMAL(10, 2)"
+    assert result["projections"][0]["nullability"] == "non_null"
+
+
+def test_analyze_query_reports_cte_facts_and_star_projections():
+    schema = {
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "type": "INT", "nullable": False},
+                    {"name": "amount", "type": "DECIMAL(10,2)", "nullable": True},
+                ],
+            }
+        ]
+    }
+
+    result = polyglot_sql.analyze_query(
+        "WITH base AS (SELECT id, amount FROM orders) SELECT * FROM base",
+        {"schema": schema, "dialect": "generic"},
+    )
+
+    assert result["cteFacts"][0]["name"] == "base"
+    assert result["cteFacts"][0]["bodySql"] == "SELECT id, amount FROM orders"
+    assert result["cteFacts"][0]["outputColumns"] == ["id", "amount"]
+    assert result["starProjections"][0]["index"] == 0
+    assert result["starProjections"][0]["expandedColumns"] == ["id", "amount"]
 
 
 def test_analyze_query_unknown_dialect_raises_value_error():

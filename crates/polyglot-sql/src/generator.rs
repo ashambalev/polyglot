@@ -12189,6 +12189,7 @@ impl Generator {
             let is_character_set = name_str == Some("CHARACTER SET");
             let is_names = name_str == Some("NAMES");
             let is_collate = name_str == Some("COLLATE");
+            let is_identity_insert = name_str == Some("IDENTITY_INSERT");
             let is_value_only =
                 matches!(&item.value, Expression::Identifier(id) if id.name.is_empty());
 
@@ -12216,6 +12217,11 @@ impl Generator {
                 self.write_keyword("COLLATE");
                 self.write_space();
                 self.generate_set_value(&item.value)?;
+            } else if is_identity_insert {
+                // T-SQL: SET IDENTITY_INSERT <table> ON|OFF
+                self.write_keyword("IDENTITY_INSERT");
+                self.write_space();
+                self.generate_identity_insert_value(&item.value)?;
             } else if has_variable_kind {
                 // Output: SET [VARIABLE] <name> = <value>
                 // VARIABLE keyword already written above if dialect requires it
@@ -12251,6 +12257,19 @@ impl Generator {
         }
 
         Ok(())
+    }
+
+    fn generate_identity_insert_value(&mut self, value: &Expression) -> Result<()> {
+        if let Expression::Tuple(tuple) = value {
+            if tuple.expressions.len() == 2 {
+                self.generate_expression(&tuple.expressions[0])?;
+                self.write_space();
+                self.generate_set_value(&tuple.expressions[1])?;
+                return Ok(());
+            }
+        }
+
+        self.generate_set_value(value)
     }
 
     /// Generate a SET statement value, writing keyword values (DEFAULT, ON, OFF)

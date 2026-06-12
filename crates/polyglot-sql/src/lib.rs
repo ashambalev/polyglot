@@ -93,9 +93,9 @@ pub use optimizer::{
 pub use parser::Parser;
 #[cfg(all(feature = "semantic", feature = "generate"))]
 pub use query_analysis::{
-    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, ProjectionFact, QueryAnalysis,
-    QueryShape, ReferenceConfidence, RelationFact, SetOperationBranchFact, SetOperationFact,
-    TransformKind,
+    analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, CteFact, ProjectionFact,
+    ProjectionNullability, QueryAnalysis, QueryShape, ReferenceConfidence, RelationFact,
+    SetOperationBranchFact, SetOperationFact, StarProjectionFact, TransformKind,
 };
 #[cfg(feature = "semantic")]
 pub use resolver::{is_column_ambiguous, resolve_column, Resolver, ResolverError, ResolverResult};
