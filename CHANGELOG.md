@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.5] - 2026-06-17
+
+### Added
+- Regression coverage for T-SQL `0x...` hex literals and nested
+  query-analysis transform function detection.
+
+### Fixed
+- T-SQL `0x...` hex/binary literals now tokenize, parse, transpile, and
+  round-trip in expressions such as predicates, `INSERT` values, and arithmetic
+  expressions.
+- T-SQL/Fabric generation now preserves hex string literals as native `0x...`
+  values instead of emitting SQL-standard `x'...'` hex string syntax.
+- `ProjectionFact.transformFunction` now reports a sole nested transform
+  function inside passthrough wrappers such as `COALESCE(...)` and
+  `CAST(... AS ...)`, while leaving ambiguous projections with multiple
+  transform functions unset.
+- Playground JSON tree panels now keep a bounded height and scroll correctly in
+  the AST Explorer and Lineage JSON views.
+
 ## [0.5.4] - 2026-06-13
 
 ### Added
