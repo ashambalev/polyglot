@@ -10,8 +10,8 @@
 use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
-    AggregateFunction, Cast, DataType, Expression, Function, JSONExtract, Literal, UnaryFunc,
-    VarArgFunc,
+    AggregateFunction, Cast, DataType, DateAddFunc, Expression, Function, IntervalUnit, Literal,
+    UnaryFunc, VarArgFunc,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
@@ -180,6 +180,9 @@ impl DialectImpl for DatabricksDialect {
                     vec![f.this, neg_val],
                 ))))
             }
+
+            // DateAdd -> native Databricks DATE_ADD forms.
+            Expression::DateAdd(f) => Ok(Self::transform_date_add(*f)),
 
             // Pass through everything else
             _ => Ok(expr),
@@ -463,13 +466,29 @@ impl DatabricksDialect {
             // DATE_TRUNC is native in Databricks
             "DATE_TRUNC" => Ok(Expression::Function(Box::new(f))),
 
-            // DATEADD is native in Databricks - uppercase the unit if present
+            // DATEADD normalizes to Databricks DATE_ADD with an uppercased unit.
             "DATEADD" => {
-                let transformed_args = self.uppercase_first_arg_if_identifier(f.args);
-                Ok(Expression::Function(Box::new(Function::new(
-                    "DATEADD".to_string(),
-                    transformed_args,
-                ))))
+                if f.args.len() == 2 {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "DATE_ADD".to_string(),
+                        f.args,
+                    ))))
+                } else {
+                    let transformed_args = self.uppercase_first_arg_if_identifier(f.args);
+                    let function_name = if matches!(
+                        transformed_args.first(),
+                        Some(Expression::Identifier(unit))
+                            if unit.name.eq_ignore_ascii_case("WEEK")
+                    ) {
+                        "DATEADD"
+                    } else {
+                        "DATE_ADD"
+                    };
+                    Ok(Expression::Function(Box::new(Function::new(
+                        function_name.to_string(),
+                        transformed_args,
+                    ))))
+                }
             }
 
             // DATE_ADD -> DATEADD in Databricks (2-arg form only)
@@ -554,48 +573,16 @@ impl DatabricksDialect {
             // JSON_EXTRACT_SCALAR -> same handling
             "JSON_EXTRACT_SCALAR" => Ok(Expression::Function(Box::new(f))),
 
-            // GET_JSON_OBJECT -> colon syntax in Databricks
-            // GET_JSON_OBJECT(col, '$.path') becomes col:path
+            // GET_JSON_OBJECT is native in Databricks.
             "GET_JSON_OBJECT" if f.args.len() == 2 => {
                 let mut args = f.args;
                 let col = args.remove(0);
                 let path_arg = args.remove(0);
 
-                // Extract and strip the $. prefix from the path
-                let path_expr = match &path_arg {
-                    Expression::Literal(lit)
-                        if matches!(lit.as_ref(), crate::expressions::Literal::String(_)) =>
-                    {
-                        let crate::expressions::Literal::String(s) = lit.as_ref() else {
-                            unreachable!()
-                        };
-                        // Strip leading '$.' if present
-                        let stripped = if s.starts_with("$.") {
-                            &s[2..]
-                        } else if s.starts_with("$") {
-                            &s[1..]
-                        } else {
-                            s.as_str()
-                        };
-                        Expression::Literal(Box::new(crate::expressions::Literal::String(
-                            stripped.to_string(),
-                        )))
-                    }
-                    _ => path_arg,
-                };
-
-                Ok(Expression::JSONExtract(Box::new(JSONExtract {
-                    this: Box::new(col),
-                    expression: Box::new(path_expr),
-                    only_json_types: None,
-                    expressions: Vec::new(),
-                    variant_extract: Some(Box::new(Expression::true_())),
-                    json_query: None,
-                    option: None,
-                    quote: None,
-                    on_condition: None,
-                    requires_json: None,
-                })))
+                Ok(Expression::Function(Box::new(Function::new(
+                    "GET_JSON_OBJECT".to_string(),
+                    vec![col, self.normalize_get_json_object_path(path_arg)],
+                ))))
             }
 
             // FROM_JSON is native in Databricks
@@ -997,6 +984,73 @@ impl DatabricksDialect {
             }
         }
         args
+    }
+
+    fn normalize_get_json_object_path(&self, path_arg: Expression) -> Expression {
+        let Expression::Literal(lit) = &path_arg else {
+            return path_arg;
+        };
+        let crate::expressions::Literal::String(path) = lit.as_ref() else {
+            return path_arg;
+        };
+
+        let Some(segment) = path.strip_prefix("$.") else {
+            return path_arg;
+        };
+
+        if segment.is_empty()
+            || segment.contains('.')
+            || segment.contains('[')
+            || segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return path_arg;
+        }
+
+        Expression::Literal(Box::new(crate::expressions::Literal::String(format!(
+            "$[\"{}\"]",
+            segment.replace('"', "\\\"")
+        ))))
+    }
+
+    fn transform_date_add(f: DateAddFunc) -> Expression {
+        if f.unit == IntervalUnit::Day {
+            Expression::Function(Box::new(Function::new(
+                "DATE_ADD".to_string(),
+                vec![f.this, f.interval],
+            )))
+        } else {
+            Expression::Function(Box::new(Function::new(
+                "DATE_ADD".to_string(),
+                vec![
+                    Expression::Identifier(crate::expressions::Identifier {
+                        name: Self::interval_unit_name(f.unit).to_string(),
+                        quoted: false,
+                        trailing_comments: Vec::new(),
+                        span: None,
+                    }),
+                    f.interval,
+                    f.this,
+                ],
+            )))
+        }
+    }
+
+    fn interval_unit_name(unit: IntervalUnit) -> &'static str {
+        match unit {
+            IntervalUnit::Year => "YEAR",
+            IntervalUnit::Quarter => "QUARTER",
+            IntervalUnit::Month => "MONTH",
+            IntervalUnit::Week => "WEEK",
+            IntervalUnit::Day => "DAY",
+            IntervalUnit::Hour => "HOUR",
+            IntervalUnit::Minute => "MINUTE",
+            IntervalUnit::Second => "SECOND",
+            IntervalUnit::Millisecond => "MILLISECOND",
+            IntervalUnit::Microsecond => "MICROSECOND",
+            IntervalUnit::Nanosecond => "NANOSECOND",
+        }
     }
 }
 

@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.7] - 2026-06-19
+
+### Changed
+- Rust verification fixtures now track SQLGlot `v30.11.0` and ClickHouse
+  `v26.5.2.39-stable`.
+
+### Fixed
+- SQLGlot identity verification compatibility for updated dialect fixtures,
+  including BigQuery `INFORMATION_SCHEMA` table qualification, ClickHouse
+  variadic `xor(...)` and view schemas with `NOT NULL`, Databricks two-argument
+  `DATEADD`, native `GET_JSON_OBJECT`, `CLUSTER BY NONE`, and collated string
+  casts.
+- Parser/generator round-tripping for newer dialect fixture cases, including
+  MySQL `ALTER TABLE ... CHANGE COLUMN`, Oracle `TO_NUMBER(... DEFAULT ... ON
+  CONVERSION ERROR)`, PostgreSQL `CREATE TYPE` variants, collated data types,
+  PostgreSQL `<<->>` operators, T-SQL `FOR BROWSE`, and `NOT LIKE` / `NOT ILIKE`
+  `ANY` and `ALL` forms.
+- ClickHouse normalized round-tripping for updated table-function CTAS shapes,
+  projection indexes, keyword CTE names such as `interval`, comma-style
+  `OVERLAY(...)`, and newer parser tolerance cases from the ClickHouse corpus.
+- Exasol transpilation now qualifies select-list aliases in `WHERE` and
+  `HAVING` predicates with `LOCAL.<alias>`, matching Exasol's alias reference
+  semantics.
+
 ## [0.5.6] - 2026-06-19
 
 ### Added

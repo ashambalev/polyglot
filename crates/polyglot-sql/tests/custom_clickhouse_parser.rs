@@ -21,6 +21,9 @@ const SKIP_FILES: &[&str] = &[
     "02366_kql_mvexpand.sql",
     "02366_kql_summarize.sql",
     "02366_kql_tabular.sql",
+    "04092_kql_conformance_baby_kusto.sql",
+    "04094_kql_conformance_pql.sql",
+    "04123_kql_operators.sql",
     // Intentionally invalid/malformed SQL for error handling tests
     "02469_fix_aliases_parser.sql",
     "02472_segfault_expression_parser.sql",

@@ -639,7 +639,50 @@ impl SingleStoreDialect {
     }
 
     fn transform_cast(&self, c: Cast) -> Result<Expression> {
+        if let Some(base_type) = Self::collated_cast_base_type(&c.to) {
+            if Self::is_cast_to_type(&c.this, &base_type) {
+                return Ok(Expression::Cast(Box::new(c)));
+            }
+
+            let mut outer = c;
+            outer.this = Expression::Cast(Box::new(Cast {
+                this: outer.this,
+                to: base_type,
+                trailing_comments: Vec::new(),
+                double_colon_syntax: false,
+                format: None,
+                default: None,
+                inferred_type: None,
+            }));
+            return Ok(Expression::Cast(Box::new(outer)));
+        }
+
         // SingleStore type mappings are handled in the generator
         Ok(Expression::Cast(Box::new(c)))
+    }
+
+    fn collated_cast_base_type(data_type: &DataType) -> Option<DataType> {
+        let DataType::Custom { name } = data_type else {
+            return None;
+        };
+
+        let upper = name.to_ascii_uppercase();
+        let collate_idx = upper.find(" COLLATE ")?;
+        let base = name[..collate_idx].trim();
+        if base.is_empty() {
+            return None;
+        }
+
+        Some(DataType::Custom {
+            name: base.to_string(),
+        })
+    }
+
+    fn is_cast_to_type(expr: &Expression, data_type: &DataType) -> bool {
+        let Expression::Cast(cast) = expr else {
+            return false;
+        };
+
+        &cast.to == data_type
     }
 }

@@ -5524,7 +5524,7 @@ impl Dialect {
             Expression::Min(agg) => rewrite_agg_filter!(Min, agg),
             Expression::Max(agg) => rewrite_agg_filter!(Max, agg),
             Expression::ArrayAgg(agg) => rewrite_agg_filter!(ArrayAgg, agg),
-            Expression::CountIf(agg) => rewrite_agg_filter!(CountIf, agg),
+            Expression::CountIf(agg) => Ok(Expression::CountIf(agg)),
             Expression::Stddev(agg) => rewrite_agg_filter!(Stddev, agg),
             Expression::StddevPop(agg) => rewrite_agg_filter!(StddevPop, agg),
             Expression::StddevSamp(agg) => rewrite_agg_filter!(StddevSamp, agg),
@@ -5610,7 +5610,10 @@ impl Dialect {
             Expression::Min(agg) => push_agg_filter!(Min, agg),
             Expression::Max(agg) => push_agg_filter!(Max, agg),
             Expression::ArrayAgg(agg) => push_agg_filter!(ArrayAgg, agg),
-            Expression::CountIf(agg) => push_agg_filter!(CountIf, agg),
+            Expression::CountIf(mut agg) => {
+                agg.filter = Some(filter);
+                Expression::CountIf(agg)
+            }
             Expression::Stddev(agg) => push_agg_filter!(Stddev, agg),
             Expression::StddevPop(agg) => push_agg_filter!(StddevPop, agg),
             Expression::StddevSamp(agg) => push_agg_filter!(StddevSamp, agg),
@@ -18885,17 +18888,9 @@ impl Dialect {
                                             vec![date, days],
                                         ))))
                                     }
-                                    DialectType::Databricks => {
-                                        // Databricks: DATEADD(DAY, days, date)
-                                        Ok(Expression::Function(Box::new(Function::new(
-                                            "DATEADD".to_string(),
-                                            vec![
-                                                Expression::Identifier(Identifier::new("DAY")),
-                                                days,
-                                                date,
-                                            ],
-                                        ))))
-                                    }
+                                    DialectType::Databricks => Ok(Expression::Function(Box::new(
+                                        Function::new("DATE_ADD".to_string(), vec![date, days]),
+                                    ))),
                                     DialectType::DuckDB => {
                                         // DuckDB: CAST(date AS DATE) + INTERVAL days DAY
                                         let cast_date = Self::ensure_cast_date(date);
@@ -18971,7 +18966,9 @@ impl Dialect {
                                         // But Databricks DATE_ADD doesn't need this wrapping for TSQL
                                         let cast_date = if matches!(
                                             source,
-                                            DialectType::Hive | DialectType::Spark
+                                            DialectType::Hive
+                                                | DialectType::Spark
+                                                | DialectType::Databricks
                                         ) {
                                             if matches!(
                                                 date,

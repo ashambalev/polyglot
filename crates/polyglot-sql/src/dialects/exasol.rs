@@ -20,7 +20,9 @@
 
 use super::{DialectImpl, DialectType};
 use crate::error::Result;
-use crate::expressions::{Expression, Function, ListAggFunc, Literal, VarArgFunc};
+use crate::expressions::{
+    BinaryOp, Expression, Function, Identifier, LikeOp, ListAggFunc, Literal, Select, VarArgFunc,
+};
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
 use crate::tokens::TokenizerConfig;
@@ -149,6 +151,10 @@ impl DialectImpl for ExasolDialect {
             // Aggregate function transformations
             Expression::AggregateFunction(f) => self.transform_aggregate_function(f),
 
+            Expression::Select(select) => Ok(Expression::Select(Box::new(
+                self.qualify_local_alias_predicates(*select),
+            ))),
+
             // Pass through everything else
             _ => Ok(expr),
         }
@@ -157,6 +163,95 @@ impl DialectImpl for ExasolDialect {
 
 #[cfg(feature = "transpile")]
 impl ExasolDialect {
+    fn qualify_local_alias_predicates(&self, mut select: Select) -> Select {
+        let aliases = Self::select_aliases(&select);
+        if aliases.is_empty() {
+            return select;
+        }
+
+        if let Some(where_clause) = select.where_clause.as_mut() {
+            where_clause.this = Self::qualify_local_alias_expr(where_clause.this.clone(), &aliases);
+        }
+        if let Some(having) = select.having.as_mut() {
+            having.this = Self::qualify_local_alias_expr(having.this.clone(), &aliases);
+        }
+
+        select
+    }
+
+    fn select_aliases(select: &Select) -> std::collections::HashMap<String, Identifier> {
+        let mut aliases = std::collections::HashMap::new();
+        for expression in &select.expressions {
+            if let Expression::Alias(alias) = expression {
+                aliases.insert(alias.alias.name.to_ascii_uppercase(), alias.alias.clone());
+            }
+        }
+        aliases
+    }
+
+    fn qualify_local_alias_expr(
+        expr: Expression,
+        aliases: &std::collections::HashMap<String, Identifier>,
+    ) -> Expression {
+        match expr {
+            Expression::Column(col) if col.table.is_none() => {
+                if let Some(alias) = aliases.get(&col.name.name.to_ascii_uppercase()) {
+                    return Expression::Raw(crate::expressions::Raw {
+                        sql: format!("LOCAL.{}", alias.name),
+                    });
+                }
+                Expression::Column(col)
+            }
+            Expression::Identifier(id) => {
+                if let Some(alias) = aliases.get(&id.name.to_ascii_uppercase()) {
+                    Expression::Raw(crate::expressions::Raw {
+                        sql: format!("LOCAL.{}", alias.name),
+                    })
+                } else {
+                    Expression::Identifier(id)
+                }
+            }
+            Expression::And(op) => Self::qualify_binary(op, aliases, Expression::And),
+            Expression::Or(op) => Self::qualify_binary(op, aliases, Expression::Or),
+            Expression::Eq(op) => Self::qualify_binary(op, aliases, Expression::Eq),
+            Expression::Neq(op) => Self::qualify_binary(op, aliases, Expression::Neq),
+            Expression::Lt(op) => Self::qualify_binary(op, aliases, Expression::Lt),
+            Expression::Lte(op) => Self::qualify_binary(op, aliases, Expression::Lte),
+            Expression::Gt(op) => Self::qualify_binary(op, aliases, Expression::Gt),
+            Expression::Gte(op) => Self::qualify_binary(op, aliases, Expression::Gte),
+            Expression::Like(op) => Self::qualify_like(op, aliases, Expression::Like),
+            Expression::ILike(op) => Self::qualify_like(op, aliases, Expression::ILike),
+            Expression::Not(mut op) => {
+                op.this = Self::qualify_local_alias_expr(op.this, aliases);
+                Expression::Not(op)
+            }
+            other => other,
+        }
+    }
+
+    fn qualify_binary(
+        mut op: Box<BinaryOp>,
+        aliases: &std::collections::HashMap<String, Identifier>,
+        wrap: fn(Box<BinaryOp>) -> Expression,
+    ) -> Expression {
+        op.left = Self::qualify_local_alias_expr(op.left, aliases);
+        op.right = Self::qualify_local_alias_expr(op.right, aliases);
+        wrap(op)
+    }
+
+    fn qualify_like(
+        mut op: Box<LikeOp>,
+        aliases: &std::collections::HashMap<String, Identifier>,
+        wrap: fn(Box<LikeOp>) -> Expression,
+    ) -> Expression {
+        op.left = Self::qualify_local_alias_expr(op.left, aliases);
+        op.right = Self::qualify_local_alias_expr(op.right, aliases);
+        if let Some(escape) = op.escape.take() {
+            op.escape = Some(Self::qualify_local_alias_expr(escape, aliases));
+        }
+        wrap(op)
+    }
+
     fn transform_function(&self, f: Function) -> Result<Expression> {
         let name_upper = f.name.to_uppercase();
         match name_upper.as_str() {

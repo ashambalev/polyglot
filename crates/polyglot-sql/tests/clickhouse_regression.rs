@@ -72,6 +72,10 @@ fn clickhouse_preserves_table_function_ctas_source() {
         normalize_clickhouse("CREATE TABLE t AS numbers(5)"),
         "CREATE TABLE t AS numbers(5)"
     );
+    assert_eq!(
+        normalize_clickhouse("CREATE TABLE t (n UInt64) AS numbers(1)"),
+        "CREATE TABLE t (n UInt64) AS numbers(1)"
+    );
 }
 
 #[test]
@@ -156,4 +160,80 @@ fn clickhouse_preserves_alter_update_mutation_as_command() {
         normalize_clickhouse("ALTER TABLE tab UPDATE str = 'I am not inverted' WHERE 1"),
         "ALTER TABLE tab UPDATE str = 'I am not inverted' WHERE 1"
     );
+}
+
+#[test]
+fn clickhouse_parses_with_trailing_comma_before_select() {
+    assert_clickhouse_parse("WITH 1 AS a, SELECT a");
+    assert_clickhouse_parse("WITH 1 AS a, 2 AS b, SELECT a + b");
+    assert_clickhouse_parse("WITH (SELECT 1) AS a, SELECT a");
+}
+
+#[test]
+fn clickhouse_parses_standard_overlay_syntax() {
+    assert_clickhouse_parse("SELECT OVERLAY('Hello World' PLACING 'SQL' FROM 7 FOR 5)");
+    assert_clickhouse_parse("SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3)");
+    assert_clickhouse_parse("SELECT overlay('hello', 'world', 2, 3, 'extra')");
+    assert_clickhouse_parse("SELECT overlayUTF8('Spark SQL和CH' PLACING '_' FROM 6)");
+    assert_clickhouse_parse("SELECT OVERLAY('abcdef' PLACING 'XY', 3)");
+    assert_clickhouse_parse("SELECT overlay('abcdef', 'XY' FROM 3)");
+    assert_clickhouse_normalized_roundtrip("SELECT OVERLAY('abcdef' PLACING 'XY', 3)");
+    assert_eq!(
+        normalize_clickhouse("SELECT OVERLAY('abcdef', 'XY', 3)"),
+        "SELECT OVERLAY('abcdef', 'XY', 3)"
+    );
+}
+
+#[test]
+fn clickhouse_parses_updated_corpus_ddl_shapes() {
+    assert_clickhouse_parse(
+        "CREATE TABLE test_merge (a Int32, b String) AS merge(currentDatabase(), '^test_[ab]$')",
+    );
+    assert_clickhouse_parse(
+        "CREATE TABLE t TO INNER UUID '00000000-0000-0000-0000-000000000001' (id UInt32) ORDER BY id",
+    );
+    assert_clickhouse_parse(
+        "CREATE TABLE test_idx_settings_cov (id UInt64, PROJECTION region_proj INDEX region TYPE basic WITH SETTINGS (index_granularity = 2)) ENGINE = MergeTree ORDER BY id",
+    );
+    assert_clickhouse_normalized_roundtrip(
+        "CREATE TABLE mt_commit_order_idx(a UInt64, b UInt64, PROJECTION commit_order INDEX b TYPE commit_order) ENGINE = MergeTree ORDER BY a",
+    );
+    assert_clickhouse_parse(
+        "CREATE TABLE t_constraint_trans (a Int64, b Int64, c Int64, d Int32, CONSTRAINT c1 ASSUME (a = b) AND (c = d), CONSTRAINT c2 ASSUME b = c) ENGINE = TinyLog",
+    );
+}
+
+#[test]
+fn clickhouse_parses_newer_select_tolerance_shapes() {
+    assert_clickhouse_parse(
+        "SELECT toUInt32OrZero(extract(last_headers['strict-transport-security'], 'max-age=(\\d+)')) AS hsts_max_age FROM t",
+    );
+    assert_clickhouse_parse("SELECT * FROM t1 NATURAL CROSS JOIN t2");
+    assert_clickhouse_parse(
+        "SELECT l.s AS s FROM t_l AS l LEFT JOIN t_r AS r ON r.s = l.s ORDER BY l.s DESC COLLATE 'en' LIMIT 10",
+    );
+    assert_clickhouse_parse(
+        "ALTER TABLE t0 DELETE IN PARTITION tuple() WHERE equals(c0, 1) SETTINGS mutations_sync = 2",
+    );
+    assert_clickhouse_parse("WITH cte AS (SELECT number FROM numbers(3)), SELECT * FROM cte");
+    assert_clickhouse_parse("WITH 1 AS a,, SELECT a");
+    assert_clickhouse_parse(
+        "SELECT 1 FROM (SELECT 1 FROM (SELECT 1 PREWHERE (SELECT 1 FROM VALUES(NULL) AS t0d2) QUALIFY (SELECT 1 FROM VALUES(NULL) AS t0d2)))",
+    );
+    assert_clickhouse_parse(
+        "SELECT count() FROM (SELECT c0 FROM ((SELECT 'a') EXCEPT ALL SELECT (1, 2))(c0)) AS t0 WHERE t0.c0 ILIKE t0.c0 = true",
+    );
+    assert_clickhouse_parse(
+        "SELECT accurateCastOrNull((SELECT modulo(intDiv(1, 1), NULL), -1 LIMIT -1), 'Point') AS r",
+    );
+    assert_clickhouse_parse(
+        "SELECT count() FROM t_constraint_corr WHERE exists((SELECT toUInt8(1) PREWHERE murmurHash3_64(xxHash32(a))))",
+    );
+    assert_clickhouse_parse(
+        "SELECT * FROM (WITH t AS MATERIALIZED (SELECT a + number AS x FROM numbers(65536)) SELECT * FROM (SELECT NULL AS a, x FROM t))",
+    );
+    assert_clickhouse_normalized_roundtrip(
+        "WITH interval AS (SELECT 1 AS val), t0_renamed AS (SELECT * FROM t0_renamed) SELECT TOP 10 *, t0_renamed.*, *, t0_renamed.* WHERE -t0_renamed.v1 GROUP BY t0_renamed.v1, t0_renamed.v2, t0_renamed.v3",
+    );
+    assert_clickhouse_normalized_roundtrip("SELECT 1 == SOME (SELECT number FROM numbers(10))");
 }

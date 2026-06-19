@@ -104,6 +104,26 @@ impl DialectImpl for BigQueryDialect {
             // ===== Data Type Mappings =====
             Expression::DataType(dt) => self.transform_data_type(dt),
 
+            Expression::Table(mut table)
+                if table.catalog.is_none()
+                    && table.alias.is_none()
+                    && table.schema.as_ref().map_or(false, |schema| {
+                        schema.quoted && schema.name.contains("INFORMATION_SCHEMA")
+                    }) =>
+            {
+                let schema = table.schema.take().expect("schema checked above");
+                let old_name = table.name.clone();
+                let alias = old_name.name.clone();
+                table.name = Identifier {
+                    name: format!("{}.{}", schema.name, old_name.name),
+                    quoted: true,
+                    trailing_comments: old_name.trailing_comments,
+                    span: old_name.span,
+                };
+                table.alias = Some(Identifier::new(alias));
+                Ok(Expression::Table(table))
+            }
+
             // ===== Null handling =====
             // IFNULL is native to BigQuery - keep as-is for identity
             Expression::IfNull(f) => Ok(Expression::IfNull(f)),

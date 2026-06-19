@@ -445,6 +445,17 @@ impl ClickHouseDialect {
                 }
                 self.transform_expr(expr)
             }
+            "XOR" if f.args.len() >= 2 => {
+                let mut iter = f.args.into_iter().map(Self::wrap_nested_xor_arg);
+                let mut expr = iter.next().unwrap();
+                for arg in iter {
+                    expr = Expression::Function(Box::new(Function::new(
+                        f.name.clone(),
+                        vec![expr, arg],
+                    )));
+                }
+                Ok(expr)
+            }
             // TYPEOF -> toTypeName in ClickHouse
             "TYPEOF" => Ok(Expression::Function(Box::new(Function::new(
                 "toTypeName".to_string(),
@@ -667,5 +678,16 @@ impl ClickHouseDialect {
 
     fn transform_cast(&self, c: Cast) -> Result<Expression> {
         Ok(Expression::Cast(Box::new(c)))
+    }
+
+    fn wrap_nested_xor_arg(expr: Expression) -> Expression {
+        if matches!(&expr, Expression::Function(f) if f.name.eq_ignore_ascii_case("XOR")) {
+            Expression::Paren(Box::new(Paren {
+                this: expr,
+                trailing_comments: Vec::new(),
+            }))
+        } else {
+            expr
+        }
     }
 }

@@ -10,8 +10,8 @@
 use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
-    BinaryFunc, BinaryOp, Cast, DataType, Expression, Function, JsonExtractFunc, LikeOp, Literal,
-    Paren, UnaryFunc,
+    BinaryFunc, BinaryOp, Cast, DataType, Expression, Function, Interval, IntervalUnit,
+    IntervalUnitSpec, JsonExtractFunc, LikeOp, Literal, MakeInterval, Paren, UnaryFunc,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
@@ -175,6 +175,10 @@ impl DialectImpl for MySQLDialect {
             // Preserve semantic string concatenation expressions.
             // MySQL generation renders these as CONCAT(...).
             Expression::Concat(op) => Ok(Expression::Concat(op)),
+
+            // PostgreSQL MAKE_INTERVAL -> MySQL interval arithmetic.
+            Expression::Add(op) => self.transform_make_interval_binary(op, false),
+            Expression::Sub(op) => self.transform_make_interval_binary(op, true),
 
             // RANDOM -> RAND in MySQL
             Expression::Random(_) => Ok(Expression::Rand(Box::new(crate::expressions::Rand {
@@ -615,6 +619,159 @@ impl MySQLDialect {
             }
             // All other casts go through normal type transformation
             _ => Ok(Expression::Cast(Box::new(self.transform_cast_type(cast)))),
+        }
+    }
+
+    fn transform_make_interval_binary(
+        &self,
+        op: Box<BinaryOp>,
+        subtract: bool,
+    ) -> Result<Expression> {
+        if let Expression::MakeInterval(make_interval) = &op.right {
+            if let Some(expr) =
+                Self::expand_make_interval_binary(op.left.clone(), make_interval, subtract)
+            {
+                return Ok(expr);
+            }
+        }
+        if let Expression::Function(function) = &op.right {
+            if function.name.eq_ignore_ascii_case("MAKE_INTERVAL") {
+                if let Some(expr) =
+                    Self::expand_make_interval_function_binary(op.left.clone(), function, subtract)
+                {
+                    return Ok(expr);
+                }
+            }
+        }
+
+        if subtract {
+            Ok(Expression::Sub(op))
+        } else {
+            Ok(Expression::Add(op))
+        }
+    }
+
+    fn expand_make_interval_binary(
+        left: Expression,
+        make_interval: &MakeInterval,
+        subtract: bool,
+    ) -> Option<Expression> {
+        let parts = Self::make_interval_parts(make_interval);
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut expr = left;
+        for (value, unit) in parts {
+            let interval = Expression::Interval(Box::new(Interval {
+                this: Some(value),
+                unit: Some(IntervalUnitSpec::Simple {
+                    unit,
+                    use_plural: false,
+                }),
+            }));
+            expr = if subtract {
+                Expression::Sub(Box::new(BinaryOp::new(expr, interval)))
+            } else {
+                Expression::Add(Box::new(BinaryOp::new(expr, interval)))
+            };
+        }
+
+        Some(expr)
+    }
+
+    fn expand_make_interval_function_binary(
+        left: Expression,
+        function: &Function,
+        subtract: bool,
+    ) -> Option<Expression> {
+        let parts = Self::make_interval_function_parts(function);
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut expr = left;
+        for (value, unit) in parts {
+            let interval = Expression::Interval(Box::new(Interval {
+                this: Some(value),
+                unit: Some(IntervalUnitSpec::Simple {
+                    unit,
+                    use_plural: false,
+                }),
+            }));
+            expr = if subtract {
+                Expression::Sub(Box::new(BinaryOp::new(expr, interval)))
+            } else {
+                Expression::Add(Box::new(BinaryOp::new(expr, interval)))
+            };
+        }
+
+        Some(expr)
+    }
+
+    fn make_interval_parts(make_interval: &MakeInterval) -> Vec<(Expression, IntervalUnit)> {
+        let mut parts = Vec::new();
+        if let Some(year) = &make_interval.year {
+            parts.push(((**year).clone(), IntervalUnit::Year));
+        }
+        if let Some(month) = &make_interval.month {
+            parts.push(((**month).clone(), IntervalUnit::Month));
+        }
+        if let Some(week) = &make_interval.week {
+            parts.push(((**week).clone(), IntervalUnit::Week));
+        }
+        if let Some(day) = &make_interval.day {
+            parts.push(((**day).clone(), IntervalUnit::Day));
+        }
+        if let Some(hour) = &make_interval.hour {
+            parts.push(((**hour).clone(), IntervalUnit::Hour));
+        }
+        if let Some(minute) = &make_interval.minute {
+            parts.push(((**minute).clone(), IntervalUnit::Minute));
+        }
+        if let Some(second) = &make_interval.second {
+            parts.push(((**second).clone(), IntervalUnit::Second));
+        }
+        parts
+    }
+
+    fn make_interval_function_parts(function: &Function) -> Vec<(Expression, IntervalUnit)> {
+        let positional_units = [
+            IntervalUnit::Year,
+            IntervalUnit::Month,
+            IntervalUnit::Week,
+            IntervalUnit::Day,
+            IntervalUnit::Hour,
+            IntervalUnit::Minute,
+            IntervalUnit::Second,
+        ];
+        let mut positional_index = 0;
+        let mut parts = Vec::new();
+
+        for arg in &function.args {
+            if let Expression::NamedArgument(named) = arg {
+                if let Some(unit) = Self::make_interval_unit_from_name(&named.name.name) {
+                    parts.push((named.value.clone(), unit));
+                }
+            } else if let Some(unit) = positional_units.get(positional_index) {
+                parts.push((arg.clone(), *unit));
+                positional_index += 1;
+            }
+        }
+
+        parts
+    }
+
+    fn make_interval_unit_from_name(name: &str) -> Option<IntervalUnit> {
+        match name.to_ascii_lowercase().as_str() {
+            "year" | "years" => Some(IntervalUnit::Year),
+            "month" | "months" => Some(IntervalUnit::Month),
+            "week" | "weeks" => Some(IntervalUnit::Week),
+            "day" | "days" => Some(IntervalUnit::Day),
+            "hour" | "hours" => Some(IntervalUnit::Hour),
+            "min" | "mins" | "minute" | "minutes" => Some(IntervalUnit::Minute),
+            "sec" | "secs" | "second" | "seconds" => Some(IntervalUnit::Second),
+            _ => None,
         }
     }
 
