@@ -6,11 +6,28 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [0.5.7] - 2026-06-19
 
+### Added
+- Regression coverage for recursive CTE, query-wrapper, set-operation,
+  scalar-subquery, window, pivot, and unpivot lineage across Rust core,
+  C FFI, WASM/TypeScript, Python, and Go.
+
 ### Changed
 - Rust verification fixtures now track SQLGlot `v30.11.0` and ClickHouse
   `v26.5.2.39-stable`.
 
 ### Fixed
+- Lineage now analyzes query-bearing wrappers such as `PREPARE`, CTAS,
+  `CREATE VIEW`, and `INSERT ... SELECT` through their inner query instead of
+  rejecting them as non-`SELECT` expressions.
+- Recursive CTE lineage now terminates at the base case and preserves CTE
+  provenance for recursive references instead of recursing indefinitely.
+- Lineage now resolves parent CTEs through set-operation branches and scalar
+  subqueries, so downstream nodes can trace back to the original base tables.
+- Window-function lineage now includes dependencies from `PARTITION BY`,
+  window `ORDER BY`, named window definitions, ordered aggregates, and
+  `WITHIN GROUP` ordering.
+- Pivot and unpivot lineage now maps generated output/value columns back to
+  the underlying input columns.
 - SQLGlot identity verification compatibility for updated dialect fixtures,
   including BigQuery `INFORMATION_SCHEMA` table qualification, ClickHouse
   variadic `xor(...)` and view schemas with `NOT NULL`, Databricks two-argument

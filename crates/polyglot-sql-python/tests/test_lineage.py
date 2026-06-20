@@ -25,6 +25,27 @@ def test_lineage_schema_less_cte_star_passthrough():
     assert "t.x" in names
 
 
+def test_lineage_create_table_as_select_wrapper():
+    result = polyglot_sql.lineage(
+        "x", "CREATE TABLE tgt AS SELECT x FROM src", dialect="generic"
+    )
+
+    names = collect_names(result)
+    assert "src.x" in names
+
+
+def test_lineage_window_over_columns():
+    sql = (
+        "WITH c AS (SELECT user_id, ts FROM events) "
+        "SELECT ROW_NUMBER() OVER (PARTITION BY c.user_id ORDER BY c.ts) AS out FROM c"
+    )
+    result = polyglot_sql.lineage("out", sql, dialect="generic")
+
+    names = collect_names(result)
+    assert "events.user_id" in names
+    assert "events.ts" in names
+
+
 def test_source_tables_returns_orders():
     sql = "SELECT o.total FROM orders o JOIN users u ON o.user_id = u.id"
     tables = polyglot_sql.source_tables("total", sql, dialect="postgres")

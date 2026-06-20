@@ -210,6 +210,30 @@ describe('Polyglot SDK', () => {
       });
     });
 
+    it('should trace pivot output columns to aggregation inputs', () => {
+      const result = lineage(
+        'q1',
+        "SELECT * FROM (SELECT region, q, amt FROM sales) PIVOT(SUM(amt) FOR q IN ('Q1' AS q1))",
+        Dialect.DuckDB,
+      );
+
+      expect(result.success).toBe(true);
+      expect(collectNames(result.lineage!)).toContain('sales.amt');
+    });
+
+    it('should trace unpivot value columns to input columns', () => {
+      const result = lineage(
+        'val',
+        'SELECT name, val FROM t UNPIVOT(val FOR col IN (a, b, c))',
+        Dialect.DuckDB,
+      );
+
+      expect(result.success).toBe(true);
+      expect(collectNames(result.lineage!)).toEqual(
+        expect.arrayContaining(['t.a', 't.b', 't.c']),
+      );
+    });
+
     it('should collect source tables from prepared statement bodies', () => {
       const result = getSourceTables(
         'id',

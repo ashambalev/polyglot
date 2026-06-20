@@ -729,6 +729,33 @@ fn test_lineage_schema_less_cte_star_passthrough() {
 }
 
 #[test]
+fn test_lineage_recursive_cte_terminates() {
+    let column = c("n");
+    let sql = c(
+        "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums",
+    );
+    let dialect = c("duckdb");
+    let (status, data, error) = consume_result(polyglot_lineage(
+        column.as_ptr(),
+        sql.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "error={error:?}");
+    let node: Value = serde_json::from_str(&data.expect("missing lineage")).expect("invalid json");
+
+    let mut names = Vec::new();
+    collect_lineage_names(&node, &mut names);
+    assert!(
+        names.len() <= 12,
+        "recursive CTE lineage should not unroll repeatedly, got {names:?}"
+    );
+    assert!(
+        node.to_string().contains("\"source_kind\":\"cte\""),
+        "expected a CTE source in recursive lineage: {node}"
+    );
+}
+
+#[test]
 fn test_lineage_bigquery_unnest_virtual_source_metadata() {
     let column = c("week_start");
     let sql = c(

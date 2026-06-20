@@ -6,6 +6,7 @@
 //! Ported from sqlglot's optimizer/scope.py
 
 use crate::expressions::Expression;
+use crate::traversal::ExpressionWalk;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "bindings")]
@@ -617,14 +618,7 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
         Expression::Select(select) => {
             // Process CTEs first
             if let Some(with) = &select.with {
-                for cte in &with.ctes {
-                    let cte_name = cte.alias.name.clone();
-                    let mut cte_scope = current_scope
-                        .branch(Expression::Cte(Box::new(cte.clone())), ScopeType::Cte);
-                    build_scope_impl(&cte.this, &mut cte_scope);
-                    current_scope.add_cte_source(cte_name, Expression::Cte(Box::new(cte.clone())));
-                    current_scope.cte_scopes.push(cte_scope);
-                }
+                process_ctes(with, current_scope);
             }
 
             // Process FROM clause
@@ -648,6 +642,10 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             collect_subqueries(expression, current_scope);
         }
         Expression::Union(union) => {
+            if let Some(with) = &union.with {
+                process_ctes(with, current_scope);
+            }
+
             let mut left_scope = current_scope.branch(union.left.clone(), ScopeType::SetOperation);
             build_scope_impl(&union.left, &mut left_scope);
 
@@ -659,6 +657,10 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Intersect(intersect) => {
+            if let Some(with) = &intersect.with {
+                process_ctes(with, current_scope);
+            }
+
             let mut left_scope =
                 current_scope.branch(intersect.left.clone(), ScopeType::SetOperation);
             build_scope_impl(&intersect.left, &mut left_scope);
@@ -671,6 +673,10 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Except(except) => {
+            if let Some(with) = &except.with {
+                process_ctes(with, current_scope);
+            }
+
             let mut left_scope = current_scope.branch(except.left.clone(), ScopeType::SetOperation);
             build_scope_impl(&except.left, &mut left_scope);
 
@@ -685,14 +691,7 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Handle CREATE TABLE ... AS [WITH ...] SELECT ...
             // Process CTEs if present
             if let Some(with) = &create.with_cte {
-                for cte in &with.ctes {
-                    let cte_name = cte.alias.name.clone();
-                    let mut cte_scope = current_scope
-                        .branch(Expression::Cte(Box::new(cte.clone())), ScopeType::Cte);
-                    build_scope_impl(&cte.this, &mut cte_scope);
-                    current_scope.add_cte_source(cte_name, Expression::Cte(Box::new(cte.clone())));
-                    current_scope.cte_scopes.push(cte_scope);
-                }
+                process_ctes(with, current_scope);
             }
             // Traverse the AS SELECT body
             if let Some(as_select) = &create.as_select {
@@ -701,6 +700,34 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
         }
         _ => {}
     }
+}
+
+fn process_ctes(with: &crate::expressions::With, current_scope: &mut Scope) {
+    for cte in &with.ctes {
+        let cte_name = cte.alias.name.clone();
+        let cte_expr = Expression::Cte(Box::new(cte.clone()));
+        let mut cte_scope = current_scope.branch(cte_expr.clone(), ScopeType::Cte);
+
+        if with.recursive && cte_body_self_references(cte) {
+            cte_scope.add_cte_source(cte_name.clone(), cte_expr.clone());
+        }
+
+        build_scope_impl(&cte.this, &mut cte_scope);
+        current_scope.add_cte_source(cte_name, cte_expr);
+        current_scope.cte_scopes.push(cte_scope);
+    }
+}
+
+fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
+    let cte_name = cte.alias.name.as_str();
+    !cte.this
+        .find_all(|expr| match expr {
+            Expression::Table(table) if table.schema.is_none() && table.catalog.is_none() => {
+                table.name.name.eq_ignore_ascii_case(cte_name)
+            }
+            _ => false,
+        })
+        .is_empty()
 }
 
 fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
@@ -762,9 +789,62 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
         Expression::LateralView(lateral_view) => {
             add_lateral_view_to_scope(lateral_view, scope);
         }
+        Expression::Pivot(pivot) => {
+            let name =
+                pivot_source_name(&pivot.this, pivot.alias.as_ref().map(|a| a.name.as_str()));
+            scope.add_source_info(
+                name,
+                SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
+            );
+            add_pivot_inner_scope(&pivot.this, scope);
+        }
+        Expression::Unpivot(unpivot) => {
+            let name = pivot_source_name(
+                &unpivot.this,
+                unpivot.alias.as_ref().map(|a| a.name.as_str()),
+            );
+            scope.add_source_info(
+                name,
+                SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
+            );
+            add_pivot_inner_scope(&unpivot.this, scope);
+        }
         Expression::Paren(paren) => {
             add_table_to_scope(&paren.this, scope);
         }
+        _ => {}
+    }
+}
+
+fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> String {
+    if let Some(alias) = explicit_alias {
+        return alias.to_string();
+    }
+
+    match source {
+        Expression::Table(table) => table
+            .alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .unwrap_or_else(|| table.name.name.clone()),
+        Expression::Subquery(subquery) => subquery
+            .alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .unwrap_or_else(|| "_0".to_string()),
+        Expression::Paren(paren) => pivot_source_name(&paren.this, explicit_alias),
+        _ => "_0".to_string(),
+    }
+}
+
+fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope) {
+    match source {
+        Expression::Subquery(subquery) => {
+            let mut derived_scope = scope.branch(subquery.this.clone(), ScopeType::DerivedTable);
+            build_scope_impl(&subquery.this, &mut derived_scope);
+            scope.derived_table_scopes.push(derived_scope);
+        }
+        Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope),
         _ => {}
     }
 }

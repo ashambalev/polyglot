@@ -397,6 +397,49 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 		t.Fatal("empty source tables")
 	}
 
+	ddlNode, err := client.Lineage(
+		"x",
+		"CREATE TABLE tgt AS SELECT x FROM src",
+		"generic",
+	)
+	if err != nil {
+		t.Fatalf("DDL wrapper Lineage: %v", err)
+	}
+	ddlNames := collectLineageNames(ddlNode)
+	hasSourceColumn := false
+	for _, name := range ddlNames {
+		if name == "src.x" {
+			hasSourceColumn = true
+			break
+		}
+	}
+	if !hasSourceColumn {
+		t.Fatalf("expected src.x in DDL wrapper lineage, got %#v", ddlNames)
+	}
+
+	windowNode, err := client.Lineage(
+		"out",
+		"WITH c AS (SELECT user_id, ts FROM events) SELECT ROW_NUMBER() OVER (PARTITION BY c.user_id ORDER BY c.ts) AS out FROM c",
+		"generic",
+	)
+	if err != nil {
+		t.Fatalf("window Lineage: %v", err)
+	}
+	windowNames := collectLineageNames(windowNode)
+	hasUserID := false
+	hasTS := false
+	for _, name := range windowNames {
+		if name == "events.user_id" {
+			hasUserID = true
+		}
+		if name == "events.ts" {
+			hasTS = true
+		}
+	}
+	if !hasUserID || !hasTS {
+		t.Fatalf("expected window input columns in lineage, got %#v", windowNames)
+	}
+
 	schemaNode, err := client.LineageWithSchema(
 		"id",
 		"SELECT id FROM users u JOIN orders o ON u.id = o.user_id",
