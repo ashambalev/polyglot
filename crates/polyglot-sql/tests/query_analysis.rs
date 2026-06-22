@@ -608,3 +608,85 @@ fn analyze_query_reports_base_tables_inside_derived_table_set_operation() {
         .iter()
         .any(|relation| relation.name == "u" && relation.kind == SourceKind::DerivedTable));
 }
+
+#[test]
+fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
+    let analysis = analyze_query(
+        "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) \
+         UNION ALL SELECT v FROM t3) u",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    let upstream_tables: Vec<_> = analysis.projections[0]
+        .upstream
+        .iter()
+        .filter_map(|reference| reference.table.as_deref())
+        .collect();
+    assert!(upstream_tables.contains(&"t1"));
+    assert!(upstream_tables.contains(&"t2"));
+    assert!(upstream_tables.contains(&"t3"));
+
+    let base_table_names: Vec<_> = analysis
+        .base_tables
+        .iter()
+        .map(|relation| relation.name.as_str())
+        .collect();
+    assert_eq!(base_table_names, vec!["t1", "t2", "t3"]);
+}
+
+#[test]
+fn analyze_query_resolves_same_select_alias_reference() {
+    let analysis = analyze_query(
+        "WITH c AS (SELECT x FROM t) SELECT c.x AS a, a + 1 AS b FROM c",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    let projection = analysis
+        .projections
+        .iter()
+        .find(|projection| projection.name.as_deref() == Some("b"))
+        .unwrap();
+    assert!(projection
+        .upstream
+        .iter()
+        .any(|reference| reference.table.as_deref() == Some("t") && reference.column == "x"));
+}
+
+#[test]
+fn analyze_query_resolves_pivot_alias_columns_and_generated_outputs() {
+    let analysis = analyze_query(
+        "SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) \
+         PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    let region = analysis
+        .projections
+        .iter()
+        .find(|projection| projection.name.as_deref() == Some("region2"))
+        .unwrap();
+    assert!(region.upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("sales") && reference.column == "region"
+    }));
+
+    let pivot_value = analysis
+        .projections
+        .iter()
+        .find(|projection| projection.name.as_deref() == Some("p1"))
+        .unwrap();
+    assert!(pivot_value.upstream.iter().any(|reference| {
+        reference.table.as_deref() == Some("sales") && reference.column == "amt"
+    }));
+}

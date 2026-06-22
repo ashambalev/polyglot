@@ -698,6 +698,12 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
                 build_scope_impl(as_select, current_scope);
             }
         }
+        Expression::Subquery(subquery) => {
+            build_scope_impl(&subquery.this, current_scope);
+        }
+        Expression::Paren(paren) => {
+            build_scope_impl(&paren.this, current_scope);
+        }
         _ => {}
     }
 }
@@ -781,6 +787,24 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
         Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
             scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
         }
+        Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
+            let outer_columns = alias
+                .column_aliases
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            let mut derived_scope = scope.branch_with_options(
+                alias.this.clone(),
+                ScopeType::DerivedTable,
+                None,
+                None,
+                Some(outer_columns),
+            );
+            build_scope_impl(&alias.this, &mut derived_scope);
+
+            scope.add_source(alias.alias.name.clone(), expr.clone(), true);
+            scope.derived_table_scopes.push(derived_scope);
+        }
         Expression::Lateral(lateral) => {
             if let Some(alias) = &lateral.alias {
                 scope.add_virtual_source(alias.clone(), expr.clone());
@@ -813,6 +837,18 @@ fn add_table_to_scope(expr: &Expression, scope: &mut Scope) {
             add_table_to_scope(&paren.this, scope);
         }
         _ => {}
+    }
+}
+
+fn is_query_like_relation(expr: &Expression) -> bool {
+    match expr {
+        Expression::Select(_)
+        | Expression::Subquery(_)
+        | Expression::Union(_)
+        | Expression::Intersect(_)
+        | Expression::Except(_) => true,
+        Expression::Paren(paren) => is_query_like_relation(&paren.this),
+        _ => false,
     }
 }
 
@@ -885,83 +921,28 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
 }
 
 fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
-    match expr {
-        Expression::Subquery(subquery) if subquery.alias.is_none() => {
-            // This is a scalar subquery or IN subquery (not a derived table)
-            let mut sub_scope = parent_scope.branch(subquery.this.clone(), ScopeType::Subquery);
-            build_scope_impl(&subquery.this, &mut sub_scope);
-            parent_scope.subquery_scopes.push(sub_scope);
+    let mut seen = HashSet::new();
+    for node in walk_in_scope(expr, false) {
+        let query = match node {
+            Expression::Subquery(subquery) if subquery.alias.is_none() => Some(&subquery.this),
+            Expression::Exists(exists) => Some(&exists.this),
+            Expression::In(in_expr) => in_expr.query.as_ref(),
+            Expression::Any(quantified) | Expression::All(quantified) => Some(&quantified.subquery),
+            _ => None,
+        };
+
+        let Some(query) = query else {
+            continue;
+        };
+
+        let key = query as *const Expression as usize;
+        if !seen.insert(key) {
+            continue;
         }
-        Expression::In(in_expr) => {
-            collect_subqueries_in_expr(&in_expr.this, parent_scope);
-            if let Some(query) = &in_expr.query {
-                let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
-                build_scope_impl(query, &mut sub_scope);
-                parent_scope.subquery_scopes.push(sub_scope);
-            }
-        }
-        Expression::Exists(exists) => {
-            let mut sub_scope = parent_scope.branch(exists.this.clone(), ScopeType::Subquery);
-            build_scope_impl(&exists.this, &mut sub_scope);
-            parent_scope.subquery_scopes.push(sub_scope);
-        }
-        // Binary operations
-        Expression::And(bin)
-        | Expression::Or(bin)
-        | Expression::Add(bin)
-        | Expression::Sub(bin)
-        | Expression::Mul(bin)
-        | Expression::Div(bin)
-        | Expression::Mod(bin)
-        | Expression::Eq(bin)
-        | Expression::Neq(bin)
-        | Expression::Lt(bin)
-        | Expression::Lte(bin)
-        | Expression::Gt(bin)
-        | Expression::Gte(bin)
-        | Expression::BitwiseAnd(bin)
-        | Expression::BitwiseOr(bin)
-        | Expression::BitwiseXor(bin)
-        | Expression::Concat(bin) => {
-            collect_subqueries_in_expr(&bin.left, parent_scope);
-            collect_subqueries_in_expr(&bin.right, parent_scope);
-        }
-        // LIKE/ILIKE operations (have different structure with escape)
-        Expression::Like(like) | Expression::ILike(like) => {
-            collect_subqueries_in_expr(&like.left, parent_scope);
-            collect_subqueries_in_expr(&like.right, parent_scope);
-            if let Some(escape) = &like.escape {
-                collect_subqueries_in_expr(escape, parent_scope);
-            }
-        }
-        // Unary operations
-        Expression::Not(un) | Expression::Neg(un) | Expression::BitwiseNot(un) => {
-            collect_subqueries_in_expr(&un.this, parent_scope);
-        }
-        Expression::Function(func) => {
-            for arg in &func.args {
-                collect_subqueries_in_expr(arg, parent_scope);
-            }
-        }
-        Expression::Case(case) => {
-            if let Some(operand) = &case.operand {
-                collect_subqueries_in_expr(operand, parent_scope);
-            }
-            for (when_expr, then_expr) in &case.whens {
-                collect_subqueries_in_expr(when_expr, parent_scope);
-                collect_subqueries_in_expr(then_expr, parent_scope);
-            }
-            if let Some(else_clause) = &case.else_ {
-                collect_subqueries_in_expr(else_clause, parent_scope);
-            }
-        }
-        Expression::Paren(paren) => {
-            collect_subqueries_in_expr(&paren.this, parent_scope);
-        }
-        Expression::Alias(alias) => {
-            collect_subqueries_in_expr(&alias.this, parent_scope);
-        }
-        _ => {}
+
+        let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
+        build_scope_impl(query, &mut sub_scope);
+        parent_scope.subquery_scopes.push(sub_scope);
     }
 }
 

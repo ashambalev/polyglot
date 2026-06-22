@@ -122,6 +122,32 @@ def test_analyze_query_reports_cte_facts_and_star_projections():
     assert result["starProjections"][0]["expandedColumns"] == ["id", "amount"]
 
 
+def test_analyze_query_resolves_pivot_alias_columns():
+    result = polyglot_sql.analyze_query(
+        "SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) "
+        "PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+        {"dialect": "duckdb"},
+    )
+
+    region = next(
+        projection
+        for projection in result["projections"]
+        if projection["name"] == "region2"
+    )
+    assert any(
+        reference["table"] == "sales" and reference["column"] == "region"
+        for reference in region["upstream"]
+    )
+
+    pivot_value = next(
+        projection for projection in result["projections"] if projection["name"] == "p1"
+    )
+    assert any(
+        reference["table"] == "sales" and reference["column"] == "amt"
+        for reference in pivot_value["upstream"]
+    )
+
+
 def test_analyze_query_unknown_dialect_raises_value_error():
     with pytest.raises(ValueError):
         polyglot_sql.analyze_query("SELECT 1", dialect="not_a_dialect")

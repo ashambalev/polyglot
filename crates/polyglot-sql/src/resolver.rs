@@ -11,8 +11,10 @@
 
 use crate::dialects::DialectType;
 use crate::expressions::{Expression, Identifier, TableRef};
+use crate::generator::Generator;
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{Scope, SourceInfo};
+use crate::traversal::ExpressionWalk;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -207,6 +209,8 @@ impl<'a> Resolver<'a> {
                     self.get_named_selects(&cte.this)
                 }
             }
+            Expression::Pivot(pivot) => self.get_pivot_output_columns(pivot),
+            Expression::Unpivot(unpivot) => self.get_unpivot_output_columns(unpivot),
             _ => Vec::new(),
         };
 
@@ -245,6 +249,120 @@ impl<'a> Resolver<'a> {
             Expression::Star(_) => Some("*".to_string()),
             Expression::Identifier(id) => Some(id.name.clone()),
             _ => None,
+        }
+    }
+
+    fn get_pivot_output_columns(&self, pivot: &crate::expressions::Pivot) -> Vec<String> {
+        if pivot.unpivot {
+            return self.get_pivot_unpivot_output_columns(pivot);
+        }
+
+        let pre_columns = self.get_source_output_columns(&pivot.this);
+        if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
+            return Vec::new();
+        }
+
+        let excluded = pivot_excluded_source_columns(pivot, self.dialect);
+        let generated = pivot_generated_output_columns(pivot, self.dialect);
+        if excluded.is_empty() || generated.is_empty() {
+            return Vec::new();
+        }
+
+        let mut columns: Vec<String> = pre_columns
+            .into_iter()
+            .filter(|column| !excluded.contains(&normalize_column_name(column, self.dialect)))
+            .collect();
+        columns.extend(generated);
+        apply_alias_columns(columns, &pivot.alias_columns)
+    }
+
+    fn get_pivot_unpivot_output_columns(&self, pivot: &crate::expressions::Pivot) -> Vec<String> {
+        let pre_columns = self.get_source_output_columns(&pivot.this);
+        if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
+            return Vec::new();
+        }
+
+        let input_columns: HashSet<String> = pivot
+            .expressions
+            .iter()
+            .flat_map(expression_column_names)
+            .map(|column| normalize_column_name(&column, self.dialect))
+            .collect();
+        let mut columns: Vec<String> = pre_columns
+            .into_iter()
+            .filter(|column| !input_columns.contains(&normalize_column_name(column, self.dialect)))
+            .collect();
+
+        if let Some(Expression::UnpivotColumns(unpivot_columns)) = pivot.into.as_deref() {
+            if let Some(name) = expression_name(&unpivot_columns.this) {
+                columns.push(name);
+            }
+            for value_column in &unpivot_columns.expressions {
+                if let Some(name) = expression_name(value_column) {
+                    columns.push(name);
+                }
+            }
+        }
+
+        apply_alias_columns(columns, &pivot.alias_columns)
+    }
+
+    fn get_unpivot_output_columns(&self, unpivot: &crate::expressions::Unpivot) -> Vec<String> {
+        let pre_columns = self.get_source_output_columns(&unpivot.this);
+        if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
+            return Vec::new();
+        }
+
+        let input_columns: HashSet<String> = unpivot
+            .columns
+            .iter()
+            .flat_map(expression_column_names)
+            .map(|column| normalize_column_name(&column, self.dialect))
+            .collect();
+        let mut columns: Vec<String> = pre_columns
+            .into_iter()
+            .filter(|column| !input_columns.contains(&normalize_column_name(column, self.dialect)))
+            .collect();
+        columns.push(unpivot.name_column.name.clone());
+        columns.push(unpivot.value_column.name.clone());
+        columns.extend(
+            unpivot
+                .extra_value_columns
+                .iter()
+                .map(|column| column.name.clone()),
+        );
+        apply_alias_columns(columns, &unpivot.alias_columns)
+    }
+
+    fn get_source_output_columns(&self, source: &Expression) -> Vec<String> {
+        match source {
+            Expression::Table(table) => {
+                if table.schema.is_none() && table.catalog.is_none() {
+                    if let Some(source) = self.scope.cte_sources.get(&table.name.name) {
+                        return self.extract_columns_from_source(source).unwrap_or_default();
+                    }
+                }
+
+                let table_name = qualified_table_name(table);
+                self.schema.column_names(&table_name).unwrap_or_default()
+            }
+            Expression::Subquery(subquery) => self.get_named_selects(&subquery.this),
+            Expression::Select(select) => self.get_select_column_names(select),
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => self
+                .get_source_columns_from_set_op(source)
+                .unwrap_or_default(),
+            Expression::Cte(cte) => {
+                if cte.columns.is_empty() {
+                    self.get_named_selects(&cte.this)
+                } else {
+                    cte.columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect()
+                }
+            }
+            Expression::Paren(paren) => self.get_source_output_columns(&paren.this),
+            _ => Vec::new(),
         }
     }
 
@@ -411,6 +529,107 @@ impl<'a> Resolver<'a> {
 
 fn normalize_column_name(name: &str, dialect: Option<DialectType>) -> String {
     normalize_name(name, dialect, false, true)
+}
+
+fn apply_alias_columns(mut columns: Vec<String>, alias_columns: &[Identifier]) -> Vec<String> {
+    for (idx, alias) in alias_columns.iter().enumerate() {
+        if let Some(column) = columns.get_mut(idx) {
+            *column = alias.name.clone();
+        }
+    }
+    columns
+}
+
+fn pivot_excluded_source_columns(
+    pivot: &crate::expressions::Pivot,
+    dialect: Option<DialectType>,
+) -> HashSet<String> {
+    pivot
+        .fields
+        .iter()
+        .chain(pivot.expressions.iter())
+        .chain(pivot.using.iter())
+        .flat_map(expression_column_names)
+        .map(|column| normalize_column_name(&column, dialect))
+        .collect()
+}
+
+fn pivot_generated_output_columns(
+    pivot: &crate::expressions::Pivot,
+    _dialect: Option<DialectType>,
+) -> Vec<String> {
+    let fields = pivot_field_output_names(pivot);
+    let aggregations = if pivot.using.is_empty() {
+        &pivot.expressions
+    } else {
+        &pivot.using
+    };
+
+    if fields.is_empty() || aggregations.is_empty() {
+        return Vec::new();
+    }
+
+    let needs_suffix = aggregations.len() > 1;
+    let mut outputs = Vec::new();
+    for field in fields {
+        for aggregation in aggregations {
+            if let Some(suffix) = pivot_aggregation_output_suffix(aggregation, needs_suffix) {
+                outputs.push(format!("{field}_{suffix}"));
+            } else {
+                outputs.push(field.clone());
+            }
+        }
+    }
+    outputs
+}
+
+fn pivot_field_output_names(pivot: &crate::expressions::Pivot) -> Vec<String> {
+    pivot
+        .fields
+        .iter()
+        .filter_map(|field| match field {
+            Expression::In(in_expr) => Some(
+                in_expr
+                    .expressions
+                    .iter()
+                    .filter_map(expression_name)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn pivot_aggregation_output_suffix(expr: &Expression, needs_suffix: bool) -> Option<String> {
+    match expr {
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
+        _ if needs_suffix => Generator::sql(expr).ok().map(|sql| sql.to_lowercase()),
+        _ => None,
+    }
+}
+
+fn expression_name(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::PivotAlias(alias) => expression_name(&alias.alias),
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
+        Expression::Identifier(identifier) => Some(identifier.name.clone()),
+        Expression::Column(column) => Some(column.name.name.clone()),
+        Expression::Literal(literal) => Some(literal.value_str().to_string()),
+        Expression::Var(var) => Some(var.this.clone()),
+        Expression::Tuple(tuple) => tuple.expressions.first().and_then(expression_name),
+        _ => None,
+    }
+}
+
+fn expression_column_names(expr: &Expression) -> Vec<String> {
+    expr.find_all(|node| matches!(node, Expression::Column(_)))
+        .into_iter()
+        .filter_map(|node| match node {
+            Expression::Column(column) => Some(column.name.name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Resolve a column to its source table.

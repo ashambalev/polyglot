@@ -221,6 +221,19 @@ describe('Polyglot SDK', () => {
       expect(collectNames(result.lineage!)).toContain('sales.amt');
     });
 
+    it('should trace nested set operations inside derived tables', () => {
+      const result = lineage(
+        'v',
+        'SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u',
+        Dialect.DuckDB,
+      );
+
+      expect(result.success).toBe(true);
+      expect(collectNames(result.lineage!)).toEqual(
+        expect.arrayContaining(['t1.v', 't2.v', 't3.v']),
+      );
+    });
+
     it('should trace unpivot value columns to input columns', () => {
       const result = lineage(
         'val',
@@ -347,6 +360,31 @@ describe('Polyglot SDK', () => {
         index: 0,
         expandedColumns: ['id', 'amount'],
       });
+    });
+
+    it('should resolve PIVOT alias columns and generated outputs', () => {
+      const result = analyzeQuery(
+        "SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+        { dialect: Dialect.DuckDB },
+      );
+
+      expect(result.success).toBe(true);
+      const region = result.analysis?.projections.find(
+        (projection) => projection.name === 'region2',
+      );
+      expect(region?.upstream).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ table: 'sales', column: 'region' }),
+        ]),
+      );
+      const pivotValue = result.analysis?.projections.find(
+        (projection) => projection.name === 'p1',
+      );
+      expect(pivotValue?.upstream).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ table: 'sales', column: 'amt' }),
+        ]),
+      );
     });
 
     it('should accept a dialect shorthand argument', () => {

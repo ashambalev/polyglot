@@ -6,12 +6,14 @@
 //!
 
 use crate::dialects::DialectType;
-use crate::expressions::{Expression, Identifier, NamedWindow, Select};
+use crate::expressions::{Expression, Identifier, JoinKind, NamedWindow, Select};
+use crate::generator::Generator;
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
 use crate::schema::{normalize_name, Schema};
-use crate::scope::{build_scope, Scope, ScopeType, SourceInfo as ScopeSourceInfo, SourceKind};
-use crate::traversal::ExpressionWalk;
+use crate::scope::{
+    build_scope, find_all_in_scope, Scope, ScopeType, SourceInfo as ScopeSourceInfo, SourceKind,
+};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -686,6 +688,9 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
             Expression::Alias(a) if matches!(&a.this, Expression::Unnest(_)) => {
                 Some(virtual_source_info(&a.alias))
             }
+            Expression::Alias(a) if is_query_like_relation(&a.this) => {
+                Some(virtual_source_info(&a.alias))
+            }
             Expression::Lateral(lateral) => lateral.alias.as_deref().map(named_virtual_source_info),
             Expression::LateralView(lateral_view) => lateral_view
                 .table_alias
@@ -729,6 +734,9 @@ fn get_select_sources(select: &Select) -> Vec<SourceInfo> {
         }
     }
     for join in &select.joins {
+        if is_semi_or_anti_join_kind(join.kind) {
+            continue;
+        }
         if let Some(info) = extract_source(&join.this) {
             sources.push(info);
         }
@@ -838,10 +846,7 @@ fn to_node_inner(
 
     // 0. Unwrap CTE scope — CTE scope expressions are Expression::Cte(...)
     //    but we need the inner query (SELECT/UNION) for column lookup.
-    let effective_expr = match scope_expr {
-        Expression::Cte(cte) => &cte.this,
-        other => other,
-    };
+    let effective_expr = effective_scope_expression(scope_expr);
 
     // 1. Set operations (UNION / INTERSECT / EXCEPT)
     if matches!(
@@ -939,27 +944,23 @@ fn to_node_inner(
     }
 
     // 6. Subqueries in select — trace through scalar subqueries
-    let subqueries: Vec<&Expression> =
-        select_expr.find_all(|e| matches!(e, Expression::Subquery(sq) if sq.alias.is_none()));
-    for sq_expr in subqueries {
-        if let Expression::Subquery(sq) = sq_expr {
-            for sq_scope in &scope.subquery_scopes {
-                if sq_scope.expression == sq.this {
-                    if let Ok(child) = to_node_inner(
-                        ColumnRef::Index(0),
-                        sq_scope,
-                        dialect,
-                        &column_name,
-                        "",
-                        "",
-                        trim_selects,
-                        &descendant_cte_scopes,
-                        depth + 1,
-                    ) {
-                        node.downstream.push(child);
-                    }
-                    break;
+    for query in query_expressions_in_scope(&select_expr) {
+        for sq_scope in &scope.subquery_scopes {
+            if sq_scope.expression == *query {
+                if let Ok(child) = to_node_inner(
+                    ColumnRef::Index(0),
+                    sq_scope,
+                    dialect,
+                    &column_name,
+                    "",
+                    "",
+                    trim_selects,
+                    &descendant_cte_scopes,
+                    depth + 1,
+                ) {
+                    node.downstream.push(child);
                 }
+                break;
             }
         }
     }
@@ -982,6 +983,40 @@ fn to_node_inner(
                 depth,
             );
         } else {
+            if let Some(alias_expr) =
+                find_prior_select_alias_expr(effective_expr, &select_expr, col_name, dialect)
+            {
+                for alias_ref in
+                    find_column_refs_in_expr_with_select(&alias_expr, effective_expr, dialect)
+                {
+                    if let Some(ref table_id) = alias_ref.table {
+                        resolve_qualified_column(
+                            &mut node,
+                            scope,
+                            dialect,
+                            &table_id.name,
+                            &alias_ref.column,
+                            &column_name,
+                            trim_selects,
+                            &all_cte_scopes,
+                            depth,
+                        );
+                    } else {
+                        resolve_unqualified_column(
+                            &mut node,
+                            scope,
+                            dialect,
+                            &alias_ref.column,
+                            &column_name,
+                            trim_selects,
+                            &all_cte_scopes,
+                            depth,
+                        );
+                    }
+                }
+                continue;
+            }
+
             resolve_unqualified_column(
                 &mut node,
                 scope,
@@ -1004,6 +1039,51 @@ fn descendant_cte_scope_clones(all_cte_scopes: &[&Scope], current_scope: &Scope)
         .filter(|scope| scope.expression != current_scope.expression)
         .map(|scope| (*scope).clone())
         .collect()
+}
+
+fn effective_scope_expression(expr: &Expression) -> &Expression {
+    match expr {
+        Expression::Cte(cte) => effective_scope_expression(&cte.this),
+        Expression::Subquery(subquery) => effective_scope_expression(&subquery.this),
+        Expression::Paren(paren) => effective_scope_expression(&paren.this),
+        other => other,
+    }
+}
+
+fn query_expressions_in_scope(expr: &Expression) -> Vec<&Expression> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for node in find_all_in_scope(
+        expr,
+        |node| {
+            matches!(
+                node,
+                Expression::Subquery(subquery) if subquery.alias.is_none()
+            ) || matches!(
+                node,
+                Expression::Exists(_) | Expression::In(_) | Expression::Any(_) | Expression::All(_)
+            )
+        },
+        false,
+    ) {
+        let query = match node {
+            Expression::Subquery(subquery) if subquery.alias.is_none() => Some(&subquery.this),
+            Expression::Exists(exists) => Some(&exists.this),
+            Expression::In(in_expr) => in_expr.query.as_ref(),
+            Expression::Any(quantified) | Expression::All(quantified) => Some(&quantified.subquery),
+            _ => None,
+        };
+
+        if let Some(query) = query {
+            let key = query as *const Expression as usize;
+            if seen.insert(key) {
+                queries.push(query);
+            }
+        }
+    }
+
+    queries
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1300,7 @@ fn attach_pivot_dependencies(
         return false;
     }
 
-    let mapping = pivot_column_mapping(pivot, dialect);
+    let mapping = pivot_lineage_column_mapping(pivot, scope, dialect);
     let Some(input_columns) = mapping.get(&normalize_column_name(col_name, dialect)) else {
         if pivot_implicit_source_column(pivot, col_name) {
             let col_ref = SimpleColumnRef {
@@ -1291,40 +1371,180 @@ fn pivot_column_mapping(
     pivot: &crate::expressions::Pivot,
     dialect: Option<DialectType>,
 ) -> HashMap<String, Vec<SimpleColumnRef>> {
-    let fields = pivot_field_output_names(pivot);
-    if fields.is_empty() {
+    let aggregations = pivot_aggregation_expressions(pivot);
+    let output_columns = pivot_generated_output_columns(pivot, dialect);
+    if aggregations.is_empty() || output_columns.is_empty() {
         return HashMap::new();
     }
 
     let mut mapping = HashMap::new();
-    for (agg_index, agg) in pivot.expressions.iter().enumerate() {
+    for (agg_index, agg) in aggregations.iter().enumerate() {
         let input_columns = find_column_refs_in_expr(agg, dialect);
         if input_columns.is_empty() {
             continue;
         }
-        let agg_name = pivot_aggregation_name(agg);
-        for field in &fields {
-            let mut output_names = Vec::new();
-            if pivot.expressions.len() == 1 {
-                output_names.push(field.clone());
-            }
-            if let Some(agg_name) = &agg_name {
-                output_names.push(format!("{field}_{agg_name}"));
-                output_names.push(format!("{agg_name}_{field}"));
-            }
-            if pivot.expressions.len() > 1 && agg_name.is_none() {
-                output_names.push(format!("{}_{}", field, agg_index));
-            }
-
-            for output_name in output_names {
-                mapping.insert(
-                    normalize_column_name(&output_name, dialect),
-                    input_columns.clone(),
-                );
-            }
+        for col_index in (agg_index..output_columns.len()).step_by(aggregations.len()) {
+            mapping.insert(
+                normalize_column_name(&output_columns[col_index], dialect),
+                input_columns.clone(),
+            );
         }
     }
     mapping
+}
+
+fn pivot_lineage_column_mapping(
+    pivot: &crate::expressions::Pivot,
+    scope: &Scope,
+    dialect: Option<DialectType>,
+) -> HashMap<String, Vec<SimpleColumnRef>> {
+    let mut mapping = pivot_column_mapping(pivot, dialect);
+    let Some(pre_pivot_columns) = pre_pivot_output_columns(&pivot.this, scope) else {
+        return mapping;
+    };
+
+    let output_columns = pivot_output_columns(pivot, &pre_pivot_columns, dialect);
+    if output_columns.is_empty() {
+        return mapping;
+    }
+
+    let base_mapping = mapping.clone();
+    for (post_name, pre_name) in output_columns {
+        let normalized_pre = normalize_column_name(&pre_name, dialect);
+        let normalized_post = normalize_column_name(&post_name, dialect);
+
+        if let Some(input_columns) = base_mapping.get(&normalized_pre) {
+            mapping.insert(normalized_post, input_columns.clone());
+        } else {
+            mapping.insert(
+                normalized_post,
+                vec![SimpleColumnRef {
+                    table: None,
+                    column: pre_name,
+                }],
+            );
+        }
+    }
+
+    mapping
+}
+
+fn pre_pivot_output_columns(source: &Expression, scope: &Scope) -> Option<Vec<String>> {
+    match source {
+        Expression::Subquery(subquery) => known_output_columns(&subquery.this),
+        Expression::Table(table) if table.schema.is_none() && table.catalog.is_none() => scope
+            .cte_sources
+            .get(&table.name.name)
+            .and_then(|source| known_output_columns(&source.expression)),
+        Expression::Paren(paren) => pre_pivot_output_columns(&paren.this, scope),
+        _ => None,
+    }
+}
+
+fn known_output_columns(expression: &Expression) -> Option<Vec<String>> {
+    let expression = match expression {
+        Expression::Cte(cte) => &cte.this,
+        Expression::Subquery(subquery) => &subquery.this,
+        other => other,
+    };
+    let columns = crate::ast_transforms::get_output_column_names(expression);
+    if columns.is_empty() || columns.iter().any(|column| column == "*") {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn pivot_output_columns(
+    pivot: &crate::expressions::Pivot,
+    pre_pivot_columns: &[String],
+    dialect: Option<DialectType>,
+) -> Vec<(String, String)> {
+    let generated_outputs = pivot_generated_output_columns(pivot, dialect);
+    let excluded = pivot_excluded_source_columns(pivot, dialect);
+
+    if excluded.is_empty() || generated_outputs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pre_rename: Vec<String> = pre_pivot_columns
+        .iter()
+        .filter(|column| !excluded.contains(&normalize_column_name(column, dialect)))
+        .cloned()
+        .collect();
+    pre_rename.extend(generated_outputs);
+
+    let post_rename = if pivot.alias_columns.is_empty() {
+        pre_rename.clone()
+    } else {
+        let mut names: Vec<String> = pivot
+            .alias_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        names.extend(pre_rename.iter().skip(names.len()).cloned());
+        names
+    };
+
+    post_rename.into_iter().zip(pre_rename).collect()
+}
+
+fn pivot_excluded_source_columns(
+    pivot: &crate::expressions::Pivot,
+    dialect: Option<DialectType>,
+) -> HashSet<String> {
+    pivot
+        .fields
+        .iter()
+        .chain(pivot.expressions.iter())
+        .chain(pivot.using.iter())
+        .flat_map(|expr| find_column_refs_in_expr(expr, dialect))
+        .map(|column| normalize_column_name(&column.column, dialect))
+        .collect()
+}
+
+fn pivot_generated_output_columns(
+    pivot: &crate::expressions::Pivot,
+    _dialect: Option<DialectType>,
+) -> Vec<String> {
+    let fields = pivot_field_output_names(pivot);
+    if fields.is_empty() {
+        return Vec::new();
+    }
+
+    let aggregations = pivot_aggregation_expressions(pivot);
+    if aggregations.is_empty() {
+        return Vec::new();
+    }
+
+    let needs_suffix = aggregations.len() > 1;
+    let mut outputs = Vec::new();
+    for field in fields {
+        for aggregation in aggregations {
+            if let Some(suffix) = pivot_aggregation_output_suffix(aggregation, needs_suffix) {
+                outputs.push(format!("{field}_{suffix}"));
+            } else {
+                outputs.push(field.clone());
+            }
+        }
+    }
+    outputs
+}
+
+fn pivot_aggregation_expressions(pivot: &crate::expressions::Pivot) -> &[Expression] {
+    if pivot.using.is_empty() {
+        &pivot.expressions
+    } else {
+        &pivot.using
+    }
+}
+
+fn pivot_aggregation_output_suffix(expr: &Expression, needs_suffix: bool) -> Option<String> {
+    match expr {
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
+        _ if needs_suffix => Generator::sql(expr).ok().map(|sql| sql.to_lowercase()),
+        _ => None,
+    }
 }
 
 fn pivot_field_output_names(pivot: &crate::expressions::Pivot) -> Vec<String> {
@@ -1339,13 +1559,6 @@ fn pivot_field_output_names(pivot: &crate::expressions::Pivot) -> Vec<String> {
         }
     }
     names
-}
-
-fn pivot_aggregation_name(expr: &Expression) -> Option<String> {
-    match expr {
-        Expression::Alias(alias) => Some(alias.alias.name.clone()),
-        _ => get_alias_or_name(expr),
-    }
 }
 
 fn pivot_expr_output_name(expr: &Expression) -> Option<String> {
@@ -1830,6 +2043,9 @@ fn source_names_from_from_join(scope: &Scope) -> Vec<String> {
             Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
                 Some(alias.alias.name.clone())
             }
+            Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
+                Some(alias.alias.name.clone())
+            }
             Expression::Lateral(lateral) => lateral.alias.clone(),
             Expression::LateralView(lateral_view) => lateral_view
                 .table_alias
@@ -1868,6 +2084,9 @@ fn source_names_from_from_join(scope: &Scope) -> Vec<String> {
             }
         }
         for join in &select.joins {
+            if is_semi_or_anti_join_kind(join.kind) {
+                continue;
+            }
             if let Some(name) = source_name(&join.this) {
                 if !name.is_empty() && seen.insert(name.clone()) {
                     names.push(name);
@@ -1886,6 +2105,47 @@ fn source_names_from_from_join(scope: &Scope) -> Vec<String> {
     }
 
     names
+}
+
+fn is_semi_or_anti_join_kind(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::Semi
+            | JoinKind::Anti
+            | JoinKind::LeftSemi
+            | JoinKind::LeftAnti
+            | JoinKind::RightSemi
+            | JoinKind::RightAnti
+    )
+}
+
+fn is_query_like_relation(expr: &Expression) -> bool {
+    match expr {
+        Expression::Select(_)
+        | Expression::Subquery(_)
+        | Expression::Union(_)
+        | Expression::Intersect(_)
+        | Expression::Except(_) => true,
+        Expression::Paren(paren) => is_query_like_relation(&paren.this),
+        _ => false,
+    }
+}
+
+fn derived_source_query(expr: &Expression) -> Option<&Expression> {
+    match expr {
+        Expression::Subquery(subquery) => Some(&subquery.this),
+        Expression::Alias(alias) if is_query_like_relation(&alias.this) => Some(&alias.this),
+        Expression::Select(_)
+        | Expression::Union(_)
+        | Expression::Intersect(_)
+        | Expression::Except(_) => Some(expr),
+        Expression::Paren(paren) => derived_source_query(&paren.this),
+        _ => None,
+    }
+}
+
+fn expressions_equivalent_after_wrappers(left: &Expression, right: &Expression) -> bool {
+    left == right || effective_scope_expression(left) == effective_scope_expression(right)
 }
 
 fn non_virtual_source_names_from_from_join(scope: &Scope) -> Vec<String> {
@@ -1916,6 +2176,32 @@ fn get_alias_or_name(expr: &Expression) -> Option<String> {
         Expression::Annotated(a) => get_alias_or_name(&a.this),
         _ => None,
     }
+}
+
+fn find_prior_select_alias_expr(
+    scope_expr: &Expression,
+    target_expr: &Expression,
+    alias_name: &str,
+    dialect: Option<DialectType>,
+) -> Option<Expression> {
+    let Expression::Select(select) = scope_expr else {
+        return None;
+    };
+
+    let normalized_alias = normalize_column_name(alias_name, dialect);
+    for expr in &select.expressions {
+        if expr == target_expr {
+            return None;
+        }
+
+        if let Expression::Alias(alias) = expr {
+            if normalize_column_name(&alias.alias.name, dialect) == normalized_alias {
+                return Some(alias.this.clone());
+            }
+        }
+    }
+
+    None
 }
 
 /// Resolve the display name for a column reference.
@@ -2079,6 +2365,9 @@ fn column_to_index(
             Expression::Union(u) => expr = &u.left,
             Expression::Intersect(i) => expr = &i.left,
             Expression::Except(e) => expr = &e.left,
+            Expression::Subquery(subquery) => expr = &subquery.this,
+            Expression::Cte(cte) => expr = &cte.this,
+            Expression::Paren(paren) => expr = &paren.this,
             Expression::Select(select) => {
                 for (i, e) in select.expressions.iter().enumerate() {
                     if let Some(alias_or_name) = get_alias_or_name(e) {
@@ -2139,9 +2428,9 @@ fn find_child_scope<'a>(scope: &'a Scope, source_name: &str) -> Option<&'a Scope
     // Check derived table scopes
     if let Some(source_info) = scope.sources.get(source_name) {
         if source_info.is_scope && !scope.cte_sources.contains_key(source_name) {
-            if let Expression::Subquery(sq) = &source_info.expression {
+            if let Some(query) = derived_source_query(&source_info.expression) {
                 for dt_scope in &scope.derived_table_scopes {
-                    if dt_scope.expression == sq.this {
+                    if expressions_equivalent_after_wrappers(&dt_scope.expression, query) {
                         return Some(dt_scope);
                     }
                 }
@@ -2181,9 +2470,9 @@ fn find_child_scope_in<'a>(
     // Fall back to derived table scopes
     if let Some(source_info) = scope.sources.get(source_name) {
         if source_info.is_scope {
-            if let Expression::Subquery(sq) = &source_info.expression {
+            if let Some(query) = derived_source_query(&source_info.expression) {
                 for dt_scope in &scope.derived_table_scopes {
-                    if dt_scope.expression == sq.this {
+                    if expressions_equivalent_after_wrappers(&dt_scope.expression, query) {
                         return Some(dt_scope);
                     }
                 }
@@ -5269,6 +5558,52 @@ LEFT JOIN import_orders AS o ON u.id = o.user_id"#;
     }
 
     #[test]
+    fn test_lineage_scalar_subqueries_inside_expression_wrappers() {
+        for sql in [
+            "WITH c AS (SELECT a, b FROM t) \
+             SELECT CASE WHEN c.a > 0 THEN c.b ELSE (SELECT MAX(z) FROM o) END AS r FROM c",
+            "WITH c AS (SELECT a FROM t) \
+             SELECT COALESCE(c.a, (SELECT MAX(z) FROM o)) AS r FROM c",
+            "WITH c AS (SELECT a FROM t) \
+             SELECT CAST((SELECT MAX(z) FROM o) AS INT) + c.a AS r FROM c",
+            "WITH c AS (SELECT a FROM t) \
+             SELECT CASE WHEN c.a BETWEEN 0 AND (SELECT MAX(z) FROM o) THEN c.a END AS r FROM c",
+        ] {
+            let expr = parse_dialect(sql, DialectType::DuckDB);
+            let node = lineage("r", &expr, Some(DialectType::DuckDB), false)
+                .unwrap_or_else(|error| panic!("lineage failed for {sql}: {error}"));
+
+            assert_lineage_contains(&node, "o.z");
+            assert_lineage_contains(&node, "t.a");
+        }
+    }
+
+    #[test]
+    fn test_lineage_nested_set_operation_inside_derived_table() {
+        let expr = parse_dialect(
+            "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) \
+             UNION ALL SELECT v FROM t3) u",
+            DialectType::DuckDB,
+        );
+        let node = lineage("v", &expr, Some(DialectType::DuckDB), false).unwrap();
+
+        assert_lineage_contains(&node, "t1.v");
+        assert_lineage_contains(&node, "t2.v");
+        assert_lineage_contains(&node, "t3.v");
+    }
+
+    #[test]
+    fn test_lineage_select_alias_reference_resolves_to_alias_source() {
+        let expr = parse_dialect(
+            "WITH c AS (SELECT x FROM t) SELECT c.x AS a, a + 1 AS b FROM c",
+            DialectType::DuckDB,
+        );
+        let node = lineage("b", &expr, Some(DialectType::DuckDB), false).unwrap();
+
+        assert_lineage_contains(&node, "t.x");
+    }
+
+    #[test]
     fn test_lineage_pivot_output_resolves_aggregation_input() {
         let expr = parse_dialect(
             "SELECT * FROM (SELECT region, q, amt FROM sales) \
@@ -5278,6 +5613,33 @@ LEFT JOIN import_orders AS o ON u.id = o.user_id"#;
         let node = lineage("q1", &expr, Some(DialectType::DuckDB), false).unwrap();
 
         assert_lineage_contains(&node, "sales.amt");
+    }
+
+    #[test]
+    fn test_lineage_pivot_multi_aggregate_and_alias_columns() {
+        let multi = parse_dialect(
+            "SELECT * FROM (SELECT category, value, price FROM t) \
+             PIVOT(SUM(value) AS value_sum, MAX(price) FOR category IN ('a' AS cat_a, 'b'))",
+            DialectType::DuckDB,
+        );
+        let value_sum =
+            lineage("cat_a_value_sum", &multi, Some(DialectType::DuckDB), false).unwrap();
+        assert_lineage_contains(&value_sum, "t.value");
+
+        let max_price =
+            lineage("cat_a_max(price)", &multi, Some(DialectType::DuckDB), false).unwrap();
+        assert_lineage_contains(&max_price, "t.price");
+
+        let aliased = parse_dialect(
+            "SELECT * FROM (SELECT region, q, amt FROM sales) \
+             PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+            DialectType::DuckDB,
+        );
+        let region = lineage("region2", &aliased, Some(DialectType::DuckDB), false).unwrap();
+        assert_lineage_contains(&region, "sales.region");
+
+        let pivot_value = lineage("p1", &aliased, Some(DialectType::DuckDB), false).unwrap();
+        assert_lineage_contains(&pivot_value, "sales.amt");
     }
 
     #[test]
@@ -5346,6 +5708,17 @@ LEFT JOIN import_orders AS o ON u.id = o.user_id"#;
 
         assert_lineage_contains(&node, "t1.x");
         assert_lineage_contains(&node, "t2.x");
+    }
+
+    #[test]
+    fn test_lineage_star_excludes_semi_join_rhs_source() {
+        let expr = parse_dialect(
+            "SELECT * FROM orders LEFT SEMI JOIN customers ON orders.customer_id = customers.id",
+            DialectType::DuckDB,
+        );
+        let node = lineage("customer_id", &expr, Some(DialectType::DuckDB), false).unwrap();
+
+        assert_lineage_contains(&node, "orders.customer_id");
     }
 
     // --- Comment handling tests (ported from sqlglot test_lineage.py) ---

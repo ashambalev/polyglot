@@ -88,6 +88,15 @@ func collectLineageNames(node LineageNode) []string {
 	return names
 }
 
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func TestIntegrationExplicitOpenAndLifecycle(t *testing.T) {
 	path := integrationLibraryPath(t)
 
@@ -336,6 +345,48 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	if len(analysis.StarProjections) != 1 || len(analysis.StarProjections[0].ExpandedColumns) != 2 {
 		t.Fatalf("unexpected AnalyzeQuery star projections: %#v", analysis.StarProjections)
 	}
+
+	analysis, err = client.AnalyzeQuery(
+		"SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+		AnalyzeQueryOptions{Dialect: "duckdb"},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery with pivot alias columns: %v", err)
+	}
+	var regionProjection *ProjectionFact
+	var pivotProjection *ProjectionFact
+	for idx := range analysis.Projections {
+		projection := &analysis.Projections[idx]
+		if projection.Name != nil && *projection.Name == "region2" {
+			regionProjection = projection
+		}
+		if projection.Name != nil && *projection.Name == "p1" {
+			pivotProjection = projection
+		}
+	}
+	if regionProjection == nil || pivotProjection == nil {
+		t.Fatalf("missing AnalyzeQuery pivot projections: %#v", analysis.Projections)
+	}
+	hasRegion := false
+	for _, upstream := range regionProjection.Upstream {
+		if upstream.Table != nil && *upstream.Table == "sales" && upstream.Column == "region" {
+			hasRegion = true
+			break
+		}
+	}
+	if !hasRegion {
+		t.Fatalf("unexpected AnalyzeQuery region upstream: %#v", regionProjection.Upstream)
+	}
+	hasPivotInput := false
+	for _, upstream := range pivotProjection.Upstream {
+		if upstream.Table != nil && *upstream.Table == "sales" && upstream.Column == "amt" {
+			hasPivotInput = true
+			break
+		}
+	}
+	if !hasPivotInput {
+		t.Fatalf("unexpected AnalyzeQuery pivot upstream: %#v", pivotProjection.Upstream)
+	}
 }
 
 func TestIntegrationLineageAndOpenLineage(t *testing.T) {
@@ -367,6 +418,19 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 	}
 	if !hasBaseColumn {
 		t.Fatalf("expected t.x in CTE star lineage, got %#v", cteNames)
+	}
+
+	setNode, err := client.Lineage(
+		"v",
+		"SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u",
+		"duckdb",
+	)
+	if err != nil {
+		t.Fatalf("nested set operation Lineage: %v", err)
+	}
+	setNames := collectLineageNames(setNode)
+	if !containsString(setNames, "t1.v") || !containsString(setNames, "t2.v") || !containsString(setNames, "t3.v") {
+		t.Fatalf("expected nested set operation input columns in lineage, got %#v", setNames)
 	}
 
 	bigQueryNode, err := client.Lineage(

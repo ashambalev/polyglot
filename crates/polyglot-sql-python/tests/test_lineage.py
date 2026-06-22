@@ -46,6 +46,19 @@ def test_lineage_window_over_columns():
     assert "events.ts" in names
 
 
+def test_lineage_nested_set_operation_inside_derived_table():
+    sql = (
+        "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) "
+        "UNION ALL SELECT v FROM t3) u"
+    )
+    result = polyglot_sql.lineage("v", sql, dialect="duckdb")
+
+    names = collect_names(result)
+    assert "t1.v" in names
+    assert "t2.v" in names
+    assert "t3.v" in names
+
+
 def test_source_tables_returns_orders():
     sql = "SELECT o.total FROM orders o JOIN users u ON o.user_id = u.id"
     tables = polyglot_sql.source_tables("total", sql, dialect="postgres")

@@ -23391,6 +23391,7 @@ impl Generator {
             self.write_keyword("AS");
             self.write_space();
             self.generate_identifier(alias)?;
+            self.generate_alias_column_list(&pivot.alias_columns)?;
         }
 
         Ok(())
@@ -23442,7 +23443,24 @@ impl Generator {
             self.write_keyword("AS");
             self.write_space();
             self.generate_identifier(alias)?;
+            self.generate_alias_column_list(&unpivot.alias_columns)?;
         }
+        Ok(())
+    }
+
+    fn generate_alias_column_list(&mut self, columns: &[Identifier]) -> Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+
+        self.write("(");
+        for (i, column) in columns.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_identifier(column)?;
+        }
+        self.write(")");
         Ok(())
     }
 

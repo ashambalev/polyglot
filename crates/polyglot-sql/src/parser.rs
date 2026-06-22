@@ -5883,10 +5883,12 @@ impl Parser {
                             }
                             Expression::Pivot(mut p) => {
                                 p.alias = Some(make_alias_ident(alias));
+                                p.alias_columns = aliases;
                                 Expression::Pivot(p)
                             }
                             Expression::Unpivot(mut u) => {
                                 u.alias = Some(make_alias_ident(alias));
+                                u.alias_columns = aliases;
                                 Expression::Unpivot(u)
                             }
                             Expression::MatchRecognize(mut mr) => {
@@ -5937,10 +5939,12 @@ impl Parser {
                         }
                         Expression::Pivot(mut p) => {
                             p.alias = Some(make_alias_ident(alias));
+                            p.alias_columns = default_column_aliases;
                             Expression::Pivot(p)
                         }
                         Expression::Unpivot(mut u) => {
                             u.alias = Some(make_alias_ident(alias));
+                            u.alias_columns = default_column_aliases;
                             Expression::Unpivot(u)
                         }
                         Expression::MatchRecognize(mut mr) => {
@@ -6052,10 +6056,12 @@ impl Parser {
                 }
                 Expression::Pivot(mut p) => {
                     p.alias = Some(make_alias_ident(alias));
+                    p.alias_columns = column_aliases;
                     Expression::Pivot(p)
                 }
                 Expression::Unpivot(mut u) => {
                     u.alias = Some(make_alias_ident(alias));
+                    u.alias_columns = column_aliases;
                     Expression::Unpivot(u)
                 }
                 Expression::MatchRecognize(mut mr) => {
@@ -6273,9 +6279,16 @@ impl Parser {
         if matches!(&expr, Expression::Pivot(_) | Expression::Unpivot(_)) {
             if self.match_token(TokenType::As) {
                 let alias = self.expect_identifier_or_alias_keyword_with_quoted()?;
+                let alias_columns = self.parse_alias_column_list_if_present()?;
                 match &mut expr {
-                    Expression::Pivot(p) => p.alias = Some(alias),
-                    Expression::Unpivot(u) => u.alias = Some(alias),
+                    Expression::Pivot(p) => {
+                        p.alias = Some(alias);
+                        p.alias_columns = alias_columns;
+                    }
+                    Expression::Unpivot(u) => {
+                        u.alias = Some(alias);
+                        u.alias_columns = alias_columns;
+                    }
                     _ => {}
                 }
             } else if !self.check_keyword()
@@ -6287,9 +6300,16 @@ impl Parser {
                 } else {
                     Identifier::new(tok.text.clone())
                 };
+                let alias_columns = self.parse_alias_column_list_if_present()?;
                 match &mut expr {
-                    Expression::Pivot(p) => p.alias = Some(alias),
-                    Expression::Unpivot(u) => u.alias = Some(alias),
+                    Expression::Pivot(p) => {
+                        p.alias = Some(alias);
+                        p.alias_columns = alias_columns;
+                    }
+                    Expression::Unpivot(u) => {
+                        u.alias = Some(alias);
+                        u.alias_columns = alias_columns;
+                    }
                     _ => {}
                 }
             }
@@ -6592,6 +6612,7 @@ impl Parser {
             unpivot: false,
             into: None,
             alias: None,
+            alias_columns: Vec::new(),
             include_nulls: None,
             default_on_null,
             with: None,
@@ -6794,6 +6815,7 @@ impl Parser {
             name_column,
             columns,
             alias: None,
+            alias_columns: Vec::new(),
             value_column_parenthesized,
             include_nulls,
             extra_value_columns,
@@ -6846,6 +6868,7 @@ impl Parser {
             unpivot: true,
             into: None,
             alias,
+            alias_columns: Vec::new(),
             include_nulls: None,
             default_on_null: None,
             with: None,
@@ -57100,6 +57123,7 @@ impl Parser {
             unpivot: is_unpivot,
             into: into.map(Box::new),
             alias: None,
+            alias_columns: Vec::new(),
             include_nulls: None,
             default_on_null: None,
             with: None,
@@ -57809,6 +57833,25 @@ impl Parser {
         }
 
         Ok(None)
+    }
+
+    fn parse_alias_column_list_if_present(&mut self) -> Result<Vec<Identifier>> {
+        if !self.match_token(TokenType::LParen) {
+            return Ok(Vec::new());
+        }
+
+        let mut columns = Vec::new();
+        loop {
+            if self.check(TokenType::RParen) {
+                break;
+            }
+            columns.push(self.expect_identifier_or_keyword_with_quoted()?);
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenType::RParen)?;
+        Ok(columns)
     }
 
     /// parse_substring - Ported from Python _parse_substring

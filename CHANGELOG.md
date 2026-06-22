@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.8] - 2026-06-22
+
+### Added
+- Regression coverage for nested set-operation derived table lineage, scalar
+  subqueries inside expression wrappers, same-select alias references,
+  pivot/unpivot alias columns, and semi/anti join source inference across Rust
+  core, C FFI, WASM/TypeScript, Python, and Go.
+
+### Fixed
+- Lineage now registers aliased query-like derived relations such as nested
+  `UNION` expressions in `FROM`, so output columns trace back to each physical
+  source table instead of stopping at the derived relation.
+- Scalar subqueries wrapped in expressions such as `CASE`, `COALESCE`, `CAST`,
+  `BETWEEN`, `IN`, `ANY`, `ALL`, and `EXISTS` now contribute their source-column
+  lineage.
+- Same-select alias references now resolve through earlier projection
+  expressions before column qualification, avoiding unresolved or incorrect
+  physical-column attribution.
+- Pivot and unpivot lineage now preserves alias column lists and maps renamed or
+  generated outputs back to implicit source columns and aggregate input columns.
+- Star and source inference now ignores semi/anti join right-hand inputs,
+  preventing non-output join sources from making schema-less star lineage
+  ambiguous.
+
 ## [0.5.7] - 2026-06-19
 
 ### Added

@@ -4118,6 +4118,9 @@ pub struct Pivot {
     /// Optional alias
     #[serde(default)]
     pub alias: Option<Identifier>,
+    /// Optional output column aliases from `PIVOT(...) AS alias(col1, col2, ...)`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alias_columns: Vec<Identifier>,
     /// Include/exclude nulls (for UNPIVOT)
     #[serde(default)]
     pub include_nulls: Option<bool>,
@@ -4138,6 +4141,9 @@ pub struct Unpivot {
     pub name_column: Identifier,
     pub columns: Vec<Expression>,
     pub alias: Option<Identifier>,
+    /// Optional output column aliases from `UNPIVOT(...) AS alias(col1, col2, ...)`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alias_columns: Vec<Identifier>,
     /// Whether the value_column was parenthesized in the original SQL
     #[serde(default)]
     pub value_column_parenthesized: bool,

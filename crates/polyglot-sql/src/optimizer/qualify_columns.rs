@@ -8,8 +8,8 @@
 use crate::dialects::transform_recursive;
 use crate::dialects::DialectType;
 use crate::expressions::{
-    Alias, BinaryOp, Column, Expression, Identifier, Join, LateralView, Literal, Over, Paren,
-    Select, TableRef, VarArgFunc, With,
+    Alias, BinaryOp, Column, Expression, Identifier, Join, JoinKind, LateralView, Literal, Over,
+    Paren, Select, TableRef, VarArgFunc, With,
 };
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
@@ -149,7 +149,15 @@ pub fn qualify_columns(
                     HashMap::new()
                 };
 
-                // 2. Qualify columns (add table qualifiers)
+                // 2. Expand alias references before qualification so same-select
+                // aliases do not get treated as unresolved physical columns.
+                if first_error.borrow().is_none() && options.expand_alias_refs {
+                    if let Err(err) = expand_alias_refs(&mut select, &mut resolver, dialect) {
+                        *first_error.borrow_mut() = Some(err);
+                    }
+                }
+
+                // 3. Qualify columns (add table qualifiers)
                 if first_error.borrow().is_none() {
                     if let Err(err) = qualify_columns_in_scope(
                         &mut select,
@@ -157,13 +165,6 @@ pub fn qualify_columns(
                         &mut resolver,
                         options.allow_partial_qualification,
                     ) {
-                        *first_error.borrow_mut() = Some(err);
-                    }
-                }
-
-                // 3. Expand alias references
-                if first_error.borrow().is_none() && options.expand_alias_refs {
-                    if let Err(err) = expand_alias_refs(&mut select, &mut resolver, dialect) {
                         *first_error.borrow_mut() = Some(err);
                     }
                 }
@@ -254,7 +255,36 @@ fn get_source_name(expr: &Expression) -> Option<String> {
                 .unwrap_or_else(|| t.name.name.clone()),
         ),
         Expression::Subquery(sq) => sq.alias.as_ref().map(|a| a.name.clone()),
+        Expression::Pivot(pivot) => Some(pivot_source_name(
+            &pivot.this,
+            pivot.alias.as_ref().map(|alias| alias.name.as_str()),
+        )),
+        Expression::Unpivot(unpivot) => Some(pivot_source_name(
+            &unpivot.this,
+            unpivot.alias.as_ref().map(|alias| alias.name.as_str()),
+        )),
         _ => None,
+    }
+}
+
+fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> String {
+    if let Some(alias) = explicit_alias {
+        return alias.to_string();
+    }
+
+    match source {
+        Expression::Table(table) => table
+            .alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .unwrap_or_else(|| table.name.name.clone()),
+        Expression::Subquery(subquery) => subquery
+            .alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .unwrap_or_else(|| "_0".to_string()),
+        Expression::Paren(paren) => pivot_source_name(&paren.this, explicit_alias),
+        _ => "_0".to_string(),
     }
 }
 
@@ -270,11 +300,26 @@ fn get_ordered_source_names(select: &Select) -> Vec<String> {
         }
     }
     for join in &select.joins {
+        if is_semi_or_anti_join_kind(join.kind) {
+            continue;
+        }
         if let Some(name) = get_source_name(&join.this) {
             ordered.push(name);
         }
     }
     ordered
+}
+
+fn is_semi_or_anti_join_kind(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::Semi
+            | JoinKind::Anti
+            | JoinKind::LeftSemi
+            | JoinKind::LeftAnti
+            | JoinKind::RightSemi
+            | JoinKind::RightAnti
+    )
 }
 
 /// Create a COALESCE expression over qualified columns from the given tables.

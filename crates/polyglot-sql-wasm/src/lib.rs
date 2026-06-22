@@ -3291,6 +3291,26 @@ mod tests {
     }
 
     #[test]
+    fn test_lineage_nested_set_operation_inside_derived_table() {
+        let result = lineage_sql(
+            "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u",
+            "v",
+            "duckdb",
+            false,
+        );
+        assert!(result.contains("\"success\":true"), "Result: {}", result);
+        let result: serde_json::Value = serde_json::from_str(&result).expect("valid wrapper json");
+        let lineage = result["lineage"].as_object().expect("lineage object");
+        let names = collect_lineage_names(&serde_json::Value::Object(lineage.clone()));
+        assert!(
+            names.iter().any(|name| name == "t1.v")
+                && names.iter().any(|name| name == "t2.v")
+                && names.iter().any(|name| name == "t3.v"),
+            "expected set operation source columns in lineage names, got {names:?}"
+        );
+    }
+
+    #[test]
     fn test_lineage_bigquery_unnest_virtual_source_metadata() {
         let result = lineage_sql(
             "SELECT date_val AS week_start FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS date_val",
@@ -3536,6 +3556,34 @@ mod tests {
             parsed["analysis"]["starProjections"][0]["expandedColumns"][1],
             "amount"
         );
+
+        let result = analyze_query(
+            "SELECT region2, p1 FROM (SELECT region, q, amt FROM sales) PIVOT(SUM(amt) FOR q IN ('Q1')) AS p(region2, p1)",
+            r#"{"dialect":"duckdb"}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["success"], true);
+        let projections = parsed["analysis"]["projections"]
+            .as_array()
+            .expect("projections array");
+        let region = projections
+            .iter()
+            .find(|projection| projection["name"] == "region2")
+            .expect("region2 projection");
+        assert!(region["upstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| { reference["table"] == "sales" && reference["column"] == "region" }));
+        let pivot_value = projections
+            .iter()
+            .find(|projection| projection["name"] == "p1")
+            .expect("p1 projection");
+        assert!(pivot_value["upstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| reference["table"] == "sales" && reference["column"] == "amt"));
     }
 
     #[test]
