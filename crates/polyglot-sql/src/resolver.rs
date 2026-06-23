@@ -173,7 +173,14 @@ impl<'a> Resolver<'a> {
 
     /// Extract column names from a source expression
     fn extract_columns_from_source(&self, source_info: &SourceInfo) -> ResolverResult<Vec<String>> {
-        let columns = match &source_info.expression {
+        self.get_source_columns_for_expression(&source_info.expression)
+    }
+
+    fn get_source_columns_for_expression(
+        &self,
+        expression: &Expression,
+    ) -> ResolverResult<Vec<String>> {
+        let columns = match expression {
             Expression::Table(table) => {
                 // For tables, try to get columns from schema.
                 // Build the fully qualified name (catalog.schema.table) to
@@ -211,6 +218,17 @@ impl<'a> Resolver<'a> {
             }
             Expression::Pivot(pivot) => self.get_pivot_output_columns(pivot),
             Expression::Unpivot(unpivot) => self.get_unpivot_output_columns(unpivot),
+            Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
+                alias_output_columns(alias)
+            }
+            Expression::Alias(alias) => {
+                let columns = self.get_source_columns_for_expression(&alias.this)?;
+                apply_alias_columns(columns, &alias.column_aliases)
+            }
+            Expression::Unnest(unnest) => unnest_output_columns(unnest),
+            Expression::Lateral(lateral) => lateral_output_columns(lateral),
+            Expression::LateralView(lateral_view) => lateral_view_output_columns(lateral_view),
+            Expression::Paren(paren) => self.get_source_columns_for_expression(&paren.this)?,
             _ => Vec::new(),
         };
 
@@ -228,6 +246,11 @@ impl<'a> Resolver<'a> {
             Expression::Intersect(intersect) => self.get_named_selects(&intersect.left),
             Expression::Except(except) => self.get_named_selects(&except.left),
             Expression::Subquery(subquery) => self.get_named_selects(&subquery.this),
+            Expression::Alias(alias) => {
+                let columns = self.get_named_selects(&alias.this);
+                apply_alias_columns(columns, &alias.column_aliases)
+            }
+            Expression::Paren(paren) => self.get_named_selects(&paren.this),
             _ => Vec::new(),
         }
     }
@@ -351,6 +374,16 @@ impl<'a> Resolver<'a> {
             Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => self
                 .get_source_columns_from_set_op(source)
                 .unwrap_or_default(),
+            Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
+                alias_output_columns(alias)
+            }
+            Expression::Alias(alias) => {
+                let columns = self.get_source_output_columns(&alias.this);
+                apply_alias_columns(columns, &alias.column_aliases)
+            }
+            Expression::Unnest(unnest) => unnest_output_columns(unnest),
+            Expression::Lateral(lateral) => lateral_output_columns(lateral),
+            Expression::LateralView(lateral_view) => lateral_view_output_columns(lateral_view),
             Expression::Cte(cte) => {
                 if cte.columns.is_empty() {
                     self.get_named_selects(&cte.this)
@@ -383,6 +416,11 @@ impl<'a> Resolver<'a> {
                     Ok(self.get_named_selects(&subquery.this))
                 }
             }
+            Expression::Alias(alias) => {
+                let columns = self.get_source_columns_from_set_op(&alias.this)?;
+                Ok(apply_alias_columns(columns, &alias.column_aliases))
+            }
+            Expression::Paren(paren) => self.get_source_columns_from_set_op(&paren.this),
             Expression::Union(union) => {
                 // Standard UNION: columns come from the left side
                 self.get_source_columns_from_set_op(&union.left)
@@ -538,6 +576,59 @@ fn apply_alias_columns(mut columns: Vec<String>, alias_columns: &[Identifier]) -
         }
     }
     columns
+}
+
+fn unnest_output_columns(unnest: &crate::expressions::UnnestFunc) -> Vec<String> {
+    unnest
+        .alias
+        .iter()
+        .map(|alias| alias.name.clone())
+        .chain(unnest.offset_alias.iter().map(|alias| alias.name.clone()))
+        .collect()
+}
+
+fn alias_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
+    if alias.column_aliases.is_empty() {
+        vec![alias.alias.name.clone()]
+    } else {
+        alias
+            .column_aliases
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+}
+
+fn lateral_output_columns(lateral: &crate::expressions::Lateral) -> Vec<String> {
+    if lateral.column_aliases.is_empty() {
+        default_virtual_output_columns(&lateral.this)
+    } else {
+        lateral.column_aliases.clone()
+    }
+}
+
+fn lateral_view_output_columns(lateral_view: &crate::expressions::LateralView) -> Vec<String> {
+    lateral_view
+        .column_aliases
+        .iter()
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+fn default_virtual_output_columns(expression: &Expression) -> Vec<String> {
+    match expression {
+        Expression::Unnest(unnest) => unnest_output_columns(unnest),
+        Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
+            alias_output_columns(alias)
+        }
+        Expression::Function(function) if function.name.eq_ignore_ascii_case("FLATTEN") => {
+            ["seq", "key", "path", "index", "value", "this"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn pivot_excluded_source_columns(

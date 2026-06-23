@@ -609,6 +609,32 @@ fn analyze_query_reports_base_tables_inside_derived_table_set_operation() {
         .any(|relation| relation.name == "u" && relation.kind == SourceKind::DerivedTable));
 }
 
+fn single_column_schema(table_names: &[&str], column_name: &str) -> ValidationSchema {
+    let tables: Vec<_> = table_names
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "columns": [{"name": column_name, "type": "INT"}]
+            })
+        })
+        .collect();
+
+    serde_json::from_value(json!({ "tables": tables })).unwrap()
+}
+
+fn unnest_analysis_schema() -> ValidationSchema {
+    serde_json::from_value(json!({
+        "tables": [
+            {
+                "name": "t",
+                "columns": [{"name": "arr", "type": "INT"}]
+            }
+        ]
+    }))
+    .unwrap()
+}
+
 #[test]
 fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
     let analysis = analyze_query(
@@ -616,7 +642,7 @@ fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
          UNION ALL SELECT v FROM t3) u",
         AnalyzeQueryOptions {
             dialect: DialectType::DuckDB,
-            schema: None,
+            schema: Some(single_column_schema(&["t1", "t2", "t3"], "v")),
         },
     )
     .unwrap();
@@ -636,6 +662,78 @@ fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
         .map(|relation| relation.name.as_str())
         .collect();
     assert_eq!(base_table_names, vec!["t1", "t2", "t3"]);
+}
+
+#[test]
+fn analyze_query_resolves_mixed_nested_set_operation_arm_inside_derived_table() {
+    let analysis = analyze_query(
+        "SELECT v FROM (SELECT v FROM t0 UNION ALL \
+         (SELECT v FROM t1 UNION ALL SELECT v FROM t2)) u",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(single_column_schema(&["t0", "t1", "t2"], "v")),
+        },
+    )
+    .unwrap();
+
+    let upstream_tables: Vec<_> = analysis.projections[0]
+        .upstream
+        .iter()
+        .filter_map(|reference| reference.table.as_deref())
+        .collect();
+    assert!(upstream_tables.contains(&"t0"));
+    assert!(upstream_tables.contains(&"t1"));
+    assert!(upstream_tables.contains(&"t2"));
+}
+
+#[test]
+fn analyze_query_resolves_nested_set_operation_inside_cte_with_schema() {
+    let analysis = analyze_query(
+        "WITH c AS (SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) \
+         UNION ALL SELECT v FROM t3) u) SELECT v FROM c",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(single_column_schema(&["t1", "t2", "t3"], "v")),
+        },
+    )
+    .unwrap();
+
+    let upstream_tables: Vec<_> = analysis.projections[0]
+        .upstream
+        .iter()
+        .filter_map(|reference| reference.table.as_deref())
+        .collect();
+    assert!(upstream_tables.contains(&"t1"));
+    assert!(upstream_tables.contains(&"t2"));
+    assert!(upstream_tables.contains(&"t3"));
+}
+
+#[test]
+fn analyze_query_resolves_unnest_virtual_output_aliases_with_schema() {
+    for sql in [
+        "SELECT i FROM t, UNNEST(t.arr) AS i",
+        "SELECT i FROM t, UNNEST(t.arr) AS u(i)",
+        "SELECT u.i FROM t, UNNEST(t.arr) AS u(i)",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(unnest_analysis_schema()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+
+        assert!(
+            analysis.projections[0]
+                .upstream
+                .iter()
+                .any(|reference| reference.table.as_deref() == Some("t")
+                    && reference.column == "arr"),
+            "expected t.arr upstream for {sql:?}, got {:?}",
+            analysis.projections[0].upstream
+        );
+    }
 }
 
 #[test]

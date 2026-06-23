@@ -148,6 +148,46 @@ def test_analyze_query_resolves_pivot_alias_columns():
     )
 
 
+def test_analyze_query_resolves_nested_set_operation_with_schema():
+    result = polyglot_sql.analyze_query(
+        "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) "
+        "UNION ALL SELECT v FROM t3) u",
+        {
+            "dialect": "duckdb",
+            "schema": {
+                "tables": [
+                    {"name": "t1", "columns": [{"name": "v", "type": "INT"}]},
+                    {"name": "t2", "columns": [{"name": "v", "type": "INT"}]},
+                    {"name": "t3", "columns": [{"name": "v", "type": "INT"}]},
+                ]
+            },
+        },
+    )
+
+    upstream = result["projections"][0]["upstream"]
+    assert {reference["table"] for reference in upstream} == {"t1", "t2", "t3"}
+
+
+def test_analyze_query_resolves_unnest_output_alias_with_schema():
+    result = polyglot_sql.analyze_query(
+        "SELECT i FROM t, UNNEST(t.arr) AS i",
+        {
+            "dialect": "duckdb",
+            "schema": {
+                "tables": [
+                    {"name": "t", "columns": [{"name": "arr", "type": "INT"}]},
+                ]
+            },
+        },
+    )
+
+    upstream = result["projections"][0]["upstream"]
+    assert any(
+        reference["table"] == "t" and reference["column"] == "arr"
+        for reference in upstream
+    )
+
+
 def test_analyze_query_unknown_dialect_raises_value_error():
     with pytest.raises(ValueError):
         polyglot_sql.analyze_query("SELECT 1", dialect="not_a_dialect")

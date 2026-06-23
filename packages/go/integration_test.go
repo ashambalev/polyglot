@@ -97,6 +97,15 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
+func hasUpstream(values []ColumnReferenceFact, table string, column string) bool {
+	for _, value := range values {
+		if value.Table != nil && *value.Table == table && value.Column == column {
+			return true
+		}
+	}
+	return false
+}
+
 func TestIntegrationExplicitOpenAndLifecycle(t *testing.T) {
 	path := integrationLibraryPath(t)
 
@@ -386,6 +395,43 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 	}
 	if !hasPivotInput {
 		t.Fatalf("unexpected AnalyzeQuery pivot upstream: %#v", pivotProjection.Upstream)
+	}
+
+	setSchema := ValidationSchema{
+		Tables: []SchemaTable{
+			{Name: "t1", Columns: []SchemaColumn{{Name: "v", Type: "INT"}}},
+			{Name: "t2", Columns: []SchemaColumn{{Name: "v", Type: "INT"}}},
+			{Name: "t3", Columns: []SchemaColumn{{Name: "v", Type: "INT"}}},
+		},
+	}
+	analysis, err = client.AnalyzeQuery(
+		"SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u",
+		AnalyzeQueryOptions{Dialect: "duckdb", Schema: &setSchema},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery nested set operation with schema: %v", err)
+	}
+	setUpstream := analysis.Projections[0].Upstream
+	if !hasUpstream(setUpstream, "t1", "v") ||
+		!hasUpstream(setUpstream, "t2", "v") ||
+		!hasUpstream(setUpstream, "t3", "v") {
+		t.Fatalf("unexpected AnalyzeQuery nested set upstream: %#v", setUpstream)
+	}
+
+	unnestSchema := ValidationSchema{
+		Tables: []SchemaTable{
+			{Name: "t", Columns: []SchemaColumn{{Name: "arr", Type: "INT"}}},
+		},
+	}
+	analysis, err = client.AnalyzeQuery(
+		"SELECT i FROM t, UNNEST(t.arr) AS i",
+		AnalyzeQueryOptions{Dialect: "duckdb", Schema: &unnestSchema},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery UNNEST output alias with schema: %v", err)
+	}
+	if !hasUpstream(analysis.Projections[0].Upstream, "t", "arr") {
+		t.Fatalf("unexpected AnalyzeQuery UNNEST upstream: %#v", analysis.Projections[0].Upstream)
 	}
 }
 

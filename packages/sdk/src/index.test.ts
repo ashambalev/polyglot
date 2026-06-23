@@ -387,6 +387,49 @@ describe('Polyglot SDK', () => {
       );
     });
 
+    it('should resolve nested set operation derived table with schema', () => {
+      const result = analyzeQuery(
+        'SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u',
+        {
+          dialect: Dialect.DuckDB,
+          schema: {
+            tables: [
+              { name: 't1', columns: [{ name: 'v', type: 'INT' }] },
+              { name: 't2', columns: [{ name: 'v', type: 'INT' }] },
+              { name: 't3', columns: [{ name: 'v', type: 'INT' }] },
+            ],
+          },
+        },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.projections[0].upstream).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ table: 't1', column: 'v' }),
+          expect.objectContaining({ table: 't2', column: 'v' }),
+          expect.objectContaining({ table: 't3', column: 'v' }),
+        ]),
+      );
+    });
+
+    it('should resolve UNNEST output alias with schema', () => {
+      const result = analyzeQuery('SELECT i FROM t, UNNEST(t.arr) AS i', {
+        dialect: Dialect.DuckDB,
+        schema: {
+          tables: [
+            { name: 't', columns: [{ name: 'arr', type: 'INT' }] },
+          ],
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.analysis?.projections[0].upstream).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ table: 't', column: 'arr' }),
+        ]),
+      );
+    });
+
     it('should accept a dialect shorthand argument', () => {
       const result = analyzeQuery('SELECT 1', Dialect.DuckDB);
 

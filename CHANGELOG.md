@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.9] - 2026-06-23
+
+### Added
+- Regression coverage for schema-backed `analyze_query` lineage through nested
+  set-operation derived tables, CTEs, and `UNNEST` output aliases across Rust
+  core, C FFI, WASM/TypeScript, Python, and Go.
+
+### Fixed
+- `analyze_query` now resolves aliased and parenthesized query-like sources when
+  deriving source output columns, so schema-backed nested `UNION` / `INTERSECT`
+  / `EXCEPT` relations can still trace projections back to their physical input
+  columns.
+- `analyze_query` now recognizes `UNNEST`, lateral, and lateral-view virtual
+  output aliases during schema-backed qualification, including both relation
+  aliases and explicit output column aliases such as `UNNEST(t.arr) AS u(i)`.
+
 ## [0.5.8] - 2026-06-22
 
 ### Added

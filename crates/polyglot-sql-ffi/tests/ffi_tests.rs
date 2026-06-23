@@ -951,6 +951,49 @@ fn test_analyze_query_pivot_alias_columns() {
 }
 
 #[test]
+fn test_analyze_query_nested_set_and_unnest_with_schema() {
+    let sql = c(
+        "SELECT v FROM ((SELECT v FROM t1 UNION ALL SELECT v FROM t2) UNION ALL SELECT v FROM t3) u",
+    );
+    let options = c(
+        r#"{"dialect":"duckdb","schema":{"tables":[{"name":"t1","columns":[{"name":"v","type":"INT"}]},{"name":"t2","columns":[{"name":"v","type":"INT"}]},{"name":"t3","columns":[{"name":"v","type":"INT"}]}]}}"#,
+    );
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let analysis: Value =
+        serde_json::from_str(&data.expect("missing analyze_query payload")).expect("invalid json");
+    let upstream = analysis["projections"][0]["upstream"]
+        .as_array()
+        .expect("upstream array");
+    assert!(upstream
+        .iter()
+        .any(|reference| reference["table"] == "t1" && reference["column"] == "v"));
+    assert!(upstream
+        .iter()
+        .any(|reference| reference["table"] == "t2" && reference["column"] == "v"));
+    assert!(upstream
+        .iter()
+        .any(|reference| reference["table"] == "t3" && reference["column"] == "v"));
+
+    let sql = c("SELECT i FROM t, UNNEST(t.arr) AS i");
+    let options = c(
+        r#"{"dialect":"duckdb","schema":{"tables":[{"name":"t","columns":[{"name":"arr","type":"INT"}]}]}}"#,
+    );
+    let (status, data, error) =
+        consume_result(polyglot_analyze_query(sql.as_ptr(), options.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let analysis: Value =
+        serde_json::from_str(&data.expect("missing analyze_query payload")).expect("invalid json");
+    let upstream = analysis["projections"][0]["upstream"]
+        .as_array()
+        .expect("upstream array");
+    assert!(upstream
+        .iter()
+        .any(|reference| reference["table"] == "t" && reference["column"] == "arr"));
+}
+
+#[test]
 fn test_analyze_query_invalid_options_json() {
     let sql = c("SELECT 1");
     let options = c("{not json}");
