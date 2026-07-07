@@ -141,6 +141,14 @@ fn postgres_positional_parameters_render_as_tsql_style_placeholders() {
 }
 
 #[test]
+fn postgres_positional_parameters_render_as_tsql_style_placeholders_in_predicates() {
+    assert_eq!(
+        pg_to_tsql("SELECT id FROM t WHERE a = $1 AND b < $2"),
+        "SELECT id FROM t WHERE a = @P1 AND b < @P2"
+    );
+}
+
+#[test]
 fn tsql_datepart_dayofweek_generates_valid_tsql_datepart() {
     let cases = [
         ("WEEKDAY", "WEEKDAY"),

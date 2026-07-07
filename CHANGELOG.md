@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.14] - 2026-07-07
+
+### Added
+- Regression coverage for PostgreSQL positional bind parameters inside
+  T-SQL/Fabric predicate expressions, ensuring `$1`, `$2`, ... are rendered as
+  executable `@P1`, `@P2`, ... placeholders outside simple projection lists.
+
+### Fixed
+- PostgreSQL `$n` positional bind parameters now render as T-SQL/Fabric
+  `@Pn` placeholders instead of invalid `$n` syntax when transpiling to those
+  dialects.
+
 ## [0.5.13] - 2026-07-04
 
 ### Added
