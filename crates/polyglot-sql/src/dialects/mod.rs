@@ -4185,6 +4185,7 @@ impl Dialect {
             feature = "dialect-starrocks",
             feature = "dialect-oracle",
             feature = "dialect-clickhouse",
+            feature = "dialect-fabric",
         ))]
         use crate::transforms;
 
@@ -4256,6 +4257,16 @@ impl Dialect {
                 let expr = transforms::unnest_generate_date_array_using_recursive_cte(expr)?;
                 let expr = transforms::move_ctes_to_top_level(expr)?;
                 let expr = transforms::qualify_derived_table_outputs(expr)?;
+                Ok(expr)
+            }
+            // Fabric shares T-SQL predicate rules: BIT values cannot be used as
+            // bare conditions in WHERE/HAVING/ON/CASE WHEN contexts. Keep this
+            // branch scoped to boolean coercion so Fabric-specific APPLY and
+            // derived-table output behavior does not inherit unrelated T-SQL
+            // preprocessing.
+            #[cfg(feature = "dialect-fabric")]
+            DialectType::Fabric => {
+                let expr = transforms::ensure_bools(expr)?;
                 Ok(expr)
             }
             // Spark doesn't support QUALIFY (but Databricks does)
@@ -5003,6 +5014,15 @@ impl Dialect {
                 if Self::node_is_function_named(node, "TO_TSVECTOR") {
                     Self::push_unsupported_diagnostic(&mut diagnostics, "PostgreSQL TO_TSVECTOR");
                 }
+                if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    if let Some(function_name) = Self::postgres_tsql_unsupported_function_name(node)
+                    {
+                        Self::push_unsupported_diagnostic(
+                            &mut diagnostics,
+                            &format!("PostgreSQL {function_name}"),
+                        );
+                    }
+                }
                 if matches!(target, DialectType::TSQL | DialectType::Fabric)
                     && Self::node_is_postgres_type_function_cast(node)
                 {
@@ -5180,6 +5200,46 @@ impl Dialect {
             Expression::Function(function) => function.name.eq_ignore_ascii_case(name),
             Expression::AggregateFunction(function) => function.name.eq_ignore_ascii_case(name),
             _ => false,
+        }
+    }
+
+    fn postgres_tsql_unsupported_function_name(expr: &Expression) -> Option<&'static str> {
+        match expr {
+            Expression::Lpad(_) => Some("LPAD"),
+            Expression::Rpad(_) => Some("RPAD"),
+            Expression::SplitPart(_) => Some("SPLIT_PART"),
+            Expression::Initcap(_) => Some("INITCAP"),
+            Expression::ToJson(_) => Some("TO_JSON"),
+            Expression::JSONBObjectAgg(_) => Some("JSONB_OBJECT_AGG"),
+            Expression::Function(function) => {
+                Self::postgres_tsql_unsupported_function_name_str(&function.name)
+            }
+            Expression::AggregateFunction(function) => {
+                Self::postgres_tsql_unsupported_function_name_str(&function.name)
+            }
+            _ => None,
+        }
+    }
+
+    fn postgres_tsql_unsupported_function_name_str(name: &str) -> Option<&'static str> {
+        if name.eq_ignore_ascii_case("LPAD") {
+            Some("LPAD")
+        } else if name.eq_ignore_ascii_case("RPAD") {
+            Some("RPAD")
+        } else if name.eq_ignore_ascii_case("SPLIT_PART") {
+            Some("SPLIT_PART")
+        } else if name.eq_ignore_ascii_case("INITCAP") {
+            Some("INITCAP")
+        } else if name.eq_ignore_ascii_case("TO_JSON") {
+            Some("TO_JSON")
+        } else if name.eq_ignore_ascii_case("TO_JSONB") {
+            Some("TO_JSONB")
+        } else if name.eq_ignore_ascii_case("JSONB_AGG") {
+            Some("JSONB_AGG")
+        } else if name.eq_ignore_ascii_case("JSONB_OBJECT_AGG") {
+            Some("JSONB_OBJECT_AGG")
+        } else {
+            None
         }
     }
 
@@ -5689,20 +5749,21 @@ impl Dialect {
     }
 
     fn tsql_boolean_value_case(predicate: Expression) -> Expression {
-        Expression::Case(Box::new(crate::expressions::Case {
+        let case = Expression::Case(Box::new(crate::expressions::Case {
             operand: None,
-            whens: vec![
-                (predicate.clone(), Expression::number(1)),
-                (
-                    Expression::Not(Box::new(crate::expressions::UnaryOp {
-                        this: predicate,
-                        inferred_type: None,
-                    })),
-                    Expression::number(0),
-                ),
-            ],
-            else_: None,
+            whens: vec![(predicate, Expression::number(1))],
+            else_: Some(Expression::number(0)),
             comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        Expression::Cast(Box::new(Cast {
+            this: case,
+            to: DataType::Boolean,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
             inferred_type: None,
         }))
     }

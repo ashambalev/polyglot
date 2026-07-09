@@ -526,23 +526,23 @@ fn postgres_scalar_boolean_values_map_to_fabric_case_values() {
     let cases = [
         (
             "SELECT (l_quantity > 30) AS b FROM tpch.lineitem",
-            "SELECT CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END AS b FROM tpch.lineitem",
+            "SELECT CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT) AS b FROM tpch.lineitem",
         ),
         (
             "SELECT COUNT(*) AS c FROM tpch.lineitem GROUP BY (l_quantity > 30)",
-            "SELECT COUNT_BIG(*) AS c FROM tpch.lineitem GROUP BY CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END",
+            "SELECT COUNT_BIG(*) AS c FROM tpch.lineitem GROUP BY CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT)",
         ),
         (
             "SELECT (l_quantity > 30) AS b, COUNT(*) AS c FROM tpch.lineitem WHERE l_orderkey < 1000 GROUP BY (l_quantity > 30) ORDER BY b",
-            "SELECT CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END AS b, COUNT_BIG(*) AS c FROM tpch.lineitem WHERE l_orderkey < 1000 GROUP BY CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END ORDER BY CASE WHEN b IS NULL THEN 1 ELSE 0 END, b",
+            "SELECT CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT) AS b, COUNT_BIG(*) AS c FROM tpch.lineitem WHERE l_orderkey < 1000 GROUP BY CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT) ORDER BY CASE WHEN b IS NULL THEN 1 ELSE 0 END, b",
         ),
         (
             "SELECT l_quantity FROM tpch.lineitem ORDER BY (l_quantity > 30)",
-            "SELECT l_quantity FROM tpch.lineitem ORDER BY CASE WHEN CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END IS NULL THEN 1 ELSE 0 END, CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END",
+            "SELECT l_quantity FROM tpch.lineitem ORDER BY CASE WHEN CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT) IS NULL THEN 1 ELSE 0 END, CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT)",
         ),
         (
             "SELECT COUNT(*) OVER (PARTITION BY (l_quantity > 30)) AS c FROM tpch.lineitem",
-            "SELECT COUNT_BIG(*) OVER (PARTITION BY CASE WHEN (l_quantity > 30) THEN 1 WHEN NOT (l_quantity > 30) THEN 0 END) AS c FROM tpch.lineitem",
+            "SELECT COUNT_BIG(*) OVER (PARTITION BY CAST(CASE WHEN (l_quantity > 30) THEN 1 ELSE 0 END AS BIT)) AS c FROM tpch.lineitem",
         ),
     ];
 
@@ -787,7 +787,7 @@ fn date_minus_interval_with_precision_rewrites_to_dateadd() {
         pg_to_fabric("SELECT l_shipdate <= DATE '1998-12-01' - INTERVAL '3' DAY (3) FROM lineitem");
     assert_eq!(
         out,
-        "SELECT CASE WHEN l_shipdate <= DATEADD(DAY, -3, CAST('1998-12-01' AS DATE)) THEN 1 WHEN NOT l_shipdate <= DATEADD(DAY, -3, CAST('1998-12-01' AS DATE)) THEN 0 END FROM lineitem"
+        "SELECT CAST(CASE WHEN l_shipdate <= DATEADD(DAY, -3, CAST('1998-12-01' AS DATE)) THEN 1 ELSE 0 END AS BIT) FROM lineitem"
     );
 }
 
@@ -798,7 +798,7 @@ fn date_minus_interval_placeholder_rewrites_to_unquoted_dateadd_amount() {
     );
     assert_eq!(
         out,
-        "SELECT CASE WHEN l_shipdate <= DATEADD(DAY, -:1, CAST('1998-12-01' AS DATE)) THEN 1 WHEN NOT l_shipdate <= DATEADD(DAY, -:1, CAST('1998-12-01' AS DATE)) THEN 0 END FROM lineitem"
+        "SELECT CAST(CASE WHEN l_shipdate <= DATEADD(DAY, -:1, CAST('1998-12-01' AS DATE)) THEN 1 ELSE 0 END AS BIT) FROM lineitem"
     );
 }
 

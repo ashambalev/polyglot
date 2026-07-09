@@ -250,24 +250,24 @@ fn polyglot_transpile_expected<'a>(
     }
 
     // SQLGlot keeps several projected predicates as scalar booleans for T-SQL.
-    // Polyglot intentionally emits CASE values because T-SQL has no scalar
-    // boolean result type.
+    // Polyglot intentionally emits definite BIT values because T-SQL has no
+    // scalar boolean result type.
     match (sql, expected) {
         (
             "SELECT IS_ASCII(x)",
             "SELECT (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0)",
-        ) => "SELECT CASE WHEN (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0) THEN 1 WHEN NOT (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0) THEN 0 END",
+        ) => "SELECT CAST(CASE WHEN (PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, x) = 0) THEN 1 ELSE 0 END AS BIT)",
         ("SELECT x BETWEEN 2 AND 10", "SELECT x BETWEEN 2 AND 10") => {
-            "SELECT CASE WHEN x BETWEEN 2 AND 10 THEN 1 WHEN NOT x BETWEEN 2 AND 10 THEN 0 END"
+            "SELECT CAST(CASE WHEN x BETWEEN 2 AND 10 THEN 1 ELSE 0 END AS BIT)"
         }
         (
             "SELECT x BETWEEN SYMMETRIC 10 AND 2",
             "SELECT (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10)",
-        ) => "SELECT CASE WHEN (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10) THEN 1 WHEN NOT (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10) THEN 0 END",
+        ) => "SELECT CAST(CASE WHEN (x BETWEEN 10 AND 2 OR x BETWEEN 2 AND 10) THEN 1 ELSE 0 END AS BIT)",
         (
             "SELECT x BETWEEN ASYMMETRIC 10 AND 2",
             "SELECT x BETWEEN 10 AND 2",
-        ) => "SELECT CASE WHEN x BETWEEN 10 AND 2 THEN 1 WHEN NOT x BETWEEN 10 AND 2 THEN 0 END",
+        ) => "SELECT CAST(CASE WHEN x BETWEEN 10 AND 2 THEN 1 ELSE 0 END AS BIT)",
         _ => expected,
     }
 }

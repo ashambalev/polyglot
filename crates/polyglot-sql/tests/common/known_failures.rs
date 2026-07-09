@@ -219,5 +219,12 @@ pub fn transpilation_known_failures(source: &str, target: &str) -> HashSet<Strin
         failures.insert("generic->tsql:201".to_string());
     }
 
+    if source == "tsql" && target == "tsql" {
+        // SQLGlot renders `a IS NOT FALSE` as `NOT a = 0`, which drops NULL
+        // rows in predicate contexts. Polyglot intentionally emits the
+        // NULL-preserving T-SQL truth table instead.
+        failures.insert("tsql->tsql:80".to_string());
+    }
+
     failures
 }

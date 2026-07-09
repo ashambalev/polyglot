@@ -4,6 +4,51 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.15] - 2026-07-09
+
+### Added
+- Regression coverage for PostgreSQL-only scalar and JSON functions when
+  targeting T-SQL/Fabric strict mode, including `LPAD`, `RPAD`, `SPLIT_PART`,
+  `INITCAP`, `TO_JSON`, `TO_JSONB`, `JSONB_AGG`, and `JSONB_OBJECT_AGG`.
+- Regression coverage for PostgreSQL `SELECT DISTINCT ... ORDER BY` null
+  ordering when targeting T-SQL/Fabric, including selected expressions,
+  selected aliases, target-default null ordering, and unsupported unselected
+  expressions.
+- Regression coverage for PostgreSQL boolean tests targeting T-SQL/Fabric,
+  including `IS TRUE`, `IS FALSE`, `IS NOT TRUE`, `IS NOT FALSE`, and
+  `IS UNKNOWN` in predicate and scalar-value contexts.
+- Regression coverage for bare boolean predicates targeting T-SQL/Fabric in
+  `WHERE`, `HAVING`, `CASE WHEN`, `JOIN ... ON`, nested subqueries, and CTE
+  bodies.
+- Regression coverage for unsupported `EXCEPT ALL` and `INTERSECT ALL` when
+  targeting T-SQL/Fabric strict mode.
+- Regression coverage for PostgreSQL positional `ORDER BY` ordinals targeting
+  T-SQL/Fabric, including standalone selects and wrapped set operations.
+
+### Fixed
+- Strict PostgreSQL-to-T-SQL/Fabric transpilation now rejects known
+  PostgreSQL-only scalar and JSON functions instead of returning target SQL
+  that the destination dialect cannot execute.
+- `SELECT DISTINCT ... ORDER BY` with emulated null ordering now generates a
+  valid T-SQL/Fabric wrapper query that projects stable internal sort keys,
+  avoiding invalid `ORDER BY` expressions that are not present in the
+  `DISTINCT` select list.
+- PostgreSQL boolean tests now preserve three-valued logic when transpiling to
+  T-SQL/Fabric: negated `IS TRUE` / `IS FALSE` predicates retain `NULL` rows,
+  scalar boolean-test outputs are materialized as definite `BIT` values, and
+  predicate operands are not compared directly to integer literals.
+- Fabric now applies the same bare boolean predicate coercion as T-SQL, and
+  the boolean coercion transform now reaches `JOIN ... ON`, nested subqueries,
+  CTE bodies, and set-operation branches without inheriting unrelated T-SQL
+  preprocessing behavior.
+- T-SQL/Fabric strict mode now rejects `EXCEPT ALL` and `INTERSECT ALL` as
+  unsupported duplicate-preserving set operations while keeping plain
+  `EXCEPT` and `INTERSECT` valid.
+- Positional `ORDER BY` ordinals targeting T-SQL/Fabric no longer produce
+  invalid constant null-ordering CASE expressions such as
+  `CASE WHEN 1 IS NULL ...`; default mode preserves the ordinal and strict mode
+  reports unsupported positional null-ordering simulation.
+
 ## [0.5.14] - 2026-07-07
 
 ### Added

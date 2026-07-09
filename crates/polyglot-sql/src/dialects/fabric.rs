@@ -48,6 +48,8 @@ impl DialectImpl for FabricDialect {
             null_ordering_supported: false,
             aggregate_filter_supported: false,
             cte_recursive_keyword_required: false,
+            ensure_bools: true,
+            except_intersect_support_all_clause: false,
             ..Default::default()
         }
     }

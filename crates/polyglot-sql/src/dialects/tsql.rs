@@ -194,66 +194,11 @@ impl DialectImpl for TSQLDialect {
             // ===== Data Type Mappings =====
             Expression::DataType(dt) => self.transform_data_type(dt),
 
-            // ===== Boolean IS TRUE/FALSE -> = 1/0 for TSQL =====
-            // TSQL doesn't have IS TRUE/IS FALSE syntax
-            Expression::IsTrue(it) => {
-                let one = Expression::Literal(Box::new(crate::expressions::Literal::Number(
-                    "1".to_string(),
-                )));
-                if it.not {
-                    // a IS NOT TRUE -> NOT a = 1
-                    Ok(Expression::Not(Box::new(crate::expressions::UnaryOp {
-                        this: Expression::Eq(Box::new(crate::expressions::BinaryOp {
-                            left: it.this,
-                            right: one,
-                            left_comments: vec![],
-                            operator_comments: vec![],
-                            trailing_comments: vec![],
-                            inferred_type: None,
-                        })),
-                        inferred_type: None,
-                    })))
-                } else {
-                    // a IS TRUE -> a = 1
-                    Ok(Expression::Eq(Box::new(crate::expressions::BinaryOp {
-                        left: it.this,
-                        right: one,
-                        left_comments: vec![],
-                        operator_comments: vec![],
-                        trailing_comments: vec![],
-                        inferred_type: None,
-                    })))
-                }
-            }
-            Expression::IsFalse(it) => {
-                let zero = Expression::Literal(Box::new(crate::expressions::Literal::Number(
-                    "0".to_string(),
-                )));
-                if it.not {
-                    // a IS NOT FALSE -> NOT a = 0
-                    Ok(Expression::Not(Box::new(crate::expressions::UnaryOp {
-                        this: Expression::Eq(Box::new(crate::expressions::BinaryOp {
-                            left: it.this,
-                            right: zero,
-                            left_comments: vec![],
-                            operator_comments: vec![],
-                            trailing_comments: vec![],
-                            inferred_type: None,
-                        })),
-                        inferred_type: None,
-                    })))
-                } else {
-                    // a IS FALSE -> a = 0
-                    Ok(Expression::Eq(Box::new(crate::expressions::BinaryOp {
-                        left: it.this,
-                        right: zero,
-                        left_comments: vec![],
-                        operator_comments: vec![],
-                        trailing_comments: vec![],
-                        inferred_type: None,
-                    })))
-                }
-            }
+            // ===== Boolean IS TRUE/FALSE -> T-SQL 3VL truth table =====
+            // T-SQL doesn't have IS TRUE/IS FALSE syntax. Negated forms must
+            // explicitly preserve UNKNOWN/NULL rows instead of using NOT (x = n).
+            Expression::IsTrue(it) => Ok(Self::boolean_test_predicate(it.this, true, it.not)),
+            Expression::IsFalse(it) => Ok(Self::boolean_test_predicate(it.this, false, it.not)),
 
             // Note: CASE WHEN boolean conditions are handled in ensure_bools preprocessing
 
@@ -684,6 +629,138 @@ impl DialectImpl for TSQLDialect {
 
 #[cfg(feature = "transpile")]
 impl TSQLDialect {
+    fn binary(
+        left: Expression,
+        right: Expression,
+        op: fn(Box<BinaryOp>) -> Expression,
+    ) -> Expression {
+        op(Box::new(BinaryOp {
+            left,
+            right,
+            left_comments: Vec::new(),
+            operator_comments: Vec::new(),
+            trailing_comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn eq(left: Expression, right: Expression) -> Expression {
+        Self::binary(left, right, Expression::Eq)
+    }
+
+    fn or(left: Expression, right: Expression) -> Expression {
+        Self::binary(left, right, Expression::Or)
+    }
+
+    fn not(this: Expression) -> Expression {
+        Expression::Not(Box::new(crate::expressions::UnaryOp {
+            this,
+            inferred_type: None,
+        }))
+    }
+
+    fn is_null(this: Expression) -> Expression {
+        Expression::IsNull(Box::new(crate::expressions::IsNull {
+            this,
+            not: false,
+            postfix_form: false,
+        }))
+    }
+
+    fn boolean_test_case_for_predicate(
+        predicate: Expression,
+        test_true: bool,
+        negated: bool,
+    ) -> Expression {
+        let condition = match (test_true, negated) {
+            (true, false) => predicate,
+            (false, false) => Self::not(predicate),
+            (true, true) => {
+                return Expression::Case(Box::new(crate::expressions::Case {
+                    operand: None,
+                    whens: vec![(predicate, Expression::number(0))],
+                    else_: Some(Expression::number(1)),
+                    comments: Vec::new(),
+                    inferred_type: None,
+                }))
+            }
+            (false, true) => {
+                return Expression::Case(Box::new(crate::expressions::Case {
+                    operand: None,
+                    whens: vec![(Self::not(predicate), Expression::number(0))],
+                    else_: Some(Expression::number(1)),
+                    comments: Vec::new(),
+                    inferred_type: None,
+                }))
+            }
+        };
+
+        Expression::Case(Box::new(crate::expressions::Case {
+            operand: None,
+            whens: vec![(condition, Expression::number(1))],
+            else_: Some(Expression::number(0)),
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn boolean_test_predicate(operand: Expression, test_true: bool, negated: bool) -> Expression {
+        if Self::is_boolean_predicate_operand(&operand) {
+            return match (test_true, negated) {
+                (true, false) => operand,
+                (false, false) => Self::not(operand),
+                _ => Self::eq(
+                    Self::boolean_test_case_for_predicate(operand, test_true, negated),
+                    Expression::number(1),
+                ),
+            };
+        }
+
+        match (test_true, negated) {
+            (true, false) => Self::eq(operand, Expression::number(1)),
+            (false, false) => Self::eq(operand, Expression::number(0)),
+            (true, true) => Self::or(
+                Self::eq(operand.clone(), Expression::number(0)),
+                Self::is_null(operand),
+            ),
+            (false, true) => Self::or(
+                Self::eq(operand.clone(), Expression::number(1)),
+                Self::is_null(operand),
+            ),
+        }
+    }
+
+    fn is_boolean_predicate_operand(expr: &Expression) -> bool {
+        match expr {
+            Expression::Paren(paren) => Self::is_boolean_predicate_operand(&paren.this),
+            Expression::Eq(_)
+            | Expression::Neq(_)
+            | Expression::Lt(_)
+            | Expression::Lte(_)
+            | Expression::Gt(_)
+            | Expression::Gte(_)
+            | Expression::Is(_)
+            | Expression::IsNull(_)
+            | Expression::IsTrue(_)
+            | Expression::IsFalse(_)
+            | Expression::Like(_)
+            | Expression::ILike(_)
+            | Expression::SimilarTo(_)
+            | Expression::Glob(_)
+            | Expression::RegexpLike(_)
+            | Expression::In(_)
+            | Expression::Between(_)
+            | Expression::Exists(_)
+            | Expression::And(_)
+            | Expression::Or(_)
+            | Expression::Not(_)
+            | Expression::Any(_)
+            | Expression::All(_)
+            | Expression::EqualNull(_) => true,
+            _ => false,
+        }
+    }
+
     fn scalar_array_comparison_values(expr: &Expression) -> Option<Vec<Expression>> {
         let (mut values, element_type) = Self::scalar_array_comparison_values_inner(expr)?;
         if let Some(to) = element_type {

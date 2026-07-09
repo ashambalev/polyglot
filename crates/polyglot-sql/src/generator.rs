@@ -4064,8 +4064,265 @@ impl Generator {
         }
     }
 
+    fn should_handle_tsql_distinct_null_ordering(&self, select: &Select) -> bool {
+        matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) && !self.config.null_ordering_supported
+            && select.distinct
+            && select.order_by.as_ref().is_some_and(|order_by| {
+                order_by
+                    .expressions
+                    .iter()
+                    .any(Self::ordered_requires_tsql_null_ordering_emulation)
+            })
+    }
+
+    fn ordered_requires_tsql_null_ordering_emulation(ordered: &Ordered) -> bool {
+        let Some(nulls_first) = ordered.nulls_first else {
+            return false;
+        };
+
+        let random_ordering = matches!(ordered.this, Expression::Rand(_) | Expression::Random(_));
+        let target_default_nulls_first = !ordered.desc;
+
+        nulls_first != target_default_nulls_first && !random_ordering
+    }
+
+    fn projection_output_identifier(expression: &Expression) -> Option<Identifier> {
+        match expression {
+            Expression::Alias(alias) if !alias.alias.name.is_empty() => Some(alias.alias.clone()),
+            Expression::Column(column) => Some(column.name.clone()),
+            Expression::Identifier(identifier) => Some(identifier.clone()),
+            _ => None,
+        }
+    }
+
+    fn identifier_names_match(left: &Identifier, right: &Identifier) -> bool {
+        if left.quoted || right.quoted {
+            left.name == right.name
+        } else {
+            left.name.eq_ignore_ascii_case(&right.name)
+        }
+    }
+
+    fn expression_matches_identifier(expression: &Expression, identifier: &Identifier) -> bool {
+        match expression {
+            Expression::Column(column) if column.table.is_none() => {
+                Self::identifier_names_match(&column.name, identifier)
+            }
+            Expression::Identifier(other) => Self::identifier_names_match(other, identifier),
+            _ => false,
+        }
+    }
+
+    fn column_expression(identifier: Identifier) -> Expression {
+        Expression::Column(Box::new(Column {
+            name: identifier,
+            table: None,
+            join_mark: false,
+            trailing_comments: Vec::new(),
+            span: None,
+            inferred_type: None,
+        }))
+    }
+
+    fn resolve_distinct_order_projection(
+        projections: &[Expression],
+        order_expression: &Expression,
+    ) -> Option<Expression> {
+        for projection in projections {
+            if let Expression::Alias(alias) = projection {
+                if Self::expression_matches_identifier(order_expression, &alias.alias)
+                    || &alias.this == order_expression
+                {
+                    return Some(alias.this.clone());
+                }
+            } else if projection == order_expression {
+                return Some(projection.clone());
+            } else if let Some(identifier) = Self::projection_output_identifier(projection) {
+                if Self::expression_matches_identifier(order_expression, &identifier) {
+                    return Some(projection.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    fn fresh_polyglot_alias(base: &str, index: usize, used_names: &mut Vec<String>) -> String {
+        let mut suffix = 0;
+        loop {
+            let candidate = if suffix == 0 {
+                format!("{base}_{index}")
+            } else {
+                format!("{base}_{index}_{suffix}")
+            };
+
+            if !used_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&candidate))
+            {
+                used_names.push(candidate.clone());
+                return candidate;
+            }
+
+            suffix += 1;
+        }
+    }
+
+    fn tsql_null_ordering_case(expression: Expression) -> Expression {
+        Expression::Case(Box::new(Case {
+            operand: None,
+            whens: vec![(
+                Expression::IsNull(Box::new(IsNull {
+                    this: expression,
+                    not: false,
+                    postfix_form: false,
+                })),
+                Expression::number(1),
+            )],
+            else_: Some(Expression::number(0)),
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn try_build_tsql_distinct_null_ordering_wrapper(&self, select: &Select) -> Option<Select> {
+        let order_by = select.order_by.as_ref()?;
+
+        if order_by.siblings
+            || select.distinct_on.is_some()
+            || select.distribute_by.is_some()
+            || select.cluster_by.is_some()
+            || select.sort_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || select.limit_by.is_some()
+            || select.fetch.is_some()
+            || select.top.is_some()
+            || select.settings.is_some()
+            || select.format.is_some()
+            || select.kind.is_some()
+            || select.hint.is_some()
+            || select.into.is_some()
+            || !select.locks.is_empty()
+            || !select.for_xml.is_empty()
+            || !select.for_json.is_empty()
+            || !select.operation_modifiers.is_empty()
+            || select.option.is_some()
+            || select.exclude.is_some()
+        {
+            return None;
+        }
+
+        let projection_identifiers: Vec<_> = select
+            .expressions
+            .iter()
+            .map(Self::projection_output_identifier)
+            .collect::<Option<_>>()?;
+        let mut used_names: Vec<_> = projection_identifiers
+            .iter()
+            .map(|identifier| identifier.name.clone())
+            .collect();
+
+        let mut inner = select.clone();
+        inner.order_by = None;
+
+        let outer_with = inner.with.take();
+        let outer_leading_comments = std::mem::take(&mut inner.leading_comments);
+        let outer_post_select_comments = std::mem::take(&mut inner.post_select_comments);
+
+        let mut outer_order_expressions = Vec::with_capacity(order_by.expressions.len() * 2);
+        for (index, ordered) in order_by.expressions.iter().enumerate() {
+            if ordered.with_fill.is_some() {
+                return None;
+            }
+
+            let sort_expression =
+                Self::resolve_distinct_order_projection(&select.expressions, &ordered.this)?;
+
+            if Self::ordered_requires_tsql_null_ordering_emulation(ordered) {
+                let null_alias =
+                    Self::fresh_polyglot_alias("_polyglot_order_null", index, &mut used_names);
+                inner.expressions.push(
+                    Self::tsql_null_ordering_case(sort_expression.clone())
+                        .alias(null_alias.clone()),
+                );
+                outer_order_expressions.push(Ordered {
+                    this: Expression::column(null_alias),
+                    desc: ordered.nulls_first == Some(true),
+                    nulls_first: None,
+                    explicit_asc: false,
+                    with_fill: None,
+                });
+            }
+
+            let key_alias =
+                Self::fresh_polyglot_alias("_polyglot_order_key", index, &mut used_names);
+            inner
+                .expressions
+                .push(sort_expression.alias(key_alias.clone()));
+            outer_order_expressions.push(Ordered {
+                this: Expression::column(key_alias),
+                desc: ordered.desc,
+                nulls_first: None,
+                explicit_asc: ordered.explicit_asc,
+                with_fill: None,
+            });
+        }
+
+        let subquery = Subquery {
+            this: Expression::Select(Box::new(inner)),
+            alias: Some(Identifier::new("_polyglot_distinct_order")),
+            column_aliases: Vec::new(),
+            alias_explicit_as: true,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            inferred_type: None,
+        };
+
+        let mut outer = Select::new();
+        outer.with = outer_with;
+        outer.leading_comments = outer_leading_comments;
+        outer.post_select_comments = outer_post_select_comments;
+        outer.expressions = projection_identifiers
+            .into_iter()
+            .map(Self::column_expression)
+            .collect();
+        outer.from = Some(From {
+            expressions: vec![Expression::Subquery(Box::new(subquery))],
+        });
+        outer.order_by = Some(OrderBy {
+            expressions: outer_order_expressions,
+            siblings: false,
+            comments: order_by.comments.clone(),
+        });
+
+        Some(outer)
+    }
+
     fn generate_select(&mut self, select: &Select) -> Result<()> {
         use crate::dialects::DialectType;
+
+        if self.should_handle_tsql_distinct_null_ordering(select) {
+            if let Some(wrapped_select) = self.try_build_tsql_distinct_null_ordering_wrapper(select)
+            {
+                return self.generate_select(&wrapped_select);
+            }
+
+            self.unsupported(
+                "SELECT DISTINCT with emulated NULL ordering is not supported for TSQL/Fabric",
+            )?;
+        }
 
         // Redshift-style EXCLUDE: for dialects other than Redshift, wrap in a derived table
         // e.g., SELECT *, col4 EXCLUDE (col2, col3) FROM t
@@ -6786,6 +7043,9 @@ impl Generator {
 
         self.write_keyword("INTERSECT");
         if intersect.all {
+            if !self.config.except_intersect_support_all_clause {
+                self.unsupported("INTERSECT ALL is not supported")?;
+            }
             self.write_space();
             self.write_keyword("ALL");
         } else if intersect.distinct {
@@ -6989,6 +7249,9 @@ impl Generator {
             _ => {
                 self.write_keyword("EXCEPT");
                 if except.all {
+                    if !self.config.except_intersect_support_all_clause {
+                        self.unsupported("EXCEPT ALL is not supported")?;
+                    }
                     self.write_space();
                     self.write_keyword("ALL");
                 } else if except.distinct {
@@ -23804,16 +24067,27 @@ impl Generator {
         };
 
         if emulate_tsql_null_ordering {
-            self.write_keyword("CASE WHEN");
-            self.write_space();
-            self.generate_expression(&ordered.this)?;
-            self.write_space();
-            self.write_keyword("IS NULL THEN 1 ELSE 0 END");
-            if ordered.nulls_first == Some(true) {
+            if Self::is_integer_ordering_literal(&ordered.this) {
+                let nulls_order = if ordered.nulls_first == Some(true) {
+                    "NULLS FIRST"
+                } else {
+                    "NULLS LAST"
+                };
+                self.unsupported(format!(
+                    "'{nulls_order}' translation not supported with positional ordering"
+                ))?;
+            } else {
+                self.write_keyword("CASE WHEN");
                 self.write_space();
-                self.write_keyword("DESC");
+                self.generate_expression(&ordered.this)?;
+                self.write_space();
+                self.write_keyword("IS NULL THEN 1 ELSE 0 END");
+                if ordered.nulls_first == Some(true) {
+                    self.write_space();
+                    self.write_keyword("DESC");
+                }
+                self.write(", ");
             }
-            self.write(", ");
         }
 
         self.generate_expression(&ordered.this)?;
@@ -23887,6 +24161,14 @@ impl Generator {
             self.generate_with_fill(with_fill)?;
         }
         Ok(())
+    }
+
+    fn is_integer_ordering_literal(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Literal(lit)
+                if matches!(lit.as_ref(), Literal::Number(n) if n.parse::<u64>().is_ok())
+        )
     }
 
     /// Write a ClickHouse type string, wrapping in Nullable unless in map key context.

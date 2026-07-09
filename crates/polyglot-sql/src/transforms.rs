@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::expressions::{
     Alias, BinaryOp, BooleanLiteral, Cast, DataType, Exists, Expression, From, Function,
     Identifier, Join, JoinKind, Lateral, LateralView, Literal, NamedArgSeparator, NamedArgument,
-    Over, Select, StructField, Subquery, UnaryFunc, UnnestFunc, Where,
+    Over, Select, StructField, Subquery, UnaryFunc, UnnestFunc, Where, With,
 };
 use std::cell::RefCell;
 
@@ -1996,68 +1996,145 @@ fn is_temporal_type(dt: &DataType) -> bool {
 ///
 /// Reference: `transforms.py:703-721`
 pub fn ensure_bools(expr: Expression) -> Result<Expression> {
-    // First, recursively process Case WHEN conditions throughout the expression tree
-    let expr = ensure_bools_in_case(expr);
-    match expr {
-        Expression::Select(mut select) => {
-            // Transform WHERE clause condition
-            if let Some(ref mut where_clause) = select.where_clause {
-                where_clause.this = ensure_bool_condition(where_clause.this.clone());
-            }
-            // Transform HAVING clause condition
-            if let Some(ref mut having) = select.having {
-                having.this = ensure_bool_condition(having.this.clone());
-            }
-            Ok(Expression::Select(select))
-        }
+    let expr = ensure_bools_in_value_context(expr);
+
+    Ok(match expr {
         // Top-level AND/OR/NOT expressions also need ensure_bools processing
-        Expression::And(_) | Expression::Or(_) | Expression::Not(_) => {
-            Ok(ensure_bool_condition(expr))
-        }
-        other => Ok(other),
-    }
+        Expression::And(_) | Expression::Or(_) | Expression::Not(_) => ensure_bool_condition(expr),
+        other => other,
+    })
 }
 
 /// Recursively walk the expression tree to find Case expressions and apply
 /// ensure_bool_condition to their WHEN conditions. This ensures that
 /// `CASE WHEN TRUE` becomes `CASE WHEN (1 = 1)` etc.
-fn ensure_bools_in_case(expr: Expression) -> Expression {
+fn ensure_bools_in_value_context(expr: Expression) -> Expression {
     match expr {
         Expression::Case(mut case) => {
             case.whens = case
                 .whens
                 .into_iter()
                 .map(|(condition, result)| {
-                    let new_condition = ensure_bool_condition(ensure_bools_in_case(condition));
-                    let new_result = ensure_bools_in_case(result);
+                    let new_condition =
+                        ensure_bool_condition(ensure_bools_in_value_context(condition));
+                    let new_result = ensure_bools_in_value_context(result);
                     (new_condition, new_result)
                 })
                 .collect();
             if let Some(else_expr) = case.else_ {
-                case.else_ = Some(ensure_bools_in_case(else_expr));
+                case.else_ = Some(ensure_bools_in_value_context(else_expr));
             }
             Expression::Case(Box::new(*case))
         }
-        Expression::Select(mut select) => {
-            // Recursively process expressions in the SELECT list
-            select.expressions = select
-                .expressions
-                .into_iter()
-                .map(ensure_bools_in_case)
-                .collect();
-            // Process WHERE/HAVING are handled by ensure_bools main function
-            Expression::Select(select)
+        Expression::Select(select) => Expression::Select(Box::new(ensure_bools_in_select(*select))),
+        Expression::Subquery(mut subquery) => {
+            subquery.this = ensure_bools_in_value_context(subquery.this);
+            Expression::Subquery(subquery)
+        }
+        Expression::Union(mut union) => {
+            let left = std::mem::replace(&mut union.left, Expression::null());
+            let right = std::mem::replace(&mut union.right, Expression::null());
+            union.left = ensure_bools_in_value_context(left);
+            union.right = ensure_bools_in_value_context(right);
+            if let Some(with) = union.with.take() {
+                union.with = Some(ensure_bools_in_with(with));
+            }
+            Expression::Union(union)
+        }
+        Expression::Intersect(mut intersect) => {
+            let left = std::mem::replace(&mut intersect.left, Expression::null());
+            let right = std::mem::replace(&mut intersect.right, Expression::null());
+            intersect.left = ensure_bools_in_value_context(left);
+            intersect.right = ensure_bools_in_value_context(right);
+            if let Some(with) = intersect.with.take() {
+                intersect.with = Some(ensure_bools_in_with(with));
+            }
+            Expression::Intersect(intersect)
+        }
+        Expression::Except(mut except) => {
+            let left = std::mem::replace(&mut except.left, Expression::null());
+            let right = std::mem::replace(&mut except.right, Expression::null());
+            except.left = ensure_bools_in_value_context(left);
+            except.right = ensure_bools_in_value_context(right);
+            if let Some(with) = except.with.take() {
+                except.with = Some(ensure_bools_in_with(with));
+            }
+            Expression::Except(except)
         }
         Expression::Alias(mut alias) => {
-            alias.this = ensure_bools_in_case(alias.this);
+            alias.this = ensure_bools_in_value_context(alias.this);
             Expression::Alias(alias)
         }
         Expression::Paren(mut paren) => {
-            paren.this = ensure_bools_in_case(paren.this);
+            paren.this = ensure_bools_in_value_context(paren.this);
             Expression::Paren(paren)
         }
         other => other,
     }
+}
+
+fn ensure_bools_in_select(mut select: Select) -> Select {
+    select.expressions = select
+        .expressions
+        .into_iter()
+        .map(ensure_bools_in_value_context)
+        .collect();
+
+    if let Some(from) = select.from.take() {
+        select.from = Some(crate::expressions::From {
+            expressions: from
+                .expressions
+                .into_iter()
+                .map(ensure_bools_in_value_context)
+                .collect(),
+        });
+    }
+
+    select.joins = select.joins.into_iter().map(ensure_bools_in_join).collect();
+
+    if let Some(mut where_clause) = select.where_clause.take() {
+        where_clause.this = ensure_bool_condition(ensure_bools_in_value_context(where_clause.this));
+        select.where_clause = Some(where_clause);
+    }
+
+    if let Some(mut having) = select.having.take() {
+        having.this = ensure_bool_condition(ensure_bools_in_value_context(having.this));
+        select.having = Some(having);
+    }
+
+    if let Some(with) = select.with.take() {
+        select.with = Some(ensure_bools_in_with(with));
+    }
+
+    select
+}
+
+fn ensure_bools_in_join(mut join: Join) -> Join {
+    join.this = ensure_bools_in_value_context(join.this);
+
+    if let Some(on) = join.on.take() {
+        join.on = Some(ensure_bool_condition(ensure_bools_in_value_context(on)));
+    }
+
+    join.pivots = join
+        .pivots
+        .into_iter()
+        .map(ensure_bools_in_value_context)
+        .collect();
+
+    join
+}
+
+fn ensure_bools_in_with(mut with: With) -> With {
+    with.ctes = with
+        .ctes
+        .into_iter()
+        .map(|mut cte| {
+            cte.this = ensure_bools_in_value_context(cte.this);
+            cte
+        })
+        .collect();
+    with
 }
 
 /// Helper to check if an expression is inherently boolean (returns a boolean value).

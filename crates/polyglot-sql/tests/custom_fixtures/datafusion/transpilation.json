@@ -314,7 +314,7 @@
       "sql": "SELECT x ILIKE '%foo%'",
       "write": {
         "mysql": "SELECT LOWER(x) LIKE LOWER('%foo%')",
-        "tsql": "SELECT CASE WHEN LOWER(x) LIKE LOWER('%foo%') THEN 1 WHEN NOT LOWER(x) LIKE LOWER('%foo%') THEN 0 END",
+        "tsql": "SELECT CAST(CASE WHEN LOWER(x) LIKE LOWER('%foo%') THEN 1 ELSE 0 END AS BIT)",
         "duckdb": "SELECT x ILIKE '%foo%'",
         "postgresql": "SELECT x ILIKE '%foo%'",
         "snowflake": "SELECT x ILIKE '%foo%'",

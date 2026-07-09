@@ -32,6 +32,11 @@ fn default_transpile_still_allows_known_unsupported_leftovers() {
             DialectType::Fabric,
         ),
         (
+            "SELECT lpad(s, 5, 'x') FROM t",
+            DialectType::PostgreSQL,
+            DialectType::Fabric,
+        ),
+        (
             "SELECT * FROM t, LATERAL (SELECT 1 AS x) AS s",
             DialectType::PostgreSQL,
             DialectType::Fabric,
@@ -76,7 +81,7 @@ fn strict_transpile_rejects_hive_recursive_ctes() {
 #[test]
 fn strict_transpile_rejects_remaining_lateral_for_tsql_targets() {
     let err = transpile_with_level(
-        "SELECT * FROM t, LATERAL (SELECT 1 AS x) AS s",
+        "SELECT * FROM (orders o JOIN LATERAL (SELECT 1 AS id) a USING (id))",
         DialectType::PostgreSQL,
         DialectType::Fabric,
         UnsupportedLevel::Raise,
@@ -84,6 +89,66 @@ fn strict_transpile_rejects_remaining_lateral_for_tsql_targets() {
     .expect_err("strict Fabric transpile should reject remaining LATERAL");
 
     assert!(err.to_string().contains("LATERAL"));
+}
+
+#[test]
+fn strict_transpile_rejects_except_intersect_all_for_tsql_targets() {
+    let cases = [
+        (
+            "SELECT a FROM t EXCEPT ALL SELECT b FROM t",
+            "EXCEPT ALL is not supported",
+        ),
+        (
+            "SELECT a FROM t INTERSECT ALL SELECT b FROM t",
+            "INTERSECT ALL is not supported",
+        ),
+    ];
+
+    for target in [DialectType::TSQL, DialectType::Fabric] {
+        for (sql, expected) in cases {
+            let err = transpile_with_level(
+                sql,
+                DialectType::PostgreSQL,
+                target,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict transpile should reject unsupported set operation");
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in error for {target:?}, got {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_transpile_allows_distinct_except_intersect_for_tsql_targets() {
+    let cases = [
+        "SELECT a FROM t EXCEPT SELECT b FROM t",
+        "SELECT a FROM t INTERSECT SELECT b FROM t",
+    ];
+
+    for target in [DialectType::TSQL, DialectType::Fabric] {
+        for sql in cases {
+            let result = transpile_with_level(
+                sql,
+                DialectType::PostgreSQL,
+                target,
+                UnsupportedLevel::Raise,
+            )
+            .unwrap_or_else(|err| {
+                panic!("strict {target:?} transpile should allow distinct set operation: {err}")
+            });
+
+            assert_eq!(result.len(), 1);
+            assert!(
+                !result[0].contains(" ALL "),
+                "distinct set operation should not contain ALL for {target:?}: {}",
+                result[0]
+            );
+        }
+    }
 }
 
 #[test]
@@ -176,6 +241,56 @@ fn strict_transpile_rejects_postgres_only_functions() {
     let message = err.to_string();
     assert!(message.contains("JSONB_BUILD_OBJECT"));
     assert!(message.contains("TO_TSVECTOR"));
+}
+
+#[test]
+fn strict_transpile_rejects_postgres_only_scalar_functions_for_tsql_targets() {
+    let cases = [
+        ("SELECT lpad(s, 5, 'x') FROM t", "LPAD"),
+        ("SELECT rpad(s, 5, 'x') FROM t", "RPAD"),
+        ("SELECT split_part(s, ',', 1) FROM t", "SPLIT_PART"),
+        ("SELECT initcap(s) FROM t", "INITCAP"),
+        ("SELECT to_jsonb(s) FROM t", "TO_JSONB"),
+    ];
+
+    for (sql, function_name) in cases {
+        for write in [DialectType::Fabric, DialectType::TSQL] {
+            let err =
+                transpile_with_level(sql, DialectType::PostgreSQL, write, UnsupportedLevel::Raise)
+                    .expect_err(
+                        "strict TSQL/Fabric transpile should reject PostgreSQL-only functions",
+                    );
+
+            assert!(
+                err.to_string().contains(function_name),
+                "unexpected error for {function_name} to {write:?}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_transpile_rejects_postgres_json_functions_for_tsql_targets() {
+    let cases = [
+        ("SELECT to_json(s) FROM t", "TO_JSON"),
+        ("SELECT jsonb_agg(s) FROM t", "JSONB_AGG"),
+        ("SELECT jsonb_object_agg(k, s) FROM t", "JSONB_OBJECT_AGG"),
+    ];
+
+    for (sql, function_name) in cases {
+        for write in [DialectType::Fabric, DialectType::TSQL] {
+            let err =
+                transpile_with_level(sql, DialectType::PostgreSQL, write, UnsupportedLevel::Raise)
+                    .expect_err(
+                        "strict TSQL/Fabric transpile should reject PostgreSQL JSON functions",
+                    );
+
+            assert!(
+                err.to_string().contains(function_name),
+                "unexpected error for {function_name} to {write:?}: {err}"
+            );
+        }
+    }
 }
 
 #[test]
