@@ -3268,6 +3268,7 @@ impl Parser {
                     || self.check(TokenType::Except)
                     || self.check(TokenType::Order)
                     || self.check(TokenType::Limit)
+                    || self.check(TokenType::Qualify)
                     || self.check(TokenType::Semicolon)
                     || self.check_text_seq(&["BULK", "COLLECT", "INTO"]))
             {
@@ -3657,6 +3658,8 @@ impl Parser {
                     // GROUP BY / ORDER BY are clause boundaries, not aliases.
                     && !self.check_text_seq(&["GROUP", "BY"])
                     && !self.check_text_seq(&["ORDER", "BY"])
+                    // QUALIFY is a clause boundary, not an alias.
+                    && !self.check(TokenType::Qualify)
                     // WINDOW is only a clause boundary when followed by a named window.
                     && !(self.check(TokenType::Window)
                         && self.peek_nth(1).is_some_and(|token| matches!(
@@ -10014,6 +10017,37 @@ impl Parser {
         }))
     }
 
+    fn check_set_operation_start(&self, token_type: TokenType) -> bool {
+        if !self.check(token_type) {
+            return false;
+        }
+
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::ClickHouse)
+        ) && matches!(token_type, TokenType::Except | TokenType::Intersect)
+            && self.check_next(TokenType::LParen)
+        {
+            let mut index = self.current + 1;
+            while self
+                .tokens
+                .get(index)
+                .is_some_and(|token| token.token_type == TokenType::LParen)
+            {
+                index += 1;
+            }
+
+            return self.tokens.get(index).is_some_and(|token| {
+                matches!(
+                    token.token_type,
+                    TokenType::Select | TokenType::With | TokenType::From | TokenType::Values
+                )
+            });
+        }
+
+        true
+    }
+
     /// Parse set operations (UNION, INTERSECT, EXCEPT)
     fn parse_set_operation(&mut self, left: Expression) -> Result<Expression> {
         let mut result = left;
@@ -10026,9 +10060,9 @@ impl Parser {
 
             // Capture leading comments from the set operation keyword token (e.g., /*x*/ before UNION).
             // These comments appeared on a new line between the left SELECT and the set operation keyword.
-            let set_op_leading_comments = if self.check(TokenType::Union)
-                || self.check(TokenType::Intersect)
-                || self.check(TokenType::Except)
+            let set_op_leading_comments = if self.check_set_operation_start(TokenType::Union)
+                || self.check_set_operation_start(TokenType::Intersect)
+                || self.check_set_operation_start(TokenType::Except)
             {
                 self.current_leading_comments().to_vec()
             } else {
@@ -10045,7 +10079,8 @@ impl Parser {
                 result
             };
 
-            if self.match_token(TokenType::Union) {
+            if self.check_set_operation_start(TokenType::Union) {
+                self.skip();
                 let all = self.match_token(TokenType::All);
                 let distinct = if !all {
                     self.match_token(TokenType::Distinct)
@@ -10085,7 +10120,8 @@ impl Parser {
                     on_columns,
                 }));
                 found_set_op = true;
-            } else if self.match_token(TokenType::Intersect) {
+            } else if self.check_set_operation_start(TokenType::Intersect) {
+                self.skip();
                 let all = self.match_token(TokenType::All);
                 let distinct = if !all {
                     self.match_token(TokenType::Distinct)
@@ -10125,7 +10161,8 @@ impl Parser {
                     on_columns,
                 }));
                 found_set_op = true;
-            } else if self.match_token(TokenType::Except) {
+            } else if self.check_set_operation_start(TokenType::Except) {
+                self.skip();
                 let all = self.match_token(TokenType::All);
                 let distinct = if !all {
                     self.match_token(TokenType::Distinct)
@@ -10216,9 +10253,9 @@ impl Parser {
             let side_text = side_token.text.to_ascii_uppercase();
 
             // Check if followed by set operation or INNER
-            if self.check(TokenType::Union)
-                || self.check(TokenType::Intersect)
-                || self.check(TokenType::Except)
+            if self.check_set_operation_start(TokenType::Union)
+                || self.check_set_operation_start(TokenType::Intersect)
+                || self.check_set_operation_start(TokenType::Except)
                 || self.check(TokenType::Inner)
             {
                 side = Some(side_text);
@@ -10235,9 +10272,9 @@ impl Parser {
             self.skip(); // consume INNER
 
             // Check if followed by set operation
-            if self.check(TokenType::Union)
-                || self.check(TokenType::Intersect)
-                || self.check(TokenType::Except)
+            if self.check_set_operation_start(TokenType::Union)
+                || self.check_set_operation_start(TokenType::Intersect)
+                || self.check_set_operation_start(TokenType::Except)
             {
                 kind = Some("INNER".to_string());
             } else {
@@ -10368,13 +10405,14 @@ impl Parser {
         Ok(())
     }
 
-    /// Parse either a SELECT statement or a parenthesized SELECT/set operation
+    /// Parse either a SELECT/VALUES query operand or a parenthesized query operand.
     fn parse_select_or_paren_select(&mut self) -> Result<Expression> {
         if self.match_token(TokenType::LParen) {
-            // Could be (SELECT ...) or ((SELECT ...) UNION ...) or (FROM ...) for DuckDB
+            // Could be (SELECT ...), (VALUES ...), ((SELECT ...) UNION ...), or (FROM ...) for DuckDB
             if self.check(TokenType::Select)
                 || self.check(TokenType::With)
                 || self.check(TokenType::From)
+                || self.check(TokenType::Values)
             {
                 let query = self.parse_statement()?;
                 self.expect(TokenType::RParen)?;
@@ -10433,8 +10471,10 @@ impl Parser {
                     inferred_type: None,
                 })))
             } else {
-                Err(self.parse_error("Expected SELECT or ( after ("))
+                Err(self.parse_error("Expected SELECT, VALUES, or ( after ("))
             }
+        } else if self.check(TokenType::Values) {
+            self.parse_values()
         } else if self.check(TokenType::From) {
             // DuckDB FROM-first syntax without parentheses: ... UNION FROM t
             self.parse_from_first_query()
@@ -29746,6 +29786,34 @@ impl Parser {
         } else if self.check(TokenType::DAt)
             && matches!(
                 self.config.dialect,
+                Some(crate::dialects::DialectType::PostgreSQL)
+            )
+        {
+            // PostgreSQL @ prefix operator: absolute value for numeric types.
+            self.skip();
+            let expr = self.parse_bitwise_or()?;
+            Ok(Expression::Abs(Box::new(UnaryFunc::new(expr))))
+        } else if self.check(TokenType::Var)
+            && self.peek().text.starts_with('@')
+            && matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::PostgreSQL)
+            )
+        {
+            let token = self.advance();
+            let col_name = &token.text[1..];
+            let col_expr = Expression::boxed_column(Column {
+                name: Identifier::new(col_name),
+                table: None,
+                join_mark: false,
+                trailing_comments: Vec::new(),
+                span: None,
+                inferred_type: None,
+            });
+            Ok(Expression::Abs(Box::new(UnaryFunc::new(col_expr))))
+        } else if self.check(TokenType::DAt)
+            && matches!(
+                self.config.dialect,
                 Some(crate::dialects::DialectType::DuckDB)
             )
         {
@@ -31373,6 +31441,11 @@ impl Parser {
         }
 
         if self.check(TokenType::Arrow)
+            && !matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::PostgreSQL)
+                    | Some(crate::dialects::DialectType::Redshift)
+            )
             && !self
                 .peek_nth(1)
                 .map_or(false, |t| t.token_type == TokenType::String)
@@ -32006,6 +32079,57 @@ impl Parser {
                 return self.maybe_parse_over(func_expr);
             }
             // Fallback to TIME as column reference - preserve original case
+            return self.maybe_parse_subscript(Expression::boxed_column(Column {
+                name: Identifier::new(original_text),
+                table: None,
+                join_mark: false,
+                trailing_comments: Vec::new(),
+                span: None,
+                inferred_type: None,
+            }));
+        }
+
+        // TIMESTAMPTZ literal: TIMESTAMPTZ '2024-01-15 10:30:00+00:00'
+        // Represent as CAST('...' AS TIMESTAMPTZ), matching the existing generic
+        // TIMESTAMP literal shape and preserving the time zone type explicitly.
+        if self.check(TokenType::TimestampTz)
+            || self.check_keyword_text("TIMESTAMPTZ")
+            || self.check_keyword_text("TIMESTAMP_TZ")
+        {
+            let token = self.advance();
+            let original_text = token.text.clone();
+            let mut precision = None;
+
+            if self.check(TokenType::LParen)
+                && self.check_next(TokenType::Number)
+                && self.peek_nth(2).map_or(false, |token| {
+                    token.token_type == TokenType::RParen
+                        && self
+                            .peek_nth(3)
+                            .map_or(false, |next| next.token_type == TokenType::String)
+                })
+            {
+                self.skip(); // consume (
+                precision = Some(self.expect_number()? as u32);
+                self.expect(TokenType::RParen)?;
+            }
+
+            if self.check(TokenType::String) {
+                let str_token = self.advance();
+                return Ok(Expression::Cast(Box::new(Cast {
+                    this: Expression::Literal(Box::new(Literal::String(str_token.text))),
+                    to: DataType::Timestamp {
+                        precision,
+                        timezone: true,
+                    },
+                    trailing_comments: Vec::new(),
+                    double_colon_syntax: false,
+                    format: None,
+                    default: None,
+                    inferred_type: None,
+                })));
+            }
+
             return self.maybe_parse_subscript(Expression::boxed_column(Column {
                 name: Identifier::new(original_text),
                 table: None,
@@ -39646,11 +39770,11 @@ impl Parser {
                                 if let Some(parsed_unit) =
                                     Self::parse_interval_unit_from_string(&unit_upper)
                                 {
-                                    // Check if the original text had an 'S' suffix (plural)
-                                    let is_plural = unit_upper.ends_with('S');
                                     unit = Some(IntervalUnitSpec::Simple {
                                         unit: parsed_unit,
-                                        use_plural: is_plural,
+                                        use_plural: Self::interval_unit_uses_plural_form(
+                                            &unit_upper,
+                                        ),
                                     });
                                     Some(Expression::Literal(Box::new(Literal::String(num_part))))
                                 } else {
@@ -39726,31 +39850,7 @@ impl Parser {
             return false;
         }
         let text = self.peek().text.to_ascii_uppercase();
-        matches!(
-            text.as_str(),
-            "YEAR"
-                | "YEARS"
-                | "MONTH"
-                | "MONTHS"
-                | "DAY"
-                | "DAYS"
-                | "HOUR"
-                | "HOURS"
-                | "MINUTE"
-                | "MINUTES"
-                | "SECOND"
-                | "SECONDS"
-                | "MILLISECOND"
-                | "MILLISECONDS"
-                | "MICROSECOND"
-                | "MICROSECONDS"
-                | "NANOSECOND"
-                | "NANOSECONDS"
-                | "WEEK"
-                | "WEEKS"
-                | "QUARTER"
-                | "QUARTERS"
-        )
+        Self::parse_interval_unit_from_string(&text).is_some()
     }
 
     /// Check if current token terminates a statement/expression context
@@ -39812,27 +39912,72 @@ impl Parser {
         Ok(None)
     }
 
+    /// Return whether an interval unit token should regenerate in plural form.
+    fn interval_unit_uses_plural_form(s: &str) -> bool {
+        matches!(
+            s.trim().to_ascii_uppercase().as_str(),
+            "YEARS"
+                | "YRS"
+                | "QUARTERS"
+                | "QTRS"
+                | "MONTHS"
+                | "MONS"
+                | "WEEKS"
+                | "WKS"
+                | "DAYS"
+                | "HOURS"
+                | "HRS"
+                | "MINUTES"
+                | "MINS"
+                | "SECONDS"
+                | "SECS"
+                | "MILLISECONDS"
+                | "MSECS"
+                | "MSECONDS"
+                | "MILLISECS"
+                | "MICROSECONDS"
+                | "USECS"
+                | "USECONDS"
+                | "MICROSECS"
+                | "NANOSECONDS"
+                | "NSECS"
+                | "NSECONDS"
+                | "NANOSECS"
+        )
+    }
+
     /// Parse an interval unit from a string (used for splitting compound interval strings)
     fn parse_interval_unit_from_string(s: &str) -> Option<IntervalUnit> {
-        // Strip trailing 'S' for plural forms
-        let base = if s.ends_with('S') && s.len() > 1 {
-            &s[..s.len() - 1]
-        } else {
-            s
-        };
-        match base {
-            "YEAR" => Some(IntervalUnit::Year),
-            "MONTH" => Some(IntervalUnit::Month),
-            "DAY" => Some(IntervalUnit::Day),
-            "HOUR" => Some(IntervalUnit::Hour),
-            "MINUTE" => Some(IntervalUnit::Minute),
-            "SECOND" => Some(IntervalUnit::Second),
-            "MILLISECOND" => Some(IntervalUnit::Millisecond),
-            "MICROSECOND" => Some(IntervalUnit::Microsecond),
-            "QUARTER" => Some(IntervalUnit::Quarter),
-            "WEEK" => Some(IntervalUnit::Week),
-            _ => None,
+        let unit = s.trim().to_ascii_uppercase();
+
+        fn parse_base_unit(base: &str) -> Option<IntervalUnit> {
+            match base {
+                "YEAR" | "Y" | "YR" | "YY" | "YYYY" => Some(IntervalUnit::Year),
+                "QUARTER" | "Q" | "QTR" | "QQ" => Some(IntervalUnit::Quarter),
+                "MONTH" | "MON" | "MM" => Some(IntervalUnit::Month),
+                "WEEK" | "W" | "WK" | "WW" => Some(IntervalUnit::Week),
+                "DAY" | "D" | "DD" => Some(IntervalUnit::Day),
+                "HOUR" | "H" | "HH" | "HR" => Some(IntervalUnit::Hour),
+                "MINUTE" | "MI" | "MIN" | "N" => Some(IntervalUnit::Minute),
+                "SECOND" | "S" | "SEC" | "SS" => Some(IntervalUnit::Second),
+                "MILLISECOND" | "MS" | "MSEC" | "MSECOND" | "MILLISEC" | "MILLISECON" => {
+                    Some(IntervalUnit::Millisecond)
+                }
+                "MICROSECOND" | "US" | "USEC" | "USECOND" | "MICROSEC" | "MCS" => {
+                    Some(IntervalUnit::Microsecond)
+                }
+                "NANOSECOND" | "NS" | "NSEC" | "NSECOND" | "NANOSEC" => {
+                    Some(IntervalUnit::Nanosecond)
+                }
+                _ => None,
+            }
         }
+
+        parse_base_unit(&unit).or_else(|| {
+            unit.strip_suffix('S')
+                .filter(|base| !base.is_empty())
+                .and_then(parse_base_unit)
+        })
     }
 
     /// Try to parse a simple interval unit (YEAR, MONTH, etc.) - returns (unit, is_plural)
@@ -39842,31 +39987,8 @@ impl Parser {
         }
 
         let text_upper = self.peek().text.to_ascii_uppercase();
-        let result = match text_upper.as_str() {
-            "YEAR" => Some((IntervalUnit::Year, false)),
-            "YEARS" => Some((IntervalUnit::Year, true)),
-            "MONTH" => Some((IntervalUnit::Month, false)),
-            "MONTHS" => Some((IntervalUnit::Month, true)),
-            "DAY" => Some((IntervalUnit::Day, false)),
-            "DAYS" => Some((IntervalUnit::Day, true)),
-            "HOUR" => Some((IntervalUnit::Hour, false)),
-            "HOURS" => Some((IntervalUnit::Hour, true)),
-            "MINUTE" => Some((IntervalUnit::Minute, false)),
-            "MINUTES" => Some((IntervalUnit::Minute, true)),
-            "SECOND" => Some((IntervalUnit::Second, false)),
-            "SECONDS" => Some((IntervalUnit::Second, true)),
-            "MILLISECOND" => Some((IntervalUnit::Millisecond, false)),
-            "MILLISECONDS" => Some((IntervalUnit::Millisecond, true)),
-            "MICROSECOND" => Some((IntervalUnit::Microsecond, false)),
-            "MICROSECONDS" => Some((IntervalUnit::Microsecond, true)),
-            "NANOSECOND" => Some((IntervalUnit::Nanosecond, false)),
-            "NANOSECONDS" => Some((IntervalUnit::Nanosecond, true)),
-            "QUARTER" => Some((IntervalUnit::Quarter, false)),
-            "QUARTERS" => Some((IntervalUnit::Quarter, true)),
-            "WEEK" => Some((IntervalUnit::Week, false)),
-            "WEEKS" => Some((IntervalUnit::Week, true)),
-            _ => None,
-        };
+        let result = Self::parse_interval_unit_from_string(&text_upper)
+            .map(|unit| (unit, Self::interval_unit_uses_plural_form(&text_upper)));
 
         if result.is_some() {
             self.skip(); // consume the unit token
@@ -55811,8 +55933,41 @@ impl Parser {
                 };
                 Some(s.as_str())
             }
+            Expression::Cast(cast)
+                if cast.format.is_none()
+                    && cast.default.is_none()
+                    && Self::date_part_cast_target_is_string(&cast.to) =>
+            {
+                match &cast.this {
+                    Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_)) => {
+                        let Literal::String(s) = lit.as_ref() else {
+                            unreachable!()
+                        };
+                        Some(s.as_str())
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         })
+    }
+
+    fn date_part_cast_target_is_string(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Char { .. }
+                | DataType::VarChar { .. }
+                | DataType::String { .. }
+                | DataType::Text
+                | DataType::TextWithLength { .. }
+        ) || matches!(
+            data_type,
+            DataType::Custom { name, .. }
+                if name.eq_ignore_ascii_case("VARCHAR")
+                    || name.eq_ignore_ascii_case("NVARCHAR")
+                    || name.eq_ignore_ascii_case("VARCHAR(MAX)")
+                    || name.eq_ignore_ascii_case("NVARCHAR(MAX)")
+        )
     }
 
     fn try_clickhouse_func_arg_alias(&mut self, expr: Expression) -> Expression {
@@ -62211,6 +62366,46 @@ OPTIONS (
                 ));
             }
             _ => panic!("Expected Cast expression for TIMESTAMP literal"),
+        }
+
+        let timestamptz_sql =
+            "SELECT id FROM events WHERE created_at >= TIMESTAMPTZ '2026-04-10T00:00:00+00:00'";
+        for dialect in [
+            None,
+            Some(crate::dialects::DialectType::DuckDB),
+            Some(crate::dialects::DialectType::PostgreSQL),
+        ] {
+            let result = match dialect {
+                Some(dialect) => crate::dialects::Dialect::get(dialect).parse(timestamptz_sql),
+                None => Parser::parse_sql(timestamptz_sql),
+            }
+            .unwrap_or_else(|err| panic!("TIMESTAMPTZ literal failed for {dialect:?}: {err}"));
+
+            let generated = crate::generate(
+                &result[0],
+                dialect.unwrap_or(crate::dialects::DialectType::Generic),
+            )
+            .unwrap();
+            assert_eq!(
+                generated,
+                "SELECT id FROM events WHERE created_at >= CAST('2026-04-10T00:00:00+00:00' AS TIMESTAMPTZ)"
+            );
+        }
+
+        let result = Parser::parse_sql("SELECT TIMESTAMPTZ(6) '2026-04-10 00:00:00+00'")
+            .expect("TIMESTAMPTZ precision literal should parse");
+        let select = result[0].as_select().unwrap();
+        match &select.expressions[0] {
+            Expression::Cast(cast) => {
+                assert!(matches!(
+                    &cast.to,
+                    DataType::Timestamp {
+                        precision: Some(6),
+                        timezone: true
+                    }
+                ));
+            }
+            _ => panic!("Expected Cast expression for TIMESTAMPTZ precision literal"),
         }
     }
 

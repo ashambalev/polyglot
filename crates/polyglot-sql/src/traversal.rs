@@ -542,6 +542,13 @@ fn iter_children(expr: &Expression) -> Vec<(&'static str, &Expression)> {
             if let Some(ref operand) = &c.operand {
                 children.push(("operand", operand));
             }
+            for (condition, result) in &c.whens {
+                children.push(("when", condition));
+                children.push(("then", result));
+            }
+            if let Some(ref else_) = c.else_ {
+                children.push(("else", else_));
+            }
         }
         Expression::WindowFunction(wf) => {
             children.push(("this", &wf.this));

@@ -346,6 +346,11 @@ impl FabricDialect {
                 name: "VARCHAR".to_string(),
             },
 
+            // Fabric has no native JSONB storage type; use unbounded text.
+            DataType::JsonB => DataType::Custom {
+                name: "VARCHAR(MAX)".to_string(),
+            },
+
             // UUID -> UNIQUEIDENTIFIER (already handled by TSQL, but ensure it's here)
             DataType::Uuid => DataType::Custom {
                 name: "UNIQUEIDENTIFIER".to_string(),
@@ -366,6 +371,11 @@ impl FabricDialect {
                 let has_max_length = upper.contains("(MAX)");
 
                 match base_name.as_str() {
+                    // Fabric supports FLOAT for double precision approximate numerics.
+                    "DOUBLE PRECISION" => DataType::Custom {
+                        name: "FLOAT".to_string(),
+                    },
+
                     // DATETIME -> DATETIME2(6)
                     "DATETIME" => DataType::Custom {
                         name: "DATETIME2(6)".to_string(),

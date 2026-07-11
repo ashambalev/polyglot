@@ -242,18 +242,6 @@ impl DialectImpl for PostgresDialect {
                 vec![f.expression, f.this], // PostgreSQL: ARRAY_PREPEND(element, array)
             )))),
 
-            // ============================================
-            // BITWISE OPERATIONS
-            // ============================================
-            // BitwiseXor -> # operator in PostgreSQL
-            Expression::BitwiseXor(f) => {
-                // Use a special marker that generator will recognize
-                Ok(Expression::Function(Box::new(Function::new(
-                    "__PG_BITWISE_XOR__".to_string(),
-                    vec![f.left, f.right],
-                ))))
-            }
-
             // BitwiseAndAgg -> BIT_AND
             Expression::BitwiseAndAgg(f) => Ok(Expression::Function(Box::new(Function::new(
                 "BIT_AND".to_string(),
@@ -1036,9 +1024,13 @@ impl PostgresDialect {
             // TINYINT -> SMALLINT
             DataType::TinyInt { .. } => DataType::SmallInt { length: None },
 
-            // FLOAT -> DOUBLE PRECISION (Python sqlglot tokenizes FLOAT as DOUBLE)
-            DataType::Float { .. } => DataType::Custom {
-                name: "DOUBLE PRECISION".to_string(),
+            // REAL stays single precision; FLOAT without precision maps to DOUBLE PRECISION.
+            DataType::Float { real_spelling, .. } => DataType::Custom {
+                name: if real_spelling {
+                    "REAL".to_string()
+                } else {
+                    "DOUBLE PRECISION".to_string()
+                },
             },
 
             // DOUBLE -> DOUBLE PRECISION
@@ -1194,6 +1186,15 @@ impl PostgresDialect {
                     sysdate: false,
                 },
             )),
+
+            // PostgreSQL random UUID generators -> normalized UUID expression.
+            "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUIDV4" if f.args.is_empty() => {
+                Ok(Expression::Uuid(Box::new(crate::expressions::Uuid {
+                    this: None,
+                    name: None,
+                    is_string: None,
+                })))
+            }
 
             // NEWID -> GEN_RANDOM_UUID in PostgreSQL
             "NEWID" => Ok(Expression::Function(Box::new(Function::new(

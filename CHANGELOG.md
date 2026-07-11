@@ -4,6 +4,87 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.5.16] - 2026-07-11
+
+### Added
+- Expanded strict-mode regression coverage for unsupported transpilation
+  leftovers, including recursive CTEs, residual lateral joins, unsupported
+  `UNNEST`/`EXPLODE` targets, duplicate-preserving set operations, lossy array
+  aggregates, regex predicates, residual `FETCH WITH TIES` / `OVERLAPS` /
+  `DATE_BIN`, PostgreSQL-only scalar functions, PostgreSQL JSON functions, and
+  `maxUnsupported` option handling.
+- Regression coverage for PostgreSQL-to-T-SQL/Fabric rewrites across JSON
+  operators and constructors, temporal functions, math/string functions,
+  arrays, lateral joins, window frames, row-value subqueries, aggregate
+  filters, ordered `STRING_AGG`, ordered-set percentiles, no-op limits,
+  interval/date arithmetic, and `VALUES` set-operation operands.
+- Regression coverage for structured PostgreSQL `PREPARE` / `EXECUTE`
+  parsing and PostgreSQL replication protocol command fallbacks.
+- Parser regression coverage for `TIMESTAMPTZ '...'` and
+  `TIMESTAMPTZ(n) '...'` typed literals in generic, DuckDB, and PostgreSQL
+  parsing paths.
+
+### Changed
+- Fabric and T-SQL now share more PostgreSQL compatibility rewrites while
+  preserving Fabric-specific type mappings such as `NVARCHAR` to `VARCHAR`.
+
+### Fixed
+- PostgreSQL JSON extraction operators, path operators, JSON constructors,
+  `json_agg` / `jsonb_agg`, and scalar `jsonb_array_elements(...)` projections
+  now transpile to valid T-SQL/Fabric JSON functions such as `JSON_VALUE`,
+  `JSON_QUERY`, `JSON_OBJECT`, `JSON_ARRAYAGG`, and `OPENJSON` where a safe
+  mapping exists.
+- Strict PostgreSQL-to-T-SQL/Fabric transpilation now rejects unsupported JSON
+  row shapes, array literals/subscripts/functions, PostgreSQL-only scalar
+  functions such as `GCD`, `LCM`, `ERF`, `QUOTE_LITERAL`, `AGE`, and
+  `PG_TYPEOF`, unsupported statistical aggregates, residual array `ANY`
+  semantics, and scalar interval casts instead of emitting target SQL that
+  would fail at runtime.
+- PostgreSQL regex and `SIMILAR TO` expressions now either lower to supported
+  T-SQL/Fabric predicate forms for compatible patterns or fail in strict mode
+  for unsupported SQL-regex patterns.
+- PostgreSQL temporal rewrites targeting T-SQL/Fabric now handle current
+  temporal niladics, `EXTRACT` / `date_part`, typed-text `date_part` fields,
+  `date_trunc`, simple `date_bin` buckets, `to_timestamp`, `to_date`,
+  `to_char`, and `format(...)` string interpolation with valid target
+  signatures or strict-mode rejection for unsupported forms.
+- PostgreSQL math, string, type, and operator rewrites targeting T-SQL/Fabric
+  now cover `LOG`/`LN`/`LOG10`, `DIV`, `CBRT`, `REPEAT`, `CHR`, `OVERLAY`,
+  `BTRIM`, `MD5`, `OCTET_LENGTH`, `BIT_LENGTH`, `TO_HEX`, hex `ENCODE`,
+  simple `TO_NUMBER`, approximate numeric casts, function-style type casts,
+  `ROUND(x)`, bitwise XOR `#`, absolute-value `@`, and `MOD(...)`.
+- PostgreSQL UUID generator functions such as `gen_random_uuid()`,
+  `uuid_generate_v4()`, and `uuidv4()` now map to `NEWID()` for T-SQL/Fabric.
+- PostgreSQL-to-T-SQL/Fabric query-shape rewrites now strip unsupported CTE
+  materialization hints, hoist nested CTEs from derived subqueries, map
+  supported lateral joins to `CROSS APPLY` / `OUTER APPLY`, preserve valid
+  null ordering and `DISTINCT ON` behavior through wrapper queries, handle
+  positional `ORDER BY` safely, and keep recursive CTE output valid by omitting
+  the unsupported `RECURSIVE` keyword.
+- PostgreSQL row-value `IN` and equality subquery comparisons now rewrite to
+  `EXISTS` predicates for T-SQL/Fabric when arity and projection shapes are
+  safe, including casted and wrapped subquery projections.
+- PostgreSQL boolean and null-safe comparison rewrites targeting T-SQL/Fabric
+  now distinguish predicate contexts from scalar contexts, materializing scalar
+  boolean results as `BIT` values while keeping predicates executable.
+- PostgreSQL aggregate filters, ordered `STRING_AGG`, typed string-aggregate
+  separators, and grouped `PERCENTILE_CONT` / `PERCENTILE_DISC` ordered-set
+  aggregates now lower to valid T-SQL/Fabric forms; unsupported `MODE() WITHIN
+  GROUP` fails in strict mode.
+- PostgreSQL `VALUES` statements and `VALUES` set-operation operands now wrap
+  as derived tables for T-SQL/Fabric, avoiding invalid top-level or set-operand
+  `VALUES` SQL.
+- PostgreSQL `LIMIT NULL`, `LIMIT ALL`, and `LIMIT (NULL)` are omitted for
+  T-SQL/Fabric, offset-only queries keep a valid `OFFSET ... ROWS` shape, and
+  `FETCH FIRST ... WITH TIES` maps to `TOP ... WITH TIES` where supported.
+- PostgreSQL date/date and date/integer arithmetic now maps to `DATEDIFF` or
+  day-based `DATEADD`, and common interval arithmetic including abbreviated
+  time and month units maps to target `DATEADD` calls.
+- The parser now accepts `TIMESTAMPTZ '...'` and `TIMESTAMPTZ(n) '...'` typed
+  literals and normalizes them to explicit timestamp-with-time-zone casts,
+  matching the behavior already available through explicit `CAST(...)` and
+  PostgreSQL `::TIMESTAMPTZ` casts.
+
 ## [0.5.15] - 2026-07-09
 
 ### Added

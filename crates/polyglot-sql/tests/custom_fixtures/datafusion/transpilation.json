@@ -291,7 +291,7 @@
         "postgresql": "SELECT x IS DISTINCT FROM y",
         "snowflake": "SELECT x IS DISTINCT FROM y",
         "spark": "SELECT x IS DISTINCT FROM y",
-        "tsql": "SELECT x IS DISTINCT FROM y"
+        "tsql": "SELECT CAST(CASE WHEN x IS DISTINCT FROM y THEN 1 ELSE 0 END AS BIT)"
       },
       "description": "IS DISTINCT FROM: MySQL uses NOT x <=> y"
     },
@@ -303,7 +303,7 @@
         "postgresql": "SELECT x IS NOT DISTINCT FROM y",
         "snowflake": "SELECT x IS NOT DISTINCT FROM y",
         "spark": "SELECT x IS NOT DISTINCT FROM y",
-        "tsql": "SELECT x IS NOT DISTINCT FROM y"
+        "tsql": "SELECT CAST(CASE WHEN x IS NOT DISTINCT FROM y THEN 1 ELSE 0 END AS BIT)"
       },
       "read": {
         "mysql": "SELECT x <=> y"
@@ -451,7 +451,7 @@
       "sql": "SELECT DATE_TRUNC('month', ts) FROM t",
       "write": {
         "mysql": "SELECT DATE(ts) FROM t",
-        "tsql": "SELECT DATETRUNC('month', ts) FROM t",
+        "tsql": "SELECT DATETRUNC(MONTH, ts) FROM t",
         "duckdb": "SELECT DATE_TRUNC('month', ts) FROM t",
         "postgresql": "SELECT DATE_TRUNC('month', ts) FROM t",
         "snowflake": "SELECT DATE_TRUNC('month', ts) FROM t",
@@ -491,7 +491,7 @@
         "duckdb": "SELECT STARTS_WITH(s, 'pre') FROM t",
         "mysql": "SELECT STARTS_WITH(s, 'pre') FROM t",
         "postgresql": "SELECT STARTS_WITH(s, 'pre') FROM t",
-        "tsql": "SELECT STARTS_WITH(s, 'pre') FROM t"
+        "tsql": "SELECT CAST(CASE WHEN LEFT(s, LEN('pre')) = 'pre' THEN 1 ELSE 0 END AS BIT) FROM t"
       },
       "description": "STARTS_WITH: Snowflake/Spark→STARTSWITH (no underscore)"
     },

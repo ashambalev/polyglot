@@ -14,8 +14,8 @@ use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
     Alias, BinaryOp, Cast, Column, Cte, DataType, Exists, Expression, Function, Identifier, In,
-    Join, JoinKind, LikeOp, Literal, Null, Over, QuantifiedOp, Select, Star, StringAggFunc,
-    Subquery, UnaryFunc, Where,
+    Join, JoinKind, LikeOp, Literal, Null, Over, Paren, QuantifiedOp, Select, Star, StringAggFunc,
+    Subquery, TrimFunc, TrimPosition, UnaryFunc, Where,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
@@ -169,9 +169,63 @@ impl DialectImpl for TSQLDialect {
                 Self::normalize_frame_incompatible_window_functions(&mut select);
 
                 let outer_qualifier = Self::single_select_source_qualifier(&select);
+
+                select.expressions = select
+                    .expressions
+                    .into_iter()
+                    .map(|expression| {
+                        Self::rewrite_tuple_in_subquery_predicates(
+                            expression,
+                            outer_qualifier.as_ref(),
+                            false,
+                        )
+                    })
+                    .collect();
+
+                for join in &mut select.joins {
+                    if let Some(on) = join.on.take() {
+                        join.on = Some(Self::rewrite_tuple_in_subquery_predicates(
+                            on,
+                            outer_qualifier.as_ref(),
+                            false,
+                        ));
+                    }
+                    if let Some(match_condition) = join.match_condition.take() {
+                        join.match_condition = Some(Self::rewrite_tuple_in_subquery_predicates(
+                            match_condition,
+                            outer_qualifier.as_ref(),
+                            false,
+                        ));
+                    }
+                }
+
+                if let Some(ref mut prewhere) = select.prewhere {
+                    *prewhere = Self::rewrite_tuple_in_subquery_predicates(
+                        std::mem::replace(prewhere, Expression::Null(Null)),
+                        outer_qualifier.as_ref(),
+                        false,
+                    );
+                }
+
                 if let Some(ref mut where_clause) = select.where_clause {
                     where_clause.this = Self::rewrite_tuple_in_subquery_predicates(
                         std::mem::replace(&mut where_clause.this, Expression::Null(Null)),
+                        outer_qualifier.as_ref(),
+                        false,
+                    );
+                }
+
+                if let Some(ref mut having) = select.having {
+                    having.this = Self::rewrite_tuple_in_subquery_predicates(
+                        std::mem::replace(&mut having.this, Expression::Null(Null)),
+                        outer_qualifier.as_ref(),
+                        false,
+                    );
+                }
+
+                if let Some(ref mut qualify) = select.qualify {
+                    qualify.this = Self::rewrite_tuple_in_subquery_predicates(
+                        std::mem::replace(&mut qualify.this, Expression::Null(Null)),
                         outer_qualifier.as_ref(),
                         false,
                     );
@@ -342,25 +396,25 @@ impl DialectImpl for TSQLDialect {
 
             // ===== Date/time =====
             // CurrentDate -> CAST(GETDATE() AS DATE) in SQL Server
-            Expression::CurrentDate(_) => {
-                let getdate =
-                    Expression::Function(Box::new(Function::new("GETDATE".to_string(), vec![])));
-                Ok(Expression::Cast(Box::new(crate::expressions::Cast {
-                    this: getdate,
-                    to: crate::expressions::DataType::Date,
-                    trailing_comments: Vec::new(),
-                    double_colon_syntax: false,
-                    format: None,
-                    default: None,
-                    inferred_type: None,
-                })))
-            }
+            Expression::CurrentDate(_) => Ok(Self::cast_getdate_to(DataType::Date)),
+
+            // CurrentTime -> CAST(GETDATE() AS TIME) in SQL Server
+            Expression::CurrentTime(_) => Ok(Self::cast_getdate_to(DataType::Time {
+                precision: None,
+                timezone: false,
+            })),
 
             // CurrentTimestamp -> GETDATE() in SQL Server
-            Expression::CurrentTimestamp(_) => Ok(Expression::Function(Box::new(Function::new(
-                "GETDATE".to_string(),
-                vec![],
-            )))),
+            Expression::CurrentTimestamp(_) => Ok(Self::getdate()),
+
+            // Localtimestamp -> GETDATE() in SQL Server
+            Expression::Localtimestamp(_) => Ok(Self::getdate()),
+
+            // PostgreSQL MAKE_DATE(y, m, d) -> SQL Server DATEFROMPARTS(y, m, d)
+            Expression::MakeDate(f) => Ok(Self::function(
+                "DATEFROMPARTS",
+                vec![f.year, f.month, f.day],
+            )),
 
             // DateDiff -> DATEDIFF
             Expression::DateDiff(f) => {
@@ -464,6 +518,17 @@ impl DialectImpl for TSQLDialect {
                 "CHAR".to_string(),
                 vec![f.this],
             )))),
+
+            // SQL standard OVERLAY(...) -> T-SQL STUFF(...)
+            Expression::Overlay(f) => Ok(Self::overlay_to_stuff(*f)),
+
+            // PostgreSQL starts_with(text, prefix) -> T-SQL prefix predicate.
+            // Scalar SELECT positions are wrapped by the shared T-SQL boolean materializer.
+            Expression::StartsWith(f) => Ok(Self::starts_with_predicate(f.this, f.expression)),
+
+            // PostgreSQL TO_NUMBER with simple literal masks can be represented as TRY_CONVERT.
+            // More complex masks intentionally remain as TO_NUMBER so strict mode rejects them.
+            Expression::ToNumber(f) => Ok(Self::to_number_or_fallback(*f)),
 
             // ===== Variance =====
             // VarPop -> VARP
@@ -629,6 +694,158 @@ impl DialectImpl for TSQLDialect {
 
 #[cfg(feature = "transpile")]
 impl TSQLDialect {
+    fn getdate() -> Expression {
+        Expression::Function(Box::new(Function::new("GETDATE".to_string(), vec![])))
+    }
+
+    fn cast_getdate_to(to: DataType) -> Expression {
+        Expression::Cast(Box::new(Cast {
+            this: Self::getdate(),
+            to,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        }))
+    }
+
+    fn cast(this: Expression, to: DataType) -> Expression {
+        Expression::Cast(Box::new(Cast {
+            this,
+            to,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        }))
+    }
+
+    fn function(name: impl Into<String>, args: Vec<Expression>) -> Expression {
+        Expression::Function(Box::new(Function::new(name, args)))
+    }
+
+    fn lower(this: Expression) -> Expression {
+        Expression::Lower(Box::new(UnaryFunc::new(this)))
+    }
+
+    fn tsql_convert(to: DataType, expression: Expression, style: Option<i64>) -> Expression {
+        let mut args = vec![Expression::DataType(to), expression];
+        if let Some(style) = style {
+            args.push(Expression::number(style));
+        }
+        Self::function("CONVERT", args)
+    }
+
+    fn tsql_hex_text(expression: Expression, varchar_type: DataType) -> Expression {
+        Self::lower(Self::tsql_convert(varchar_type, expression, Some(2)))
+    }
+
+    fn tsql_hex_from_varbinary(expression: Expression) -> Expression {
+        Self::tsql_hex_text(
+            Self::cast(
+                expression,
+                DataType::Custom {
+                    name: "VARBINARY(MAX)".to_string(),
+                },
+            ),
+            DataType::Text,
+        )
+    }
+
+    fn tsql_md5_hex(expression: Expression) -> Expression {
+        let hashbytes = Self::function("HASHBYTES", vec![Expression::string("MD5"), expression]);
+        Self::tsql_hex_text(
+            hashbytes,
+            DataType::VarChar {
+                length: Some(32),
+                parenthesized_length: false,
+            },
+        )
+    }
+
+    fn overlay_to_stuff(f: crate::expressions::OverlayFunc) -> Expression {
+        let length = f
+            .length
+            .unwrap_or_else(|| Self::function("LEN", vec![f.replacement.clone()]));
+        Self::function("STUFF", vec![f.this, f.from, length, f.replacement])
+    }
+
+    fn starts_with_predicate(this: Expression, prefix: Expression) -> Expression {
+        let prefix_len = Self::function("LEN", vec![prefix.clone()]);
+        let left_prefix = Self::function("LEFT", vec![this, prefix_len]);
+        Self::eq(left_prefix, prefix)
+    }
+
+    fn to_number_or_fallback(f: crate::expressions::ToNumber) -> Expression {
+        let crate::expressions::ToNumber {
+            this,
+            format,
+            nlsparam,
+            precision,
+            scale,
+            safe,
+            safe_name,
+        } = f;
+
+        if nlsparam.is_none()
+            && precision.is_none()
+            && scale.is_none()
+            && safe.is_none()
+            && safe_name.is_none()
+        {
+            if let Some(format) = format.as_deref() {
+                if let Some(scale) = Self::simple_to_number_scale(format) {
+                    return Self::function(
+                        "TRY_CONVERT",
+                        vec![
+                            Expression::DataType(DataType::Decimal {
+                                precision: Some(18),
+                                scale: Some(scale),
+                            }),
+                            *this,
+                        ],
+                    );
+                }
+            }
+        }
+
+        Expression::ToNumber(Box::new(crate::expressions::ToNumber {
+            this,
+            format,
+            nlsparam,
+            precision,
+            scale,
+            safe,
+            safe_name,
+        }))
+    }
+
+    fn simple_to_number_scale(format: &Expression) -> Option<u32> {
+        let format = Self::literal_string(format)?;
+        let format = format.strip_prefix("FM").unwrap_or(format);
+        let mut saw_digit = false;
+        let mut saw_decimal = false;
+        let mut scale = 0u32;
+
+        for ch in format.chars() {
+            match ch {
+                '9' | '0' => {
+                    saw_digit = true;
+                    if saw_decimal {
+                        scale = scale.checked_add(1)?;
+                    }
+                }
+                '.' if !saw_decimal => saw_decimal = true,
+                ',' | ' ' => {}
+                _ => return None,
+            }
+        }
+
+        saw_digit.then_some(scale)
+    }
+
     fn binary(
         left: Expression,
         right: Expression,
@@ -664,6 +881,13 @@ impl TSQLDialect {
             this,
             not: false,
             postfix_form: false,
+        }))
+    }
+
+    fn paren(this: Expression) -> Expression {
+        Expression::Paren(Box::new(Paren {
+            this,
+            trailing_comments: Vec::new(),
         }))
     }
 
@@ -1336,8 +1560,13 @@ impl TSQLDialect {
         match expr {
             Expression::In(in_expr) if !under_not => {
                 let in_expr = *in_expr;
-                Self::tuple_in_subquery_to_exists(&in_expr, outer_qualifier)
+                Self::tuple_in_subquery_to_exists(&in_expr, outer_qualifier, in_expr.not)
                     .unwrap_or_else(|| Expression::In(Box::new(in_expr)))
+            }
+            Expression::Eq(op) if !under_not => {
+                let op = *op;
+                Self::tuple_subquery_eq_to_exists(&op, outer_qualifier)
+                    .unwrap_or_else(|| Expression::Eq(Box::new(op)))
             }
             Expression::And(mut op) => {
                 op.left =
@@ -1368,27 +1597,152 @@ impl TSQLDialect {
                 Expression::Paren(paren)
             }
             Expression::Not(mut not) => {
-                not.this =
-                    Self::rewrite_tuple_in_subquery_predicates(not.this, outer_qualifier, true);
-                Expression::Not(not)
+                if let Some(rewritten) = Self::direct_tuple_subquery_predicate_to_exists(
+                    &not.this,
+                    outer_qualifier,
+                    true,
+                ) {
+                    rewritten
+                } else {
+                    not.this =
+                        Self::rewrite_tuple_in_subquery_predicates(not.this, outer_qualifier, true);
+                    Expression::Not(not)
+                }
+            }
+            Expression::Alias(mut alias) => {
+                alias.this = Self::rewrite_tuple_in_subquery_predicates(
+                    alias.this,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::Alias(alias)
+            }
+            Expression::Cast(mut cast) => {
+                cast.this = Self::rewrite_tuple_in_subquery_predicates(
+                    cast.this,
+                    outer_qualifier,
+                    under_not,
+                );
+                if let Some(format) = cast.format.take() {
+                    cast.format = Some(Box::new(Self::rewrite_tuple_in_subquery_predicates(
+                        *format,
+                        outer_qualifier,
+                        under_not,
+                    )));
+                }
+                if let Some(default) = cast.default.take() {
+                    cast.default = Some(Box::new(Self::rewrite_tuple_in_subquery_predicates(
+                        *default,
+                        outer_qualifier,
+                        under_not,
+                    )));
+                }
+                Expression::Cast(cast)
+            }
+            Expression::TryCast(mut cast) => {
+                cast.this = Self::rewrite_tuple_in_subquery_predicates(
+                    cast.this,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::TryCast(cast)
+            }
+            Expression::SafeCast(mut cast) => {
+                cast.this = Self::rewrite_tuple_in_subquery_predicates(
+                    cast.this,
+                    outer_qualifier,
+                    under_not,
+                );
+                Expression::SafeCast(cast)
+            }
+            Expression::Case(mut case) => {
+                if let Some(operand) = case.operand.take() {
+                    case.operand = Some(Self::rewrite_tuple_in_subquery_predicates(
+                        operand,
+                        outer_qualifier,
+                        under_not,
+                    ));
+                }
+                case.whens = case
+                    .whens
+                    .into_iter()
+                    .map(|(condition, result)| {
+                        (
+                            Self::rewrite_tuple_in_subquery_predicates(
+                                condition,
+                                outer_qualifier,
+                                false,
+                            ),
+                            Self::rewrite_tuple_in_subquery_predicates(
+                                result,
+                                outer_qualifier,
+                                under_not,
+                            ),
+                        )
+                    })
+                    .collect();
+                if let Some(else_) = case.else_.take() {
+                    case.else_ = Some(Self::rewrite_tuple_in_subquery_predicates(
+                        else_,
+                        outer_qualifier,
+                        under_not,
+                    ));
+                }
+                Expression::Case(case)
+            }
+            Expression::IfFunc(mut if_func) => {
+                if_func.condition = Self::rewrite_tuple_in_subquery_predicates(
+                    if_func.condition,
+                    outer_qualifier,
+                    false,
+                );
+                if_func.true_value = Self::rewrite_tuple_in_subquery_predicates(
+                    if_func.true_value,
+                    outer_qualifier,
+                    under_not,
+                );
+                if let Some(false_value) = if_func.false_value.take() {
+                    if_func.false_value = Some(Self::rewrite_tuple_in_subquery_predicates(
+                        false_value,
+                        outer_qualifier,
+                        under_not,
+                    ));
+                }
+                Expression::IfFunc(if_func)
             }
             other => other,
+        }
+    }
+
+    fn direct_tuple_subquery_predicate_to_exists(
+        expr: &Expression,
+        outer_qualifier: Option<&Identifier>,
+        negated: bool,
+    ) -> Option<Expression> {
+        match expr {
+            Expression::In(in_expr) => {
+                Self::tuple_in_subquery_to_exists(in_expr, outer_qualifier, negated ^ in_expr.not)
+            }
+            Expression::Paren(paren) => Self::direct_tuple_subquery_predicate_to_exists(
+                &paren.this,
+                outer_qualifier,
+                negated,
+            ),
+            _ => None,
         }
     }
 
     fn tuple_in_subquery_to_exists(
         in_expr: &In,
         outer_qualifier: Option<&Identifier>,
+        negated: bool,
     ) -> Option<Expression> {
-        if in_expr.not || !in_expr.expressions.is_empty() || in_expr.unnest.is_some() {
+        if in_expr.unnest.is_some() {
             return None;
         }
 
         let left_expressions = Self::tuple_expressions(&in_expr.this)?;
-        let mut select = match in_expr.query.as_ref()? {
-            Expression::Select(select) => (**select).clone(),
-            _ => return None,
-        };
+        let mut select = Self::select_from_in_rhs(in_expr)?;
 
         if left_expressions.len() != select.expressions.len() || left_expressions.is_empty() {
             return None;
@@ -1404,6 +1758,75 @@ impl TSQLDialect {
         {
             let inner = Self::tuple_in_projection_expr(projection, inner_qualifier.as_ref())?;
             let outer = Self::qualify_tuple_operand(left, outer_qualifier);
+            predicates.push(if negated {
+                Self::tuple_component_may_match(inner, outer)
+            } else {
+                Expression::Eq(Box::new(BinaryOp::new(inner, outer)))
+            });
+        }
+
+        if let Some(where_clause) = select.where_clause.take() {
+            predicates.push(where_clause.this);
+        }
+
+        select.expressions = vec![Expression::number(1)];
+        select.where_clause = Some(Where {
+            this: Self::and_all(predicates)?,
+        });
+
+        Some(Expression::Exists(Box::new(Exists {
+            this: Expression::Select(Box::new(select)),
+            not: negated,
+        })))
+    }
+
+    fn tuple_subquery_eq_to_exists(
+        op: &BinaryOp,
+        outer_qualifier: Option<&Identifier>,
+    ) -> Option<Expression> {
+        if let Some((tuple_expr, query_expr)) = Self::tuple_and_query_operands(&op.left, &op.right)
+        {
+            return Self::tuple_subquery_eq_to_exists_inner(
+                tuple_expr,
+                query_expr,
+                outer_qualifier,
+            );
+        }
+
+        if let Some((tuple_expr, query_expr)) = Self::tuple_and_query_operands(&op.right, &op.left)
+        {
+            return Self::tuple_subquery_eq_to_exists_inner(
+                tuple_expr,
+                query_expr,
+                outer_qualifier,
+            );
+        }
+
+        None
+    }
+
+    fn tuple_subquery_eq_to_exists_inner(
+        tuple_expr: &Expression,
+        query_expr: &Expression,
+        outer_qualifier: Option<&Identifier>,
+    ) -> Option<Expression> {
+        let tuple_expressions = Self::tuple_expressions(tuple_expr)?;
+        let mut select = Self::select_from_query_expression(query_expr)?;
+
+        if tuple_expressions.len() != select.expressions.len() || tuple_expressions.is_empty() {
+            return None;
+        }
+
+        let inner_qualifier = Self::single_select_source_qualifier(&select);
+        let mut predicates = Vec::with_capacity(tuple_expressions.len() + 1);
+        for (projection, tuple_operand) in select
+            .expressions
+            .iter()
+            .cloned()
+            .zip(tuple_expressions.iter().cloned())
+        {
+            let inner = Self::tuple_in_projection_expr(projection, inner_qualifier.as_ref())?;
+            let outer = Self::qualify_tuple_operand(tuple_operand, outer_qualifier);
             predicates.push(Expression::Eq(Box::new(BinaryOp::new(inner, outer))));
         }
 
@@ -1422,9 +1845,50 @@ impl TSQLDialect {
         })))
     }
 
+    fn tuple_and_query_operands<'a>(
+        tuple_candidate: &'a Expression,
+        query_candidate: &'a Expression,
+    ) -> Option<(&'a Expression, &'a Expression)> {
+        if Self::tuple_expressions(tuple_candidate).is_some()
+            && Self::select_from_query_expression(query_candidate).is_some()
+        {
+            Some((tuple_candidate, query_candidate))
+        } else {
+            None
+        }
+    }
+
+    fn select_from_query_expression(expr: &Expression) -> Option<Select> {
+        match expr {
+            Expression::Select(select) => Some((**select).clone()),
+            Expression::Subquery(subquery) => Self::select_from_query_expression(&subquery.this),
+            Expression::Paren(paren) => Self::select_from_query_expression(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn select_from_in_rhs(in_expr: &In) -> Option<Select> {
+        if let Some(query) = &in_expr.query {
+            return if in_expr.expressions.is_empty() {
+                Self::select_from_query_expression(query)
+            } else {
+                None
+            };
+        }
+
+        if in_expr.expressions.len() == 1 {
+            Self::select_from_query_expression(&in_expr.expressions[0])
+        } else {
+            None
+        }
+    }
+
     fn tuple_expressions(expr: &Expression) -> Option<&[Expression]> {
         match expr {
             Expression::Tuple(tuple) => Some(&tuple.expressions),
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("ROW") => {
+                Some(&function.args)
+            }
             Expression::Paren(paren) => Self::tuple_expressions(&paren.this),
             _ => None,
         }
@@ -1446,11 +1910,15 @@ impl TSQLDialect {
                 Some(Self::column_from_identifier(identifier, qualifier.cloned()))
             }
             Expression::Dot(_) => Some(expr),
-            _ => None,
+            other => Some(Self::qualify_tuple_expression(other, qualifier)),
         }
     }
 
     fn qualify_tuple_operand(expr: Expression, qualifier: Option<&Identifier>) -> Expression {
+        Self::qualify_tuple_expression(expr, qualifier)
+    }
+
+    fn qualify_tuple_expression(expr: Expression, qualifier: Option<&Identifier>) -> Expression {
         match expr {
             Expression::Column(mut column) => {
                 if column.table.is_none() {
@@ -1461,8 +1929,81 @@ impl TSQLDialect {
             Expression::Identifier(identifier) => {
                 Self::column_from_identifier(identifier, qualifier.cloned())
             }
+            Expression::Alias(mut alias) => {
+                alias.this = Self::qualify_tuple_expression(alias.this, qualifier);
+                Expression::Alias(alias)
+            }
+            Expression::Paren(mut paren) => {
+                paren.this = Self::qualify_tuple_expression(paren.this, qualifier);
+                Expression::Paren(paren)
+            }
+            Expression::Cast(mut cast) => {
+                cast.this = Self::qualify_tuple_expression(cast.this, qualifier);
+                if let Some(format) = cast.format.take() {
+                    cast.format =
+                        Some(Box::new(Self::qualify_tuple_expression(*format, qualifier)));
+                }
+                if let Some(default) = cast.default.take() {
+                    cast.default = Some(Box::new(Self::qualify_tuple_expression(
+                        *default, qualifier,
+                    )));
+                }
+                Expression::Cast(cast)
+            }
+            Expression::TryCast(mut cast) => {
+                cast.this = Self::qualify_tuple_expression(cast.this, qualifier);
+                Expression::TryCast(cast)
+            }
+            Expression::SafeCast(mut cast) => {
+                cast.this = Self::qualify_tuple_expression(cast.this, qualifier);
+                Expression::SafeCast(cast)
+            }
+            Expression::Function(mut function) => {
+                function.args = function
+                    .args
+                    .into_iter()
+                    .map(|arg| Self::qualify_tuple_expression(arg, qualifier))
+                    .collect();
+                Expression::Function(function)
+            }
+            Expression::Add(mut op) => {
+                op.left = Self::qualify_tuple_expression(op.left, qualifier);
+                op.right = Self::qualify_tuple_expression(op.right, qualifier);
+                Expression::Add(op)
+            }
+            Expression::Sub(mut op) => {
+                op.left = Self::qualify_tuple_expression(op.left, qualifier);
+                op.right = Self::qualify_tuple_expression(op.right, qualifier);
+                Expression::Sub(op)
+            }
+            Expression::Mul(mut op) => {
+                op.left = Self::qualify_tuple_expression(op.left, qualifier);
+                op.right = Self::qualify_tuple_expression(op.right, qualifier);
+                Expression::Mul(op)
+            }
+            Expression::Div(mut op) => {
+                op.left = Self::qualify_tuple_expression(op.left, qualifier);
+                op.right = Self::qualify_tuple_expression(op.right, qualifier);
+                Expression::Div(op)
+            }
+            Expression::Mod(mut op) => {
+                op.left = Self::qualify_tuple_expression(op.left, qualifier);
+                op.right = Self::qualify_tuple_expression(op.right, qualifier);
+                Expression::Mod(op)
+            }
             other => other,
         }
+    }
+
+    fn tuple_component_may_match(inner: Expression, outer: Expression) -> Expression {
+        Self::paren(
+            Self::or_all(vec![
+                Expression::Eq(Box::new(BinaryOp::new(inner.clone(), outer.clone()))),
+                Self::is_null(inner),
+                Self::is_null(outer),
+            ])
+            .expect("tuple component match condition is non-empty"),
+        )
     }
 
     fn column_from_identifier(identifier: Identifier, table: Option<Identifier>) -> Expression {
@@ -1508,6 +2049,17 @@ impl TSQLDialect {
         }))
     }
 
+    fn or_all(mut predicates: Vec<Expression>) -> Option<Expression> {
+        if predicates.is_empty() {
+            return None;
+        }
+
+        let first = predicates.remove(0);
+        Some(predicates.into_iter().fold(first, |left, right| {
+            Expression::Or(Box::new(BinaryOp::new(left, right)))
+        }))
+    }
+
     /// Transform data types according to T-SQL TYPE_MAPPING
     pub(super) fn transform_data_type(
         &self,
@@ -1549,6 +2101,10 @@ impl TSQLDialect {
                 let upper = name.trim().to_uppercase();
                 let (base_name, precision, _scale) = Self::parse_type_precision_and_scale(&upper);
                 match base_name.as_str() {
+                    // PostgreSQL DOUBLE PRECISION is SQL Server FLOAT.
+                    "DOUBLE PRECISION" => DataType::Custom {
+                        name: "FLOAT".to_string(),
+                    },
                     // BPCHAR is PostgreSQL's blank-padded CHAR alias — map to CHAR
                     "BPCHAR" => {
                         if let Some(len) = precision {
@@ -1676,6 +2232,79 @@ impl TSQLDialect {
                 f.args,
             )))),
 
+            // PostgreSQL btrim(text[, characters]) -> T-SQL TRIM([characters FROM] text)
+            "BTRIM" if f.args.len() == 1 || f.args.len() == 2 => {
+                let mut args = f.args;
+                let this = args.remove(0);
+                let characters = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.remove(0))
+                };
+                Ok(Expression::Trim(Box::new(TrimFunc {
+                    this,
+                    sql_standard_syntax: characters.is_some(),
+                    characters,
+                    position: TrimPosition::Both,
+                    position_explicit: false,
+                })))
+            }
+
+            // PostgreSQL md5(text) returns lowercase hex text; HASHBYTES returns varbinary.
+            "MD5" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Self::tsql_md5_hex(args.remove(0)))
+            }
+
+            // PostgreSQL octet_length(text/bytea) -> DATALENGTH(...)
+            "OCTET_LENGTH" if f.args.len() == 1 => Ok(Self::function("DATALENGTH", f.args)),
+
+            // PostgreSQL bit_length(text/bytea) -> DATALENGTH(...) * 8
+            "BIT_LENGTH" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Expression::Mul(Box::new(BinaryOp::new(
+                    Self::function("DATALENGTH", vec![args.remove(0)]),
+                    Expression::number(8),
+                ))))
+            }
+
+            // PostgreSQL to_hex(int) -> lowercase hex text. SQL Server's varbinary
+            // conversion is an approximation for numeric inputs, matching the existing
+            // cross-dialect behavior rather than preserving PostgreSQL integer width rules.
+            "TO_HEX" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Self::tsql_hex_from_varbinary(args.remove(0)))
+            }
+
+            // PostgreSQL encode(bytea, 'hex') -> lowercase hex text.
+            "ENCODE" if f.args.len() == 2 => {
+                let mut args = f.args;
+                let this = args.remove(0);
+                let encoding = args.remove(0);
+                if Self::literal_string(&encoding)
+                    .is_some_and(|encoding| encoding.eq_ignore_ascii_case("hex"))
+                {
+                    Ok(Self::tsql_hex_from_varbinary(this))
+                } else {
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "ENCODE".to_string(),
+                        vec![this, encoding],
+                    ))))
+                }
+            }
+
+            // PostgreSQL repeat(text, count) -> SQL Server REPLICATE(text, count)
+            "REPEAT" if f.args.len() == 2 => Ok(Expression::Function(Box::new(Function::new(
+                "REPLICATE".to_string(),
+                f.args,
+            )))),
+
+            // PostgreSQL chr(code) -> SQL Server CHAR(code)
+            "CHR" if f.args.len() == 1 => Ok(Expression::Function(Box::new(Function::new(
+                "CHAR".to_string(),
+                f.args,
+            )))),
+
             // RANDOM -> RAND
             "RANDOM" => Ok(Expression::Rand(Box::new(crate::expressions::Rand {
                 seed: None,
@@ -1684,45 +2313,79 @@ impl TSQLDialect {
             }))),
 
             // NOW -> GETDATE or CURRENT_TIMESTAMP (both work)
-            "NOW" => Ok(Expression::Function(Box::new(Function::new(
-                "GETDATE".to_string(),
-                vec![],
-            )))),
+            "NOW" => Ok(Self::getdate()),
 
             // CURRENT_TIMESTAMP -> GETDATE (SQL Server prefers GETDATE)
-            "CURRENT_TIMESTAMP" => Ok(Expression::Function(Box::new(Function::new(
-                "GETDATE".to_string(),
-                vec![],
-            )))),
+            "CURRENT_TIMESTAMP" => Ok(Self::getdate()),
 
             // CURRENT_DATE -> CAST(GETDATE() AS DATE)
-            "CURRENT_DATE" => {
-                // In SQL Server, use CAST(GETDATE() AS DATE)
-                Ok(Expression::Function(Box::new(Function::new(
-                    "CAST".to_string(),
-                    vec![
-                        Expression::Function(Box::new(Function::new(
-                            "GETDATE".to_string(),
-                            vec![],
-                        ))),
-                        Expression::Identifier(crate::expressions::Identifier::new("DATE")),
-                    ],
-                ))))
+            "CURRENT_DATE" => Ok(Self::cast_getdate_to(DataType::Date)),
+
+            // CURRENT_TIME -> CAST(GETDATE() AS TIME)
+            "CURRENT_TIME" => Ok(Self::cast_getdate_to(DataType::Time {
+                precision: None,
+                timezone: false,
+            })),
+
+            // LOCALTIMESTAMP -> GETDATE()
+            "LOCALTIMESTAMP" => Ok(Self::getdate()),
+
+            // PostgreSQL clock_timestamp() -> high-precision current system timestamp.
+            "CLOCK_TIMESTAMP" if f.args.is_empty() => Ok(Self::function("SYSDATETIME", vec![])),
+
+            // PostgreSQL make_date(year, month, day) -> SQL Server DATEFROMPARTS.
+            "MAKE_DATE" if f.args.len() == 3 => Ok(Self::function("DATEFROMPARTS", f.args)),
+
+            // PostgreSQL/Oracle-style TO_DATE(value, fmt) -> typed parse expression.
+            // The generator will emit native CONVERT(DATE, value, style) when
+            // the literal format maps cleanly to a T-SQL style code.
+            "TO_DATE" if f.args.len() == 2 => {
+                Self::formatted_str_to_date_or_fallback(f.args, "TO_DATE")
             }
 
-            // TO_DATE -> CONVERT or CAST
-            "TO_DATE" => Ok(Expression::Function(Box::new(Function::new(
-                "CONVERT".to_string(),
-                f.args,
-            )))),
+            // One-arg TO_DATE(value) has no format string; use a native cast shape.
+            "TO_DATE" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Expression::Cast(Box::new(Cast {
+                    this: args.remove(0),
+                    to: DataType::Date,
+                    trailing_comments: Vec::new(),
+                    double_colon_syntax: false,
+                    format: None,
+                    default: None,
+                    inferred_type: None,
+                })))
+            }
 
-            // TO_TIMESTAMP -> CONVERT
-            "TO_TIMESTAMP" => Ok(Expression::Function(Box::new(Function::new(
-                "CONVERT".to_string(),
-                f.args,
-            )))),
+            // PostgreSQL/Oracle-style TO_TIMESTAMP(value, fmt) -> typed parse expression.
+            // This avoids the invalid CONVERT(value, fmt) argument order.
+            "TO_TIMESTAMP" if f.args.len() == 2 => {
+                Self::formatted_str_to_time_or_fallback(f.args, "TO_TIMESTAMP")
+            }
 
-            // TO_CHAR -> FORMAT in SQL Server 2012+
+            // PostgreSQL's one-arg TO_TIMESTAMP is epoch seconds.
+            "TO_TIMESTAMP" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Expression::UnixToTime(Box::new(
+                    crate::expressions::UnixToTime {
+                        this: Box::new(args.remove(0)),
+                        scale: Some(0),
+                        zone: None,
+                        hours: None,
+                        minutes: None,
+                        format: None,
+                        target_type: None,
+                    },
+                )))
+            }
+
+            // PostgreSQL/Oracle-style TO_CHAR(value, fmt) -> typed format expression.
+            // The generator converts the normalized strftime format to .NET FORMAT().
+            "TO_CHAR" if f.args.len() == 2 => {
+                Self::formatted_time_to_str_or_fallback(f.args, "TO_CHAR")
+            }
+
+            // TO_CHAR(value) without a format remains a normal T-SQL FORMAT call.
             "TO_CHAR" => Ok(Expression::Function(Box::new(Function::new(
                 "FORMAT".to_string(),
                 f.args,
@@ -1973,6 +2636,127 @@ impl TSQLDialect {
 
             // Pass through everything else
             _ => Ok(Expression::Function(Box::new(f))),
+        }
+    }
+
+    fn literal_string(expr: &Expression) -> Option<&str> {
+        match expr {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::String(s) => Some(s),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn postgres_format_to_strftime(format: &str) -> String {
+        let mapping = HashMap::from([
+            ("FMHH24", "%-H"),
+            ("FMHH12", "%-I"),
+            ("FMDDD", "%-j"),
+            ("TMMonth", "%B"),
+            ("TMMon", "%b"),
+            ("TMDay", "%A"),
+            ("TMDy", "%a"),
+            ("YYYY", "%Y"),
+            ("yyyy", "%Y"),
+            ("HH24", "%H"),
+            ("HH12", "%I"),
+            ("FMDD", "%-d"),
+            ("FMMM", "%-m"),
+            ("FMMI", "%-M"),
+            ("FMSS", "%-S"),
+            ("DDD", "%j"),
+            ("ddd", "%j"),
+            ("YY", "%y"),
+            ("yy", "%y"),
+            ("MM", "%m"),
+            ("mm", "%m"),
+            ("DD", "%d"),
+            ("dd", "%d"),
+            ("MI", "%M"),
+            ("mi", "%M"),
+            ("SS", "%S"),
+            ("ss", "%S"),
+            ("US", "%f"),
+            ("OF", "%z"),
+            ("TZ", "%Z"),
+            ("WW", "%U"),
+            ("ww", "%U"),
+            ("D", "%u"),
+            ("d", "%u"),
+        ]);
+        crate::time::format_time(format, &mapping, None).unwrap_or_else(|| format.to_string())
+    }
+
+    fn formatted_str_to_time_or_fallback(
+        mut args: Vec<Expression>,
+        original_name: &str,
+    ) -> Result<Expression> {
+        let this = args.remove(0);
+        let format = args.remove(0);
+        if let Some(format) = Self::literal_string(&format) {
+            Ok(Expression::StrToTime(Box::new(
+                crate::expressions::StrToTime {
+                    this: Box::new(this),
+                    format: Self::postgres_format_to_strftime(format),
+                    zone: None,
+                    safe: None,
+                    target_type: Some(Box::new(Expression::DataType(DataType::Custom {
+                        name: "DATETIME2".to_string(),
+                    }))),
+                },
+            )))
+        } else {
+            Ok(Expression::Function(Box::new(Function::new(
+                original_name.to_string(),
+                vec![this, format],
+            ))))
+        }
+    }
+
+    fn formatted_str_to_date_or_fallback(
+        mut args: Vec<Expression>,
+        original_name: &str,
+    ) -> Result<Expression> {
+        let this = args.remove(0);
+        let format = args.remove(0);
+        if let Some(format) = Self::literal_string(&format) {
+            Ok(Expression::StrToDate(Box::new(
+                crate::expressions::StrToDate {
+                    this: Box::new(this),
+                    format: Some(Self::postgres_format_to_strftime(format)),
+                    safe: None,
+                },
+            )))
+        } else {
+            Ok(Expression::Function(Box::new(Function::new(
+                original_name.to_string(),
+                vec![this, format],
+            ))))
+        }
+    }
+
+    fn formatted_time_to_str_or_fallback(
+        mut args: Vec<Expression>,
+        original_name: &str,
+    ) -> Result<Expression> {
+        let this = args.remove(0);
+        let format = args.remove(0);
+        if let Some(format) = Self::literal_string(&format) {
+            Ok(Expression::TimeToStr(Box::new(
+                crate::expressions::TimeToStr {
+                    this: Box::new(this),
+                    format: Self::postgres_format_to_strftime(format),
+                    culture: None,
+                    zone: None,
+                },
+            )))
+        } else {
+            Ok(Expression::Function(Box::new(Function::new(
+                original_name.to_string(),
+                vec![this, format],
+            ))))
         }
     }
 

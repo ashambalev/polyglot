@@ -159,7 +159,10 @@ pub use tsql::TSQLDialect;
 
 use crate::error::Result;
 #[cfg(feature = "transpile")]
-use crate::expressions::{Cast, ColumnConstraint, Function, Identifier, Literal};
+use crate::expressions::{
+    BinaryOp, Case, Cast, ColumnConstraint, DateBin, Fetch, Function, Identifier, Interval,
+    IntervalUnit, IntervalUnitSpec, LikeOp, Literal, Top, Var,
+};
 use crate::expressions::{DataType, Expression};
 #[cfg(any(
     feature = "transpile",
@@ -4255,18 +4258,18 @@ impl Dialect {
                 let expr = transforms::eliminate_semi_and_anti_joins(expr)?;
                 let expr = transforms::ensure_bools(expr)?;
                 let expr = transforms::unnest_generate_date_array_using_recursive_cte(expr)?;
+                let expr = transforms::strip_cte_materialization(expr)?;
                 let expr = transforms::move_ctes_to_top_level(expr)?;
                 let expr = transforms::qualify_derived_table_outputs(expr)?;
                 Ok(expr)
             }
-            // Fabric shares T-SQL predicate rules: BIT values cannot be used as
-            // bare conditions in WHERE/HAVING/ON/CASE WHEN contexts. Keep this
-            // branch scoped to boolean coercion so Fabric-specific APPLY and
-            // derived-table output behavior does not inherit unrelated T-SQL
-            // preprocessing.
+            // Fabric shares T-SQL predicate rules and CTE placement restrictions,
+            // but keeps Fabric-specific APPLY and derived-table behavior separate.
             #[cfg(feature = "dialect-fabric")]
             DialectType::Fabric => {
                 let expr = transforms::ensure_bools(expr)?;
+                let expr = transforms::strip_cte_materialization(expr)?;
+                let expr = transforms::move_ctes_to_top_level(expr)?;
                 Ok(expr)
             }
             // Spark doesn't support QUALIFY (but Databricks does)
@@ -4449,6 +4452,13 @@ impl Dialect {
                 } else {
                     expr
                 };
+
+                Self::reject_postgres_tsql_strict_regex_predicates(
+                    &expr,
+                    self.dialect_type,
+                    target,
+                    opts,
+                )?;
 
                 // When source and target differ, first normalize the source dialect's
                 // AST constructs to standard SQL, so that the target dialect can handle them.
@@ -4727,6 +4737,12 @@ impl Dialect {
                 let normalized =
                     Self::cross_dialect_normalize(normalized, self.dialect_type, target)?;
 
+                let normalized = if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    Self::normalize_tsql_fetch_overlaps_date_bin(normalized)?
+                } else {
+                    normalized
+                };
+
                 let normalized =
                     if matches!(
                         self.dialect_type,
@@ -4757,7 +4773,7 @@ impl Dialect {
                 let normalized = if matches!(self.dialect_type, DialectType::PostgreSQL)
                     && matches!(target, DialectType::Fabric)
                 {
-                    Self::normalize_postgres_to_fabric_decimal_types(normalized)?
+                    Self::normalize_postgres_to_fabric_types(normalized)?
                 } else {
                     normalized
                 };
@@ -4903,6 +4919,16 @@ impl Dialect {
                     normalized
                 };
 
+                let normalized = if matches!(
+                    self.dialect_type,
+                    DialectType::PostgreSQL | DialectType::CockroachDB
+                ) && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::rewrite_postgres_format_for_tsql(normalized, target)?
+                } else {
+                    normalized
+                };
+
                 let transformed =
                     target_dialect.transform_with_guard(normalized, opts.complexity_guard)?;
 
@@ -4915,9 +4941,49 @@ impl Dialect {
                     transformed
                 };
 
+                let transformed = if matches!(
+                    self.dialect_type,
+                    DialectType::PostgreSQL | DialectType::CockroachDB
+                ) && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    crate::transforms::grouped_percentiles_to_tsql_windows(transformed)?
+                } else {
+                    transformed
+                };
+
+                let transformed = if matches!(
+                    self.dialect_type,
+                    DialectType::PostgreSQL | DialectType::CockroachDB
+                ) && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::normalize_postgres_trim_for_tsql(transformed)?
+                } else {
+                    transformed
+                };
+
+                let transformed = if matches!(
+                    self.dialect_type,
+                    DialectType::PostgreSQL | DialectType::CockroachDB
+                ) && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::rewrite_postgres_json_array_elements_select_for_tsql(transformed)?
+                } else {
+                    transformed
+                };
+
                 // DuckDB target: when FROM is RANGE(n), replace SEQ's ROW_NUMBER pattern with `range`
                 let transformed = if matches!(target, DialectType::DuckDB) {
                     Self::seq_rownum_to_range(transformed)?
+                } else {
+                    transformed
+                };
+
+                if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    Self::reject_tsql_interval_casts(&transformed, target, opts)?;
+                }
+
+                let transformed = if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    Self::rewrite_tsql_interval_casts_to_varchar(transformed)?
                 } else {
                     transformed
                 };
@@ -4972,6 +5038,10 @@ impl Dialect {
                 Self::push_unsupported_diagnostic(&mut diagnostics, "LATERAL joins and subqueries");
             }
 
+            if !Self::target_supports_distinct_on(target) && Self::node_has_distinct_on(node) {
+                Self::push_unsupported_diagnostic(&mut diagnostics, "DISTINCT ON");
+            }
+
             if !Self::target_supports_remaining_unnest(target) && Self::node_is_unnest(node) {
                 Self::push_unsupported_diagnostic(&mut diagnostics, "UNNEST");
             }
@@ -5002,19 +5072,57 @@ impl Dialect {
                 );
             }
 
+            if matches!(target, DialectType::TSQL | DialectType::Fabric)
+                && Self::node_is_row_value_subquery_comparison(node)
+            {
+                Self::push_unsupported_diagnostic(
+                    &mut diagnostics,
+                    "row-value subquery comparisons",
+                );
+            }
+
+            if matches!(target, DialectType::TSQL | DialectType::Fabric)
+                && Self::node_has_fetch_with_ties(node)
+            {
+                Self::push_unsupported_diagnostic(&mut diagnostics, "FETCH WITH TIES without TOP");
+            }
+
+            if matches!(target, DialectType::TSQL | DialectType::Fabric)
+                && Self::node_is_overlaps(node)
+            {
+                Self::push_unsupported_diagnostic(&mut diagnostics, "OVERLAPS");
+            }
+
+            if matches!(target, DialectType::TSQL | DialectType::Fabric)
+                && Self::node_is_date_bin(node)
+            {
+                Self::push_unsupported_diagnostic(&mut diagnostics, "DATE_BIN");
+            }
+
             if matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
                 && !matches!(target, DialectType::PostgreSQL | DialectType::CockroachDB)
             {
-                if Self::node_is_function_named(node, "JSONB_BUILD_OBJECT") {
+                if Self::node_is_postgres_json_build_object(node)
+                    && !(matches!(target, DialectType::TSQL | DialectType::Fabric)
+                        && Self::postgres_json_build_object_can_lower_to_json_object(node))
+                {
                     Self::push_unsupported_diagnostic(
                         &mut diagnostics,
-                        "PostgreSQL JSONB_BUILD_OBJECT",
+                        "PostgreSQL JSON_BUILD_OBJECT",
                     );
                 }
                 if Self::node_is_function_named(node, "TO_TSVECTOR") {
                     Self::push_unsupported_diagnostic(&mut diagnostics, "PostgreSQL TO_TSVECTOR");
                 }
                 if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+                    if let Some(array_semantics) =
+                        Self::postgres_tsql_unsupported_array_semantics(node)
+                    {
+                        Self::push_unsupported_diagnostic(
+                            &mut diagnostics,
+                            &format!("PostgreSQL {array_semantics}"),
+                        );
+                    }
                     if let Some(function_name) = Self::postgres_tsql_unsupported_function_name(node)
                     {
                         Self::push_unsupported_diagnostic(
@@ -5038,6 +5146,10 @@ impl Dialect {
             }
         }
 
+        if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+            Self::collect_tsql_unsupported_ordered_sets(expr, &mut diagnostics);
+        }
+
         if diagnostics.is_empty() {
             return Ok(());
         }
@@ -5058,10 +5170,119 @@ impl Dialect {
         ))
     }
 
+    fn reject_postgres_tsql_strict_regex_predicates(
+        expr: &Expression,
+        source: DialectType,
+        target: DialectType,
+        opts: &TranspileOptions,
+    ) -> Result<()> {
+        if !matches!(
+            opts.unsupported_level,
+            UnsupportedLevel::Raise | UnsupportedLevel::Immediate
+        ) || !matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
+            || !matches!(target, DialectType::TSQL | DialectType::Fabric)
+        {
+            return Ok(());
+        }
+
+        if expr.dfs().any(Self::node_is_regex_predicate) {
+            return Err(crate::error::Error::unsupported(
+                "regular expression predicates",
+                target.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn push_unsupported_diagnostic(diagnostics: &mut Vec<String>, message: &str) {
         if !diagnostics.iter().any(|existing| existing == message) {
             diagnostics.push(message.to_string());
         }
+    }
+
+    fn collect_tsql_unsupported_ordered_sets(expr: &Expression, diagnostics: &mut Vec<String>) {
+        match expr {
+            Expression::WindowFunction(window) => {
+                if let Expression::WithinGroup(within_group) = &window.this {
+                    if Self::within_group_is_mode(within_group) {
+                        Self::push_unsupported_diagnostic(
+                            diagnostics,
+                            "MODE ordered-set aggregates",
+                        );
+                        return;
+                    }
+
+                    if Self::within_group_is_percentile(within_group) {
+                        if !window.over.order_by.is_empty() || window.over.frame.is_some() {
+                            Self::push_unsupported_diagnostic(
+                                diagnostics,
+                                "PERCENTILE_CONT/PERCENTILE_DISC window ORDER BY or frame clauses",
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+            Expression::WithinGroup(within_group) => {
+                if Self::within_group_is_mode(within_group) {
+                    Self::push_unsupported_diagnostic(diagnostics, "MODE ordered-set aggregates");
+                    return;
+                }
+
+                if Self::within_group_is_percentile(within_group) {
+                    Self::push_unsupported_diagnostic(
+                        diagnostics,
+                        "PERCENTILE_CONT/PERCENTILE_DISC ordered-set aggregates without OVER",
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        for child in expr.children() {
+            Self::collect_tsql_unsupported_ordered_sets(child, diagnostics);
+        }
+    }
+
+    fn within_group_is_percentile(within_group: &crate::expressions::WithinGroup) -> bool {
+        match &within_group.this {
+            Expression::Function(function) => Self::is_percentile_ordered_set_name(&function.name),
+            Expression::AggregateFunction(function) => {
+                Self::is_percentile_ordered_set_name(&function.name)
+            }
+            Expression::PercentileCont(_) | Expression::PercentileDisc(_) => true,
+            _ => false,
+        }
+    }
+
+    fn within_group_is_mode(within_group: &crate::expressions::WithinGroup) -> bool {
+        match &within_group.this {
+            Expression::Function(function) => function.name.eq_ignore_ascii_case("MODE"),
+            Expression::AggregateFunction(function) => function.name.eq_ignore_ascii_case("MODE"),
+            Expression::Mode(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_percentile_ordered_set_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("PERCENTILE_CONT") || name.eq_ignore_ascii_case("PERCENTILE_DISC")
+    }
+
+    fn target_supports_distinct_on(target: DialectType) -> bool {
+        matches!(target, DialectType::PostgreSQL | DialectType::DuckDB)
+    }
+
+    fn node_has_distinct_on(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Select(select)
+                if select
+                    .distinct_on
+                    .as_ref()
+                    .is_some_and(|distinct_on| !distinct_on.is_empty())
+        )
     }
 
     fn node_has_recursive_with(expr: &Expression) -> bool {
@@ -5171,6 +5392,70 @@ impl Dialect {
         matches!(expr, Expression::ArrayAgg(_)) || Self::node_is_function_named(expr, "ARRAY_AGG")
     }
 
+    fn postgres_tsql_unsupported_array_semantics(expr: &Expression) -> Option<&'static str> {
+        match expr {
+            Expression::Array(_) | Expression::ArrayFunc(_) => Some("array literals"),
+            Expression::Subscript(_) => Some("array subscripts"),
+            Expression::ArraySlice(_) => Some("array slices"),
+            Expression::DataType(DataType::Array { .. }) => Some("array data types"),
+            Expression::ArrayLength(_) | Expression::ArraySize(_) => Some("ARRAY_LENGTH"),
+            Expression::Cardinality(_) => Some("CARDINALITY"),
+            Expression::ArrayToString(_) | Expression::ArrayJoin(_) => Some("ARRAY_TO_STRING"),
+            Expression::StringToArray(_) => Some("STRING_TO_ARRAY"),
+            Expression::ArrayContains(_)
+            | Expression::ArrayPosition(_)
+            | Expression::ArrayAppend(_)
+            | Expression::ArrayPrepend(_)
+            | Expression::ArrayConcat(_)
+            | Expression::ArraySort(_)
+            | Expression::ArrayReverse(_)
+            | Expression::ArrayDistinct(_)
+            | Expression::ArrayFilter(_)
+            | Expression::ArrayTransform(_)
+            | Expression::ArrayFlatten(_)
+            | Expression::ArrayCompact(_)
+            | Expression::ArrayIntersect(_)
+            | Expression::ArrayUnion(_)
+            | Expression::ArrayExcept(_)
+            | Expression::ArrayRemove(_)
+            | Expression::ArrayZip(_)
+            | Expression::ArrayAll(_)
+            | Expression::ArrayAny(_)
+            | Expression::ArrayConstructCompact(_)
+            | Expression::ArraySum(_) => Some("array functions"),
+            Expression::ArrayContainsAll(_)
+            | Expression::ArrayContainedBy(_)
+            | Expression::ArrayOverlaps(_) => Some("array operators"),
+            Expression::Function(function) => {
+                Self::postgres_tsql_unsupported_array_function_name_str(&function.name)
+            }
+            Expression::AggregateFunction(function) => {
+                Self::postgres_tsql_unsupported_array_function_name_str(&function.name)
+            }
+            _ => None,
+        }
+    }
+
+    fn postgres_tsql_unsupported_array_function_name_str(name: &str) -> Option<&'static str> {
+        if name.eq_ignore_ascii_case("ARRAY") {
+            Some("array literals")
+        } else if name.eq_ignore_ascii_case("ARRAY_LENGTH")
+            || name.eq_ignore_ascii_case("ARRAY_SIZE")
+        {
+            Some("ARRAY_LENGTH")
+        } else if name.eq_ignore_ascii_case("CARDINALITY") {
+            Some("CARDINALITY")
+        } else if name.eq_ignore_ascii_case("ARRAY_TO_STRING")
+            || name.eq_ignore_ascii_case("ARRAY_JOIN")
+        {
+            Some("ARRAY_TO_STRING")
+        } else if name.eq_ignore_ascii_case("STRING_TO_ARRAY") {
+            Some("STRING_TO_ARRAY")
+        } else {
+            None
+        }
+    }
+
     fn node_is_regex_predicate(expr: &Expression) -> bool {
         matches!(
             expr,
@@ -5195,12 +5480,399 @@ impl Dialect {
         }
     }
 
+    fn node_is_row_value_subquery_comparison(expr: &Expression) -> bool {
+        match expr {
+            Expression::In(in_expr) => {
+                Self::in_rhs_is_subquery_like(in_expr) && Self::expr_is_row_value(&in_expr.this)
+            }
+            Expression::Eq(op) | Expression::Neq(op) => {
+                (Self::expr_is_row_value(&op.left) && Self::expr_is_subquery_like(&op.right))
+                    || (Self::expr_is_row_value(&op.right) && Self::expr_is_subquery_like(&op.left))
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_is_row_value(expr: &Expression) -> bool {
+        match expr {
+            Expression::Tuple(tuple) => tuple.expressions.len() > 1,
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("ROW") => {
+                function.args.len() > 1
+            }
+            Expression::Paren(paren) => Self::expr_is_row_value(&paren.this),
+            _ => false,
+        }
+    }
+
+    fn expr_is_subquery_like(expr: &Expression) -> bool {
+        match expr {
+            Expression::Select(_) | Expression::Subquery(_) => true,
+            Expression::Paren(paren) => Self::expr_is_subquery_like(&paren.this),
+            _ => false,
+        }
+    }
+
+    fn in_rhs_is_subquery_like(in_expr: &crate::expressions::In) -> bool {
+        if in_expr
+            .query
+            .as_ref()
+            .is_some_and(Self::expr_is_subquery_like)
+        {
+            return true;
+        }
+
+        in_expr.expressions.len() == 1 && Self::expr_is_subquery_like(&in_expr.expressions[0])
+    }
+
+    fn normalize_tsql_fetch_overlaps_date_bin(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Select(mut select) => {
+                if select.top.is_none() && select.offset.is_none() {
+                    if let Some(fetch) = select.fetch.take() {
+                        if let Some(top) = Self::fetch_with_ties_to_top(fetch.clone()) {
+                            select.top = Some(top);
+                        } else {
+                            select.fetch = Some(fetch);
+                        }
+                    }
+                }
+                Self::rewrite_tsql_overlaps_in_select_predicates(&mut select)?;
+                Ok(Expression::Select(select))
+            }
+            Expression::DateBin(date_bin) => {
+                let date_bin = *date_bin;
+                if let Some(rewritten) = Self::date_bin_to_date_bucket(date_bin.clone()) {
+                    Ok(rewritten)
+                } else {
+                    Ok(Expression::DateBin(Box::new(date_bin)))
+                }
+            }
+            Expression::Function(function) => {
+                let function = *function;
+                if function.name.eq_ignore_ascii_case("DATE_BIN") {
+                    if let Some(rewritten) = Self::date_bin_function_to_date_bucket(&function) {
+                        Ok(rewritten)
+                    } else {
+                        Ok(Expression::Function(Box::new(function)))
+                    }
+                } else {
+                    Ok(Expression::Function(Box::new(function)))
+                }
+            }
+            _ => Ok(e),
+        })
+    }
+
+    fn rewrite_tsql_overlaps_in_select_predicates(
+        select: &mut crate::expressions::Select,
+    ) -> Result<()> {
+        if let Some(where_clause) = &mut select.where_clause {
+            where_clause.this = Self::rewrite_tsql_overlaps_predicate(where_clause.this.clone())?;
+        }
+        if let Some(having) = &mut select.having {
+            having.this = Self::rewrite_tsql_overlaps_predicate(having.this.clone())?;
+        }
+        if let Some(qualify) = &mut select.qualify {
+            qualify.this = Self::rewrite_tsql_overlaps_predicate(qualify.this.clone())?;
+        }
+        for join in &mut select.joins {
+            if let Some(on) = join.on.take() {
+                join.on = Some(Self::rewrite_tsql_overlaps_predicate(on)?);
+            }
+            if let Some(match_condition) = join.match_condition.take() {
+                join.match_condition =
+                    Some(Self::rewrite_tsql_overlaps_predicate(match_condition)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_tsql_overlaps_predicate(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Overlaps(overlaps) => {
+                let overlaps = *overlaps;
+                if let Some(rewritten) = Self::rewrite_full_overlaps_for_tsql(&overlaps) {
+                    Ok(rewritten)
+                } else {
+                    Ok(Expression::Overlaps(Box::new(overlaps)))
+                }
+            }
+            _ => Ok(e),
+        })
+    }
+
+    fn fetch_with_ties_to_top(fetch: Fetch) -> Option<Top> {
+        if !fetch.with_ties {
+            return None;
+        }
+
+        fetch.count.map(|count| Top {
+            this: count,
+            percent: fetch.percent,
+            with_ties: true,
+            parenthesized: true,
+        })
+    }
+
+    fn rewrite_full_overlaps_for_tsql(
+        overlaps: &crate::expressions::OverlapsExpr,
+    ) -> Option<Expression> {
+        let (left_start, left_end, right_start, right_end) =
+            if let (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) = (
+                overlaps.left_start.as_ref(),
+                overlaps.left_end.as_ref(),
+                overlaps.right_start.as_ref(),
+                overlaps.right_end.as_ref(),
+            ) {
+                (left_start, left_end, right_start, right_end)
+            } else if let (
+                Some(Expression::Tuple(left_tuple)),
+                Some(Expression::Tuple(right_tuple)),
+            ) = (&overlaps.this, &overlaps.expression)
+            {
+                if left_tuple.expressions.len() != 2 || right_tuple.expressions.len() != 2 {
+                    return None;
+                }
+                (
+                    &left_tuple.expressions[0],
+                    &left_tuple.expressions[1],
+                    &right_tuple.expressions[0],
+                    &right_tuple.expressions[1],
+                )
+            } else {
+                return None;
+            };
+
+        let left_min = Self::case_min(left_start.clone(), left_end.clone());
+        let left_max = Self::case_max(left_start.clone(), left_end.clone());
+        let right_min = Self::case_min(right_start.clone(), right_end.clone());
+        let right_max = Self::case_max(right_start.clone(), right_end.clone());
+
+        Some(Expression::And(Box::new(BinaryOp::new(
+            Expression::Lte(Box::new(BinaryOp::new(left_min, right_max))),
+            Expression::Lte(Box::new(BinaryOp::new(right_min, left_max))),
+        ))))
+    }
+
+    fn case_min(left: Expression, right: Expression) -> Expression {
+        Expression::Case(Box::new(Case {
+            operand: None,
+            whens: vec![(
+                Expression::Lte(Box::new(BinaryOp::new(left.clone(), right.clone()))),
+                left,
+            )],
+            else_: Some(right),
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn case_max(left: Expression, right: Expression) -> Expression {
+        Expression::Case(Box::new(Case {
+            operand: None,
+            whens: vec![(
+                Expression::Gte(Box::new(BinaryOp::new(left.clone(), right.clone()))),
+                left,
+            )],
+            else_: Some(right),
+            comments: Vec::new(),
+            inferred_type: None,
+        }))
+    }
+
+    fn date_bin_to_date_bucket(date_bin: DateBin) -> Option<Expression> {
+        if date_bin.unit.is_some() || date_bin.zone.is_some() {
+            return None;
+        }
+
+        let (datepart, number) = Self::date_bucket_parts(&date_bin.this)?;
+        let mut args = vec![
+            Self::date_bucket_datepart(datepart),
+            number,
+            *date_bin.expression,
+        ];
+        if let Some(origin) = date_bin.origin {
+            args.push(*origin);
+        }
+
+        Some(Expression::Function(Box::new(Function::new(
+            "DATE_BUCKET".to_string(),
+            args,
+        ))))
+    }
+
+    fn date_bin_function_to_date_bucket(function: &Function) -> Option<Expression> {
+        if !(2..=3).contains(&function.args.len()) {
+            return None;
+        }
+
+        let (datepart, number) = Self::date_bucket_parts(&function.args[0])?;
+        let mut args = vec![
+            Self::date_bucket_datepart(datepart),
+            number,
+            function.args[1].clone(),
+        ];
+        if let Some(origin) = function.args.get(2) {
+            args.push(origin.clone());
+        }
+
+        Some(Expression::Function(Box::new(Function::new(
+            "DATE_BUCKET".to_string(),
+            args,
+        ))))
+    }
+
+    fn date_bucket_parts(stride: &Expression) -> Option<(&'static str, Expression)> {
+        match stride {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::String(value) => Self::date_bucket_parts_from_string(value),
+                _ => None,
+            },
+            Expression::Interval(interval) => Self::date_bucket_parts_from_interval(interval),
+            _ => None,
+        }
+    }
+
+    fn date_bucket_parts_from_interval(interval: &Interval) -> Option<(&'static str, Expression)> {
+        match &interval.unit {
+            Some(IntervalUnitSpec::Simple { unit, .. }) => {
+                let datepart = Self::date_bucket_datepart_from_unit(*unit)?;
+                let amount = interval
+                    .this
+                    .as_ref()
+                    .and_then(Self::date_bucket_amount_expr)?;
+                Some((datepart, amount))
+            }
+            None => interval.this.as_ref().and_then(|expr| match expr {
+                Expression::Literal(lit) => match lit.as_ref() {
+                    Literal::String(value) => Self::date_bucket_parts_from_string(value),
+                    _ => None,
+                },
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn date_bucket_parts_from_string(value: &str) -> Option<(&'static str, Expression)> {
+        let mut parts = value.split_whitespace();
+        let amount = parts.next()?;
+        let unit = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+
+        Some((
+            Self::date_bucket_datepart_from_name(unit)?,
+            Self::positive_integer_expr(amount)?,
+        ))
+    }
+
+    fn date_bucket_amount_expr(expr: &Expression) -> Option<Expression> {
+        match expr {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::Number(value) => Self::positive_integer_expr(value),
+                Literal::String(value) => Self::positive_integer_expr(value),
+                _ => None,
+            },
+            _ => Some(expr.clone()),
+        }
+    }
+
+    fn positive_integer_expr(value: &str) -> Option<Expression> {
+        let parsed = value.trim().parse::<i64>().ok()?;
+        (parsed > 0).then(|| Expression::number(parsed))
+    }
+
+    fn date_bucket_datepart(datepart: &str) -> Expression {
+        Expression::Var(Box::new(Var {
+            this: datepart.to_string(),
+        }))
+    }
+
+    fn date_bucket_datepart_from_unit(unit: IntervalUnit) -> Option<&'static str> {
+        match unit {
+            IntervalUnit::Week => Some("WEEK"),
+            IntervalUnit::Day => Some("DAY"),
+            IntervalUnit::Hour => Some("HOUR"),
+            IntervalUnit::Minute => Some("MINUTE"),
+            IntervalUnit::Second => Some("SECOND"),
+            IntervalUnit::Millisecond => Some("MILLISECOND"),
+            _ => None,
+        }
+    }
+
+    fn date_bucket_datepart_from_name(unit: &str) -> Option<&'static str> {
+        match unit.trim().to_ascii_uppercase().as_str() {
+            "WEEK" | "WEEKS" | "W" | "WK" | "WKS" | "WW" => Some("WEEK"),
+            "DAY" | "DAYS" | "D" | "DD" => Some("DAY"),
+            "HOUR" | "HOURS" | "H" | "HH" | "HR" | "HRS" => Some("HOUR"),
+            "MINUTE" | "MINUTES" | "MI" | "MIN" | "MINS" | "N" => Some("MINUTE"),
+            "SECOND" | "SECONDS" | "S" | "SEC" | "SECS" | "SS" => Some("SECOND"),
+            "MILLISECOND" | "MILLISECONDS" | "MS" | "MSEC" | "MSECS" | "MILLISEC" | "MILLISECS" => {
+                Some("MILLISECOND")
+            }
+            _ => None,
+        }
+    }
+
+    fn node_has_fetch_with_ties(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Select(select)
+                if select
+                    .fetch
+                    .as_ref()
+                    .is_some_and(|fetch| fetch.with_ties)
+        )
+    }
+
+    fn node_is_overlaps(expr: &Expression) -> bool {
+        matches!(expr, Expression::Overlaps(_))
+    }
+
+    fn node_is_date_bin(expr: &Expression) -> bool {
+        matches!(expr, Expression::DateBin(_)) || Self::node_is_function_named(expr, "DATE_BIN")
+    }
+
     fn node_is_function_named(expr: &Expression, name: &str) -> bool {
         match expr {
             Expression::Function(function) => function.name.eq_ignore_ascii_case(name),
             Expression::AggregateFunction(function) => function.name.eq_ignore_ascii_case(name),
             _ => false,
         }
+    }
+
+    fn node_is_postgres_json_build_object(expr: &Expression) -> bool {
+        match expr {
+            Expression::Function(function) => {
+                function.name.eq_ignore_ascii_case("JSON_BUILD_OBJECT")
+                    || function.name.eq_ignore_ascii_case("JSONB_BUILD_OBJECT")
+            }
+            _ => false,
+        }
+    }
+
+    fn postgres_json_build_object_can_lower_to_json_object(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Function(function)
+                if (function.name.eq_ignore_ascii_case("JSON_BUILD_OBJECT")
+                    || function.name.eq_ignore_ascii_case("JSONB_BUILD_OBJECT"))
+                    && !function.distinct
+                    && function.args.len() % 2 == 0
+        )
+    }
+
+    fn node_is_postgres_json_array_elements(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Function(function)
+                if function.name.eq_ignore_ascii_case("JSON_ARRAY_ELEMENTS")
+                    || function.name.eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS")
+                    || function.name.eq_ignore_ascii_case("JSON_ARRAY_ELEMENTS_TEXT")
+                    || function.name.eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS_TEXT")
+        )
     }
 
     fn postgres_tsql_unsupported_function_name(expr: &Expression) -> Option<&'static str> {
@@ -5211,6 +5883,23 @@ impl Dialect {
             Expression::Initcap(_) => Some("INITCAP"),
             Expression::ToJson(_) => Some("TO_JSON"),
             Expression::JSONBObjectAgg(_) => Some("JSONB_OBJECT_AGG"),
+            Expression::ToNumber(_) => Some("TO_NUMBER"),
+            Expression::WidthBucket(_) => Some("WIDTH_BUCKET"),
+            Expression::BitwiseAndAgg(_) => Some("BIT_AND"),
+            Expression::BitwiseOrAgg(_) => Some("BIT_OR"),
+            Expression::BitwiseXorAgg(_) => Some("BIT_XOR"),
+            Expression::Corr(_) => Some("CORR"),
+            Expression::CovarPop(_) => Some("COVAR_POP"),
+            Expression::CovarSamp(_) => Some("COVAR_SAMP"),
+            Expression::RegrAvgx(_) => Some("REGR_AVGX"),
+            Expression::RegrAvgy(_) => Some("REGR_AVGY"),
+            Expression::RegrCount(_) => Some("REGR_COUNT"),
+            Expression::RegrIntercept(_) => Some("REGR_INTERCEPT"),
+            Expression::RegrR2(_) => Some("REGR_R2"),
+            Expression::RegrSlope(_) => Some("REGR_SLOPE"),
+            Expression::RegrSxx(_) => Some("REGR_SXX"),
+            Expression::RegrSxy(_) => Some("REGR_SXY"),
+            Expression::RegrSyy(_) => Some("REGR_SYY"),
             Expression::Function(function) => {
                 Self::postgres_tsql_unsupported_function_name_str(&function.name)
             }
@@ -5234,12 +5923,174 @@ impl Dialect {
             Some("TO_JSON")
         } else if name.eq_ignore_ascii_case("TO_JSONB") {
             Some("TO_JSONB")
-        } else if name.eq_ignore_ascii_case("JSONB_AGG") {
-            Some("JSONB_AGG")
         } else if name.eq_ignore_ascii_case("JSONB_OBJECT_AGG") {
             Some("JSONB_OBJECT_AGG")
+        } else if name.eq_ignore_ascii_case("ROW_TO_JSON") {
+            Some("ROW_TO_JSON")
+        } else if name.eq_ignore_ascii_case("JSON_ARRAY_ELEMENTS") {
+            Some("JSON_ARRAY_ELEMENTS")
+        } else if name.eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS") {
+            Some("JSONB_ARRAY_ELEMENTS")
+        } else if name.eq_ignore_ascii_case("JSON_ARRAY_ELEMENTS_TEXT") {
+            Some("JSON_ARRAY_ELEMENTS_TEXT")
+        } else if name.eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS_TEXT") {
+            Some("JSONB_ARRAY_ELEMENTS_TEXT")
+        } else if name.eq_ignore_ascii_case("ENCODE") {
+            Some("ENCODE")
+        } else if name.eq_ignore_ascii_case("AGE") {
+            Some("AGE")
+        } else if name.eq_ignore_ascii_case("ERF") {
+            Some("ERF")
+        } else if name.eq_ignore_ascii_case("GCD") {
+            Some("GCD")
+        } else if name.eq_ignore_ascii_case("LCM") {
+            Some("LCM")
+        } else if name.eq_ignore_ascii_case("QUOTE_LITERAL") {
+            Some("QUOTE_LITERAL")
+        } else if name.eq_ignore_ascii_case("WIDTH_BUCKET") {
+            Some("WIDTH_BUCKET")
+        } else if name.eq_ignore_ascii_case("PG_TYPEOF") {
+            Some("PG_TYPEOF")
+        } else if name.eq_ignore_ascii_case("BIT_AND") {
+            Some("BIT_AND")
+        } else if name.eq_ignore_ascii_case("BIT_OR") {
+            Some("BIT_OR")
+        } else if name.eq_ignore_ascii_case("BIT_XOR") {
+            Some("BIT_XOR")
+        } else if name.eq_ignore_ascii_case("CORR") {
+            Some("CORR")
+        } else if name.eq_ignore_ascii_case("COVAR_POP") {
+            Some("COVAR_POP")
+        } else if name.eq_ignore_ascii_case("COVAR_SAMP") {
+            Some("COVAR_SAMP")
+        } else if name.eq_ignore_ascii_case("REGR_AVGX") {
+            Some("REGR_AVGX")
+        } else if name.eq_ignore_ascii_case("REGR_AVGY") {
+            Some("REGR_AVGY")
+        } else if name.eq_ignore_ascii_case("REGR_COUNT") {
+            Some("REGR_COUNT")
+        } else if name.eq_ignore_ascii_case("REGR_INTERCEPT") {
+            Some("REGR_INTERCEPT")
+        } else if name.eq_ignore_ascii_case("REGR_R2") {
+            Some("REGR_R2")
+        } else if name.eq_ignore_ascii_case("REGR_SLOPE") {
+            Some("REGR_SLOPE")
+        } else if name.eq_ignore_ascii_case("REGR_SXX") {
+            Some("REGR_SXX")
+        } else if name.eq_ignore_ascii_case("REGR_SXY") {
+            Some("REGR_SXY")
+        } else if name.eq_ignore_ascii_case("REGR_SYY") {
+            Some("REGR_SYY")
         } else {
             None
+        }
+    }
+
+    fn normalize_postgres_trim_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Trim(trim) => {
+                let mut trim = *trim;
+                match trim.position {
+                    crate::expressions::TrimPosition::Both
+                        if trim.position_explicit && trim.characters.is_some() =>
+                    {
+                        trim.position_explicit = false;
+                        trim.sql_standard_syntax = true;
+                        Ok(Expression::Trim(Box::new(trim)))
+                    }
+                    crate::expressions::TrimPosition::Leading if trim.characters.is_some() => {
+                        let characters = trim.characters.take().expect("checked above");
+                        Ok(Expression::Function(Box::new(Function::new(
+                            "LTRIM",
+                            vec![trim.this, characters],
+                        ))))
+                    }
+                    crate::expressions::TrimPosition::Trailing if trim.characters.is_some() => {
+                        let characters = trim.characters.take().expect("checked above");
+                        Ok(Expression::Function(Box::new(Function::new(
+                            "RTRIM",
+                            vec![trim.this, characters],
+                        ))))
+                    }
+                    _ => Ok(Expression::Trim(Box::new(trim))),
+                }
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn rewrite_postgres_json_array_elements_select_for_tsql(
+        expr: Expression,
+    ) -> Result<Expression> {
+        let Expression::Select(select) = expr else {
+            return Ok(expr);
+        };
+        let mut select = *select;
+        if !Self::is_plain_single_projection_select(&select) {
+            return Ok(Expression::Select(Box::new(select)));
+        }
+
+        let Some(json_arg) =
+            Self::postgres_json_array_elements_projection_arg(&select.expressions[0])
+        else {
+            return Ok(Expression::Select(Box::new(select)));
+        };
+
+        select.expressions = vec![Expression::column("value")];
+        select.from = Some(From {
+            expressions: vec![Expression::OpenJSON(Box::new(
+                crate::expressions::OpenJSON {
+                    this: Box::new(json_arg),
+                    path: None,
+                    expressions: Vec::new(),
+                },
+            ))],
+        });
+
+        Ok(Expression::Select(Box::new(select)))
+    }
+
+    fn is_plain_single_projection_select(select: &crate::expressions::Select) -> bool {
+        select.expressions.len() == 1
+            && select.from.is_none()
+            && select.joins.is_empty()
+            && select.lateral_views.is_empty()
+            && select.prewhere.is_none()
+            && select.where_clause.is_none()
+            && select.group_by.is_none()
+            && select.having.is_none()
+            && select.qualify.is_none()
+            && select.order_by.is_none()
+            && select.distribute_by.is_none()
+            && select.cluster_by.is_none()
+            && select.sort_by.is_none()
+            && select.limit.is_none()
+            && select.offset.is_none()
+            && select.limit_by.is_none()
+            && select.fetch.is_none()
+            && !select.distinct
+            && select.distinct_on.is_none()
+            && select.top.is_none()
+            && select.with.is_none()
+            && select.sample.is_none()
+            && select.into.is_none()
+            && select.locks.is_empty()
+            && select.for_xml.is_empty()
+            && select.for_json.is_empty()
+            && select.exclude.is_none()
+    }
+
+    fn postgres_json_array_elements_projection_arg(expr: &Expression) -> Option<Expression> {
+        match expr {
+            Expression::Function(function)
+                if Self::node_is_postgres_json_array_elements(expr) && function.args.len() == 1 =>
+            {
+                Some(function.args[0].clone())
+            }
+            Expression::Alias(alias) => {
+                Self::postgres_json_array_elements_projection_arg(&alias.this)
+            }
+            _ => None,
         }
     }
 
@@ -5360,6 +6211,123 @@ impl Dialect {
             }
             other => Self::rewrite_tsql_boolean_embedded_queries(other),
         }
+    }
+
+    fn rewrite_postgres_format_for_tsql(
+        expr: Expression,
+        target: DialectType,
+    ) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Function(f) if f.name.eq_ignore_ascii_case("FORMAT") => {
+                Self::postgres_format_function_to_tsql(*f, target)
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn postgres_format_function_to_tsql(f: Function, target: DialectType) -> Result<Expression> {
+        let Some(format_expr) = f.args.first() else {
+            return Err(Self::unsupported_postgres_format_for_tsql(
+                target,
+                "missing format string",
+            ));
+        };
+
+        let format = match format_expr {
+            Expression::Literal(lit) if lit.is_string() => lit.value_str(),
+            _ => {
+                return Err(Self::unsupported_postgres_format_for_tsql(
+                    target,
+                    "dynamic format strings",
+                ))
+            }
+        };
+
+        let value_args = &f.args[1..];
+        let mut arg_index = 0usize;
+        let mut literal = String::new();
+        let mut segments = Vec::new();
+        let mut chars = format.chars();
+
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                literal.push(ch);
+                continue;
+            }
+
+            let Some(specifier) = chars.next() else {
+                return Err(Self::unsupported_postgres_format_for_tsql(
+                    target,
+                    "unterminated format specifier",
+                ));
+            };
+
+            match specifier {
+                '%' => literal.push('%'),
+                's' => {
+                    if !literal.is_empty() {
+                        segments.push(Expression::string(std::mem::take(&mut literal)));
+                    }
+                    let Some(arg) = value_args.get(arg_index) else {
+                        return Err(Self::unsupported_postgres_format_for_tsql(
+                            target,
+                            "not enough arguments",
+                        ));
+                    };
+                    segments.push(arg.clone());
+                    arg_index += 1;
+                }
+                other => {
+                    return Err(Self::unsupported_postgres_format_for_tsql(
+                        target,
+                        format!("unsupported format specifier %{other}"),
+                    ))
+                }
+            }
+        }
+
+        if !literal.is_empty() {
+            segments.push(Expression::string(literal));
+        }
+
+        if arg_index != value_args.len() {
+            return Err(Self::unsupported_postgres_format_for_tsql(
+                target,
+                "unused format arguments",
+            ));
+        }
+
+        Ok(Self::postgres_format_segments_to_tsql_concat(segments))
+    }
+
+    fn postgres_format_segments_to_tsql_concat(mut segments: Vec<Expression>) -> Expression {
+        if segments.is_empty() {
+            return Expression::string("");
+        }
+
+        if segments.len() == 1 {
+            let only = segments.pop().expect("one segment");
+            if matches!(&only, Expression::Literal(lit) if lit.is_string()) {
+                return only;
+            }
+
+            return Expression::Function(Box::new(Function::new(
+                "CONCAT".to_string(),
+                vec![only, Expression::string("")],
+            )));
+        }
+
+        Expression::Function(Box::new(Function::new("CONCAT".to_string(), segments)))
+    }
+
+    fn unsupported_postgres_format_for_tsql(
+        target: DialectType,
+        reason: impl Into<String>,
+    ) -> crate::error::Error {
+        crate::error::Error::unsupported(
+            format!("PostgreSQL format() ({})", reason.into()),
+            target.to_string(),
+        )
     }
 
     fn rewrite_boolean_values_in_tsql_select(
@@ -5732,6 +6700,7 @@ impl Dialect {
             | Expression::IsFalse(_)
             | Expression::Like(_)
             | Expression::ILike(_)
+            | Expression::StartsWith(_)
             | Expression::SimilarTo(_)
             | Expression::Glob(_)
             | Expression::RegexpLike(_)
@@ -5743,6 +6712,8 @@ impl Dialect {
             | Expression::Not(_)
             | Expression::Any(_)
             | Expression::All(_)
+            | Expression::NullSafeEq(_)
+            | Expression::NullSafeNeq(_)
             | Expression::EqualNull(_) => true,
             _ => false,
         }
@@ -6115,8 +7086,8 @@ impl Dialect {
         })
     }
 
-    fn normalize_postgres_to_fabric_decimal_types(expr: Expression) -> Result<Expression> {
-        fn fabric_decimal_type(dt: crate::expressions::DataType) -> crate::expressions::DataType {
+    fn normalize_postgres_to_fabric_types(expr: Expression) -> Result<Expression> {
+        fn fabric_type(dt: crate::expressions::DataType) -> crate::expressions::DataType {
             use crate::expressions::DataType;
 
             match dt {
@@ -6127,20 +7098,23 @@ impl Dialect {
                     precision: Some(38),
                     scale: Some(10),
                 },
+                DataType::Json | DataType::JsonB => DataType::Custom {
+                    name: "VARCHAR(MAX)".to_string(),
+                },
                 _ => dt,
             }
         }
 
         transform_recursive(expr, &|e| match e {
-            Expression::DataType(dt) => Ok(Expression::DataType(fabric_decimal_type(dt))),
+            Expression::DataType(dt) => Ok(Expression::DataType(fabric_type(dt))),
             Expression::CreateTable(mut ct) => {
                 for column in &mut ct.columns {
-                    column.data_type = fabric_decimal_type(column.data_type.clone());
+                    column.data_type = fabric_type(column.data_type.clone());
                 }
                 Ok(Expression::CreateTable(ct))
             }
             Expression::ColumnDef(mut col) => {
-                col.data_type = fabric_decimal_type(col.data_type);
+                col.data_type = fabric_type(col.data_type);
                 Ok(Expression::ColumnDef(col))
             }
             _ => Ok(e),
@@ -7127,6 +8101,108 @@ impl Dialect {
         sql
     }
 
+    #[cfg(feature = "transpile")]
+    fn wrap_tsql_top_level_values(expr: Expression) -> Expression {
+        match expr {
+            Expression::Values(values) => Self::tsql_values_as_select(*values),
+            Expression::Union(mut union) => {
+                let left = std::mem::replace(&mut union.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut union.right, Expression::Null(Null));
+                union.left = Self::wrap_tsql_values_set_operand(left);
+                union.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Union(union)
+            }
+            Expression::Intersect(mut intersect) => {
+                let left = std::mem::replace(&mut intersect.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut intersect.right, Expression::Null(Null));
+                intersect.left = Self::wrap_tsql_values_set_operand(left);
+                intersect.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Intersect(intersect)
+            }
+            Expression::Except(mut except) => {
+                let left = std::mem::replace(&mut except.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut except.right, Expression::Null(Null));
+                except.left = Self::wrap_tsql_values_set_operand(left);
+                except.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Except(except)
+            }
+            other => other,
+        }
+    }
+
+    #[cfg(feature = "transpile")]
+    fn wrap_tsql_values_set_operand(expr: Expression) -> Expression {
+        match expr {
+            Expression::Values(values) => Self::tsql_values_as_select(*values),
+            Expression::Union(mut union) => {
+                let left = std::mem::replace(&mut union.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut union.right, Expression::Null(Null));
+                union.left = Self::wrap_tsql_values_set_operand(left);
+                union.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Union(union)
+            }
+            Expression::Intersect(mut intersect) => {
+                let left = std::mem::replace(&mut intersect.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut intersect.right, Expression::Null(Null));
+                intersect.left = Self::wrap_tsql_values_set_operand(left);
+                intersect.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Intersect(intersect)
+            }
+            Expression::Except(mut except) => {
+                let left = std::mem::replace(&mut except.left, Expression::Null(Null));
+                let right = std::mem::replace(&mut except.right, Expression::Null(Null));
+                except.left = Self::wrap_tsql_values_set_operand(left);
+                except.right = Self::wrap_tsql_values_set_operand(right);
+                Expression::Except(except)
+            }
+            other => other,
+        }
+    }
+
+    #[cfg(feature = "transpile")]
+    fn tsql_values_as_select(mut values: crate::expressions::Values) -> Expression {
+        let column_aliases = if values.column_aliases.is_empty() {
+            let column_count = values
+                .expressions
+                .first()
+                .map(|row| row.expressions.len())
+                .unwrap_or(0);
+            (1..=column_count)
+                .map(|index| Identifier::new(format!("column{index}")))
+                .collect()
+        } else {
+            std::mem::take(&mut values.column_aliases)
+        };
+
+        values.alias = None;
+
+        let values_subquery = Expression::Subquery(Box::new(crate::expressions::Subquery {
+            this: Expression::Values(Box::new(values)),
+            alias: Some(Identifier::new("_v")),
+            column_aliases,
+            alias_explicit_as: false,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        let mut select = crate::expressions::Select::new();
+        select.expressions = vec![Expression::star()];
+        select.from = Some(From {
+            expressions: vec![values_subquery],
+        });
+
+        Expression::Select(Box::new(select))
+    }
+
     /// Apply cross-dialect semantic normalizations that depend on knowing both source and target.
     /// This handles cases where the same syntax has different semantics across dialects.
     fn cross_dialect_normalize(
@@ -7167,6 +8243,10 @@ impl Dialect {
             BigQueryApproxQuantiles, // APPROX_QUANTILES(x, n) -> APPROX_QUANTILE(x, [quantiles]) for DuckDB
             GenericFunctionNormalize, // Cross-dialect function renaming (non-BigQuery sources)
             RegexpLikeToDuckDB,      // RegexpLike -> REGEXP_MATCHES for DuckDB target
+            RegexpLikeToTsqlPatindex, // RegexpLike/RegexpILike -> PATINDEX(...) > 0 for TSQL/Fabric
+            SimilarToToTsqlLike,     // SimilarTo -> LIKE for TSQL/Fabric-compatible patterns
+            PostgresJsonBuildObjectToJsonObject, // json[b]_build_object -> JSON_OBJECT
+            PostgresJsonAggToJsonArrayAgg, // json[b]_agg -> JSON_ARRAYAGG
             EpochConvert,            // Expression::Epoch -> target-specific epoch function
             EpochMsConvert,          // Expression::EpochMs -> target-specific epoch ms function
             TSQLTypeNormalize, // TSQL types (MONEY, SMALLMONEY, REAL, DATETIME2) -> standard types
@@ -7253,14 +8333,15 @@ impl Dialect {
             GenerateSeriesConvert, // GENERATE_SERIES -> SEQUENCE/UNNEST(SEQUENCE)/EXPLODE(SEQUENCE)
             ConcatCoalesceWrap, // CONCAT(a, b) -> CONCAT(COALESCE(CAST(a), ''), ...) for Presto/ClickHouse
             PipeConcatToConcat, // a || b -> CONCAT(CAST(a), CAST(b)) for Presto
-            DivFuncConvert,     // DIV(a, b) -> a // b for DuckDB, CAST for BigQuery
+            DivFuncConvert,     // DIV(a, b) -> target-specific integer division
+            CbrtToPower,        // CBRT(x) -> POWER(CAST(x AS FLOAT), 1.0 / 3.0)
             JsonObjectAggConvert, // JSON_OBJECT_AGG -> JSON_GROUP_OBJECT for DuckDB
             JsonbExistsConvert, // JSONB_EXISTS -> JSON_EXISTS for DuckDB
             DateBinConvert,     // DATE_BIN -> TIME_BUCKET for DuckDB
             MysqlCastCharToText, // MySQL CAST(x AS CHAR) -> CAST(x AS TEXT/VARCHAR/STRING) for targets
             SparkCastVarcharToString, // Spark CAST(x AS VARCHAR/CHAR) -> CAST(x AS STRING) for Spark targets
             JsonExtractToArrow,       // JSON_EXTRACT(x, path) -> x -> path for SQLite/DuckDB
-            JsonExtractToTsql, // JSON_EXTRACT/JSON_EXTRACT_SCALAR -> ISNULL(JSON_QUERY, JSON_VALUE) for TSQL
+            JsonExtractToTsql, // JSON operators/functions -> T-SQL/Fabric JSON_QUERY/JSON_VALUE
             JsonExtractToClickHouse, // JSON_EXTRACT/JSON_EXTRACT_SCALAR -> JSONExtractString for ClickHouse
             JsonExtractScalarConvert, // JSON_EXTRACT_SCALAR -> target-specific (PostgreSQL, Snowflake, SQLite)
             JsonPathNormalize, // Normalize JSON path format (brackets, wildcards, quotes) for various dialects
@@ -7677,6 +8758,12 @@ impl Dialect {
             expr
         };
 
+        let expr = if matches!(target, DialectType::TSQL | DialectType::Fabric) {
+            Self::wrap_tsql_top_level_values(expr)
+        } else {
+            expr
+        };
+
         // PostgreSQL CREATE INDEX: add NULLS FIRST to index columns that don't have nulls ordering
         let expr = if matches!(target, DialectType::PostgreSQL) {
             if let Expression::CreateIndex(mut ci) = expr {
@@ -7694,6 +8781,35 @@ impl Dialect {
         };
 
         transform_recursive(expr, &|e| {
+            if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
+                && matches!(target, DialectType::TSQL | DialectType::Fabric)
+            {
+                if let Expression::Round(mut f) = e {
+                    if f.decimals.is_none() {
+                        f.decimals = Some(Expression::number(0));
+                    }
+                    return Ok(Expression::Round(f));
+                }
+
+                if let Expression::Function(f) = &e {
+                    if f.name.eq_ignore_ascii_case("ROUND") && f.args.len() == 1 {
+                        let mut f = f.clone();
+                        f.args.push(Expression::number(0));
+                        return Ok(Expression::Function(f));
+                    }
+                }
+
+                if let Expression::Log(f) = e {
+                    if f.base.is_none() {
+                        return Ok(Expression::Function(Box::new(Function::new(
+                            "LOG10".to_string(),
+                            vec![f.this],
+                        ))));
+                    }
+                    return Ok(Expression::Log(f));
+                }
+            }
+
             // BigQuery CAST(ARRAY[STRUCT(...)] AS STRUCT_TYPE[]) -> DuckDB: convert unnamed Structs to ROW()
             // This converts auto-named struct literals {'_0': x, '_1': y} inside typed arrays to ROW(x, y)
             if matches!(source, DialectType::BigQuery) && matches!(target, DialectType::DuckDB) {
@@ -9465,10 +10581,35 @@ impl Dialect {
                                 "CONCAT" if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
                                     && matches!(target, DialectType::Presto | DialectType::Trino | DialectType::ClickHouse) => Action::ConcatCoalesceWrap,
                                 "CONCAT" => Action::GenericFunctionNormalize,
+                                // CBRT(x) -> POWER(CAST(x AS FLOAT), 1.0 / 3.0)
+                                "CBRT" if f.args.len() == 1
+                                    && Self::is_postgres_family_source(source)
+                                    && matches!(target, DialectType::TSQL | DialectType::Fabric) => Action::CbrtToPower,
+                                "JSON_BUILD_OBJECT" | "JSONB_BUILD_OBJECT"
+                                    if Self::is_postgres_family_source(source)
+                                        && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                                        && f.args.len() % 2 == 0 =>
+                                {
+                                    Action::PostgresJsonBuildObjectToJsonObject
+                                }
+                                "JSON_AGG" | "JSONB_AGG"
+                                    if Self::is_postgres_family_source(source)
+                                        && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                                        && f.args.len() == 1 =>
+                                {
+                                    Action::PostgresJsonAggToJsonArrayAgg
+                                }
                                 // DIV(a, b) -> target-specific integer division
                                 "DIV" if f.args.len() == 2
-                                    && matches!(source, DialectType::PostgreSQL)
-                                    && matches!(target, DialectType::DuckDB | DialectType::BigQuery | DialectType::SQLite) => Action::DivFuncConvert,
+                                    && Self::is_postgres_family_source(source)
+                                    && matches!(
+                                        target,
+                                        DialectType::DuckDB
+                                            | DialectType::BigQuery
+                                            | DialectType::SQLite
+                                            | DialectType::TSQL
+                                            | DialectType::Fabric
+                                    ) => Action::DivFuncConvert,
                                 // JSON_OBJECT_AGG/JSONB_OBJECT_AGG -> JSON_GROUP_OBJECT for DuckDB
                                 "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" if f.args.len() == 2
                                     && matches!(target, DialectType::DuckDB) => Action::JsonObjectAggConvert,
@@ -9491,6 +10632,12 @@ impl Dialect {
                         let name = af.name.to_ascii_uppercase();
                         match name.as_str() {
                             "ARBITRARY" | "AGGREGATE" => Action::GenericFunctionNormalize,
+                            "JSON_AGG" | "JSONB_AGG"
+                                if Self::is_postgres_family_source(source)
+                                    && matches!(target, DialectType::TSQL | DialectType::Fabric) =>
+                            {
+                                Action::PostgresJsonAggToJsonArrayAgg
+                            }
                             "JSON_ARRAYAGG" => Action::GenericFunctionNormalize,
                             // JSON_OBJECT_AGG/JSONB_OBJECT_AGG -> JSON_GROUP_OBJECT for DuckDB
                             "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG"
@@ -10160,6 +11307,22 @@ impl Dialect {
                     {
                         Action::RlikeSnowflakeToDuckDB
                     }
+                    // PostgreSQL regex predicates have no native T-SQL/Fabric equivalent.
+                    // Default mode emits a best-effort PATINDEX predicate; strict mode rejects
+                    // before this rewrite runs.
+                    Expression::RegexpLike(_) | Expression::RegexpILike(_)
+                        if matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
+                            && matches!(target, DialectType::TSQL | DialectType::Fabric) =>
+                    {
+                        Action::RegexpLikeToTsqlPatindex
+                    }
+                    Expression::SimilarTo(s)
+                        if matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
+                            && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                            && Self::similar_to_can_lower_to_tsql_like(s) =>
+                    {
+                        Action::SimilarToToTsqlLike
+                    }
                     // RegexpLike from non-DuckDB/non-Snowflake sources -> REGEXP_MATCHES for DuckDB target
                     Expression::RegexpLike(_)
                         if !matches!(source, DialectType::DuckDB)
@@ -10362,14 +11525,20 @@ impl Dialect {
                     {
                         Action::TempTableHash
                     }
-                    // JSON_EXTRACT -> ISNULL(JSON_QUERY, JSON_VALUE) for TSQL
+                    // JSON_EXTRACT / PostgreSQL `->` -> T-SQL JSON functions
                     Expression::JsonExtract(_)
                         if matches!(target, DialectType::TSQL | DialectType::Fabric) =>
                     {
                         Action::JsonExtractToTsql
                     }
-                    // JSON_EXTRACT_SCALAR -> ISNULL(JSON_QUERY, JSON_VALUE) for TSQL
+                    // JSON_EXTRACT_SCALAR / PostgreSQL `->>`/`#>>` -> T-SQL JSON functions
                     Expression::JsonExtractScalar(_)
+                        if matches!(target, DialectType::TSQL | DialectType::Fabric) =>
+                    {
+                        Action::JsonExtractToTsql
+                    }
+                    // PostgreSQL `#>` -> T-SQL/Fabric JSON_QUERY
+                    Expression::JsonExtractPath(_)
                         if matches!(target, DialectType::TSQL | DialectType::Fabric) =>
                     {
                         Action::JsonExtractToTsql
@@ -11015,6 +12184,12 @@ impl Dialect {
                     }
                     // Note: PostgreSQL ^ is now parsed as Power directly (not BitwiseXor).
                     // PostgreSQL # is parsed as BitwiseXor (which is correct).
+                    Expression::Cbrt(_)
+                        if Self::is_postgres_family_source(source)
+                            && matches!(target, DialectType::TSQL | DialectType::Fabric) =>
+                    {
+                        Action::CbrtToPower
+                    }
                     // a || b (Concat operator) -> CONCAT function for Presto/Trino
                     Expression::Concat(ref _op)
                         if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
@@ -11030,7 +12205,8 @@ impl Dialect {
                 Action::None => {
                     // Handle inline transforms that don't need a dedicated action
                     if matches!(target, DialectType::TSQL | DialectType::Fabric) {
-                        if let Some(rewritten) = Self::rewrite_tsql_interval_arithmetic(&e) {
+                        if let Some(rewritten) = Self::rewrite_tsql_interval_arithmetic(&e, source)
+                        {
                             return Ok(rewritten);
                         }
                     }
@@ -13532,6 +14708,11 @@ impl Dialect {
                                     DialectType::Doris | DialectType::StarRocks => {
                                         "SPLIT_BY_STRING"
                                     }
+                                    DialectType::TSQL | DialectType::Fabric
+                                        if name == "STRING_TO_ARRAY" =>
+                                    {
+                                        "STRING_TO_ARRAY"
+                                    }
                                     DialectType::PostgreSQL | DialectType::Redshift => {
                                         "STRING_TO_ARRAY"
                                     }
@@ -13716,8 +14897,12 @@ impl Dialect {
                                                 Function::new("ARRAY_LENGTH".to_string(), all_args),
                                             )));
                                         }
-                                        DialectType::PostgreSQL | DialectType::Redshift => {
-                                            // Keep ARRAY_LENGTH with dimension arg
+                                        DialectType::PostgreSQL
+                                        | DialectType::Redshift
+                                        | DialectType::TSQL
+                                        | DialectType::Fabric => {
+                                            // Keep ARRAY_LENGTH with dimension args when there is
+                                            // no safe target-specific array representation.
                                             let mut all_args = vec![arr];
                                             all_args.extend(args);
                                             return Ok(Expression::Function(Box::new(
@@ -14377,7 +15562,7 @@ impl Dialect {
                                             new_args,
                                         ))))
                                     }
-                                    DialectType::TSQL => {
+                                    DialectType::TSQL | DialectType::Fabric => {
                                         // ISNULL(JSON_QUERY(json, '$.path'), JSON_VALUE(json, '$.path'))
                                         let jq = Expression::Function(Box::new(Function::new(
                                             "JSON_QUERY".to_string(),
@@ -16153,6 +17338,14 @@ impl Dialect {
                                         f.args,
                                     ))))
                                 }
+                                DialectType::TSQL | DialectType::Fabric
+                                    if matches!(
+                                        source,
+                                        DialectType::PostgreSQL | DialectType::CockroachDB
+                                    ) =>
+                                {
+                                    Ok(Expression::Function(f))
+                                }
                                 DialectType::TSQL => Ok(Expression::Function(Box::new(
                                     Function::new("STRING_AGG".to_string(), f.args),
                                 ))),
@@ -16438,6 +17631,17 @@ impl Dialect {
                                             "REGEXP_MATCHES".to_string(),
                                             new_args,
                                         ))))
+                                    }
+                                    DialectType::TSQL | DialectType::Fabric
+                                        if flags.is_none()
+                                            && matches!(
+                                                source,
+                                                DialectType::PostgreSQL | DialectType::CockroachDB
+                                            ) =>
+                                    {
+                                        Ok(Self::build_tsql_regex_patindex_predicate(
+                                            str_expr, pattern, false,
+                                        ))
                                     }
                                     _ => Ok(Expression::RegexpLike(Box::new(
                                         crate::expressions::RegexpFunc {
@@ -21101,6 +22305,28 @@ impl Dialect {
                                         };
                                         s.clone()
                                     }
+                                    Expression::Cast(cast)
+                                        if cast.format.is_none()
+                                            && cast.default.is_none()
+                                            && Self::unit_cast_target_is_string(&cast.to)
+                                            && matches!(
+                                                &cast.this,
+                                                Expression::Literal(lit)
+                                                    if matches!(
+                                                        lit.as_ref(),
+                                                        crate::expressions::Literal::String(_)
+                                                    )
+                                            ) =>
+                                    {
+                                        let Expression::Literal(lit) = &cast.this else {
+                                            unreachable!()
+                                        };
+                                        let crate::expressions::Literal::String(s) = lit.as_ref()
+                                        else {
+                                            unreachable!()
+                                        };
+                                        s.clone()
+                                    }
                                     Expression::Column(col) => col.name.name.clone(),
                                     _ => unit_str.clone(),
                                 };
@@ -24249,6 +25475,61 @@ impl Dialect {
                         Ok(e)
                     }
                 }
+                Action::RegexpLikeToTsqlPatindex => {
+                    match e {
+                        Expression::RegexpLike(f) => Ok(Self::build_tsql_regex_patindex_predicate(
+                            f.this, f.pattern, false,
+                        )),
+                        Expression::RegexpILike(f) => Ok(
+                            Self::build_tsql_regex_patindex_predicate(*f.this, *f.expression, true),
+                        ),
+                        _ => Ok(e),
+                    }
+                }
+                Action::SimilarToToTsqlLike => match e {
+                    Expression::SimilarTo(f) => {
+                        let like = Expression::Like(Box::new(LikeOp {
+                            left: f.this,
+                            right: f.pattern,
+                            escape: f.escape,
+                            quantifier: None,
+                            inferred_type: None,
+                        }));
+                        if f.not {
+                            Ok(Expression::Not(Box::new(crate::expressions::UnaryOp::new(
+                                like,
+                            ))))
+                        } else {
+                            Ok(like)
+                        }
+                    }
+                    _ => Ok(e),
+                },
+                Action::PostgresJsonBuildObjectToJsonObject => match e {
+                    Expression::Function(f) => Ok(Expression::JsonObject(
+                        Self::build_json_object_from_pairs(f.args)
+                            .expect("action selected only for even key/value argument lists"),
+                    )),
+                    _ => Ok(e),
+                },
+                Action::PostgresJsonAggToJsonArrayAgg => match e {
+                    Expression::Function(f) if f.args.len() == 1 => {
+                        let mut args = f.args;
+                        Ok(Expression::JsonArrayAgg(Box::new(
+                            crate::expressions::JsonArrayAggFunc {
+                                this: args.remove(0),
+                                order_by: None,
+                                null_handling: None,
+                                filter: None,
+                            },
+                        )))
+                    }
+                    Expression::AggregateFunction(mut af) => {
+                        af.name = "JSON_ARRAYAGG".to_string();
+                        Ok(Expression::AggregateFunction(af))
+                    }
+                    _ => Ok(e),
+                },
                 Action::EpochConvert => {
                     if let Expression::Epoch(f) = e {
                         let arg = f.this;
@@ -25447,18 +26728,51 @@ impl Dialect {
                 }
 
                 Action::JsonExtractToTsql => {
-                    // JSON_EXTRACT/JSON_EXTRACT_SCALAR -> ISNULL(JSON_QUERY(x, path), JSON_VALUE(x, path)) for TSQL
-                    let (this, path) = match e {
-                        Expression::JsonExtract(f) => (f.this, f.path),
-                        Expression::JsonExtractScalar(f) => (f.this, f.path),
+                    // PostgreSQL JSON operators need rooted T-SQL JSON paths. Generic
+                    // JSON_EXTRACT keeps the historical SQLGlot-style query/value fallback.
+                    let (this, path, func_name) = match e {
+                        Expression::JsonExtract(f) => {
+                            let path = Self::normalize_tsql_json_path_expr(f.path, false, false);
+                            if f.arrow_syntax {
+                                (f.this, path, Some("JSON_QUERY"))
+                            } else {
+                                (f.this, path, None)
+                            }
+                        }
+                        Expression::JsonExtractScalar(f) => {
+                            let path = Self::normalize_tsql_json_path_expr(
+                                f.path,
+                                f.hash_arrow_syntax,
+                                f.hash_arrow_syntax,
+                            );
+                            if f.arrow_syntax || f.hash_arrow_syntax {
+                                (f.this, path, Some("JSON_VALUE"))
+                            } else {
+                                (f.this, path, None)
+                            }
+                        }
+                        Expression::JsonExtractPath(f) => {
+                            let path = Self::normalize_tsql_json_path_parts(f.paths);
+                            (f.this, path, Some("JSON_QUERY"))
+                        }
                         _ => return Ok(e),
                     };
-                    // Transform path: strip wildcards, convert bracket notation to dot notation
+
+                    if let Some(func_name) = func_name {
+                        return Ok(Self::build_tsql_json_function(func_name, this, path));
+                    }
+
+                    // Transform path: strip wildcards, convert bracket notation to dot notation,
+                    // and make sure the path is rooted for T-SQL JSON functions.
                     let transformed_path = if let Expression::Literal(ref lit) = path {
                         if let Literal::String(ref s) = lit.as_ref() {
                             let stripped = Self::strip_json_wildcards(s);
                             let dotted = Self::bracket_to_dot_notation(&stripped);
-                            Expression::string(&dotted)
+                            Self::normalize_tsql_json_path_expr(
+                                Expression::string(&dotted),
+                                false,
+                                false,
+                            )
                         } else {
                             path.clone()
                         }
@@ -29091,6 +30405,9 @@ impl Dialect {
                                         inferred_type: None,
                                     })))
                                 }
+                                DialectType::TSQL | DialectType::Fabric => {
+                                    Ok(Self::build_tsql_div_func(a, b, target))
+                                }
                                 _ => Ok(Expression::Function(f)),
                             }
                         } else {
@@ -29100,6 +30417,15 @@ impl Dialect {
                         Ok(e)
                     }
                 }
+
+                Action::CbrtToPower => match e {
+                    Expression::Cbrt(f) => Ok(Self::build_tsql_cbrt_power(f.this)),
+                    Expression::Function(f) if f.args.len() == 1 => {
+                        let mut args = f.args;
+                        Ok(Self::build_tsql_cbrt_power(args.remove(0)))
+                    }
+                    _ => Ok(e),
+                },
 
                 Action::JsonObjectAggConvert => {
                     // JSON_OBJECT_AGG/JSONB_OBJECT_AGG -> JSON_GROUP_OBJECT for DuckDB
@@ -33305,6 +34631,238 @@ impl Dialect {
         parts
     }
 
+    /// Normalize a JSON path operand for T-SQL/Fabric JSON_QUERY/JSON_VALUE.
+    ///
+    /// PostgreSQL arrow operators accept bare keys (`json -> 'name'`) and numeric
+    /// array indexes (`json -> 0`), while T-SQL JSON paths must be rooted at `$`.
+    /// PostgreSQL #>/#>> path arrays (`'{a,0}'`) are also converted here.
+    fn normalize_tsql_json_path_expr(
+        path: Expression,
+        postgres_path_array_literal: bool,
+        string_numbers_are_indexes: bool,
+    ) -> Expression {
+        match path {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::String(s) => {
+                    let normalized = if postgres_path_array_literal {
+                        if let Some(parts) = Self::parse_postgres_json_path_array_literal(s) {
+                            Self::tsql_json_path_from_segments(&parts, true)
+                        } else {
+                            Self::normalize_tsql_json_path_string(s, string_numbers_are_indexes)
+                        }
+                    } else {
+                        Self::normalize_tsql_json_path_string(s, string_numbers_are_indexes)
+                    };
+                    Expression::string(normalized)
+                }
+                Literal::Number(n) => Expression::string(format!("$[{n}]")),
+                _ => Expression::Literal(lit),
+            },
+            other => other,
+        }
+    }
+
+    fn normalize_tsql_json_path_parts(paths: Vec<Expression>) -> Expression {
+        if paths.len() == 1 {
+            return Self::normalize_tsql_json_path_expr(
+                paths.into_iter().next().expect("checked len"),
+                true,
+                true,
+            );
+        }
+
+        let mut segments = Vec::new();
+        for path in paths {
+            match path {
+                Expression::Literal(lit) => match lit.as_ref() {
+                    Literal::String(s) => {
+                        if let Some(parts) = Self::parse_postgres_json_path_array_literal(s) {
+                            segments.extend(parts);
+                        } else {
+                            segments.push(s.clone());
+                        }
+                    }
+                    Literal::Number(n) => segments.push(n.clone()),
+                    _ => return Expression::Literal(lit),
+                },
+                other => return other,
+            }
+        }
+
+        Expression::string(Self::tsql_json_path_from_segments(&segments, true))
+    }
+
+    fn normalize_tsql_json_path_string(path: &str, string_numbers_are_indexes: bool) -> String {
+        let trimmed = path.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        if trimmed.starts_with('$') || lower.starts_with("lax $") || lower.starts_with("strict $") {
+            return Self::bracket_to_dot_notation(trimmed);
+        }
+
+        if trimmed.starts_with('[') {
+            return format!("${}", Self::bracket_to_dot_notation(trimmed));
+        }
+
+        if string_numbers_are_indexes && Self::is_json_array_index(trimmed) {
+            return format!("$[{trimmed}]");
+        }
+
+        let mut result = "$".to_string();
+        Self::push_tsql_json_path_segment(&mut result, trimmed, false);
+        result
+    }
+
+    fn parse_postgres_json_path_array_literal(path: &str) -> Option<Vec<String>> {
+        let trimmed = path.trim();
+        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            return None;
+        }
+
+        let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut chars = inner.chars().peekable();
+        let mut in_quotes = false;
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if in_quotes {
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => {
+                        if matches!(chars.peek(), Some('"')) {
+                            current.push('"');
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    }
+                    _ => current.push(ch),
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_quotes = true,
+                ',' => {
+                    parts.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        parts.push(current.trim().to_string());
+        Some(parts)
+    }
+
+    fn tsql_json_path_from_segments(
+        segments: &[String],
+        numeric_strings_are_indexes: bool,
+    ) -> String {
+        let mut path = "$".to_string();
+        for segment in segments {
+            Self::push_tsql_json_path_segment(&mut path, segment, numeric_strings_are_indexes);
+        }
+        path
+    }
+
+    fn push_tsql_json_path_segment(
+        path: &mut String,
+        segment: &str,
+        numeric_string_is_index: bool,
+    ) {
+        if numeric_string_is_index && Self::is_json_array_index(segment) {
+            path.push('[');
+            path.push_str(segment);
+            path.push(']');
+            return;
+        }
+
+        if Self::is_simple_json_path_key(segment) {
+            path.push('.');
+            path.push_str(segment);
+        } else {
+            path.push_str(".\"");
+            path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
+            path.push('"');
+        }
+    }
+
+    fn is_json_array_index(segment: &str) -> bool {
+        !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
+    }
+
+    fn is_simple_json_path_key(segment: &str) -> bool {
+        !segment.is_empty()
+            && !segment.starts_with('$')
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn build_tsql_json_function(name: &str, this: Expression, path: Expression) -> Expression {
+        let (this, path) = Self::collapse_nested_tsql_json_query(this, path);
+        Expression::Function(Box::new(crate::expressions::Function::new(
+            name.to_string(),
+            vec![this, path],
+        )))
+    }
+
+    fn collapse_nested_tsql_json_query(
+        this: Expression,
+        path: Expression,
+    ) -> (Expression, Expression) {
+        if let Expression::Function(f) = &this {
+            if f.name.eq_ignore_ascii_case("JSON_QUERY") && f.args.len() == 2 {
+                if let (Some(prefix), Some(suffix)) = (
+                    Self::literal_string_value(&f.args[1]),
+                    Self::literal_string_value(&path),
+                ) {
+                    if let Some(combined) = Self::join_tsql_json_paths(prefix, suffix) {
+                        return (f.args[0].clone(), Expression::string(combined));
+                    }
+                }
+            }
+        }
+
+        (this, path)
+    }
+
+    fn literal_string_value(expr: &Expression) -> Option<&str> {
+        match expr {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::String(s) => Some(s.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn join_tsql_json_paths(prefix: &str, suffix: &str) -> Option<String> {
+        if prefix == "$" {
+            return Some(suffix.to_string());
+        }
+        if suffix == "$" {
+            return Some(prefix.to_string());
+        }
+
+        if let Some(rest) = suffix.strip_prefix("$.") {
+            Some(format!("{prefix}.{rest}"))
+        } else {
+            suffix
+                .strip_prefix("$[")
+                .map(|rest| format!("{prefix}[{rest}"))
+        }
+    }
+
     /// Strip `$` prefix from a JSON path, keeping the rest.
     /// `$.y[0].z` -> `y[0].z`, `$["a b"]` -> `["a b"]`
     fn strip_json_dollar_prefix(path: &str) -> String {
@@ -34005,6 +35563,132 @@ impl Dialect {
         }
     }
 
+    fn cast_expr(this: Expression, to: DataType) -> Expression {
+        Expression::Cast(Box::new(Cast {
+            this,
+            to,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        }))
+    }
+
+    fn lower_expr(this: Expression) -> Expression {
+        Expression::Function(Box::new(Function::new("LOWER".to_string(), vec![this])))
+    }
+
+    fn build_tsql_regex_patindex_predicate(
+        this: Expression,
+        pattern: Expression,
+        case_insensitive: bool,
+    ) -> Expression {
+        let (this, pattern) = if case_insensitive {
+            (Self::lower_expr(this), Self::lower_expr(pattern))
+        } else {
+            (this, pattern)
+        };
+        let patindex = Expression::Function(Box::new(Function::new(
+            "PATINDEX".to_string(),
+            vec![pattern, this],
+        )));
+
+        Expression::Gt(Box::new(BinaryOp::new(patindex, Expression::number(0))))
+    }
+
+    fn similar_to_can_lower_to_tsql_like(f: &crate::expressions::SimilarToExpr) -> bool {
+        match &f.pattern {
+            Expression::Literal(literal) if literal.is_string() => {
+                Self::similar_to_literal_pattern_is_like_compatible(literal.value_str())
+            }
+            _ => false,
+        }
+    }
+
+    fn similar_to_literal_pattern_is_like_compatible(pattern: &str) -> bool {
+        if pattern.contains('\\') {
+            return false;
+        }
+
+        !pattern
+            .chars()
+            .any(|ch| matches!(ch, '|' | '*' | '+' | '?' | '{' | '}' | '(' | ')'))
+    }
+
+    fn build_json_object_from_pairs(
+        args: Vec<Expression>,
+    ) -> Option<Box<crate::expressions::JsonObjectFunc>> {
+        if args.len() % 2 != 0 {
+            return None;
+        }
+
+        let mut pairs = Vec::with_capacity(args.len() / 2);
+        let mut iter = args.into_iter();
+        while let Some(key) = iter.next() {
+            let value = iter.next()?;
+            pairs.push((key, value));
+        }
+
+        Some(Box::new(crate::expressions::JsonObjectFunc {
+            pairs,
+            null_handling: None,
+            with_unique_keys: false,
+            returning_type: None,
+            format_json: false,
+            encoding: None,
+            star: false,
+        }))
+    }
+
+    fn build_tsql_div_func(left: Expression, right: Expression, target: DialectType) -> Expression {
+        let cast_left = Self::cast_expr(
+            left,
+            DataType::Double {
+                precision: None,
+                scale: None,
+            },
+        );
+        let divided = Expression::Div(Box::new(BinaryOp::new(cast_left, right)));
+        let cast_int = Self::cast_expr(
+            divided,
+            DataType::Int {
+                length: None,
+                integer_spelling: true,
+            },
+        );
+        let numeric_type = match target {
+            DialectType::Fabric => DataType::Custom {
+                name: "DECIMAL".to_string(),
+            },
+            _ => DataType::Custom {
+                name: "NUMERIC".to_string(),
+            },
+        };
+        Self::cast_expr(cast_int, numeric_type)
+    }
+
+    fn build_tsql_cbrt_power(this: Expression) -> Expression {
+        let base = Self::cast_expr(
+            this,
+            DataType::Double {
+                precision: None,
+                scale: None,
+            },
+        );
+        let exponent = Expression::Div(Box::new(BinaryOp::new(
+            Expression::Literal(Box::new(Literal::Number("1.0".to_string()))),
+            Expression::Literal(Box::new(Literal::Number("3.0".to_string()))),
+        )));
+
+        Expression::Power(Box::new(crate::expressions::BinaryFunc {
+            this: base,
+            expression: exponent,
+            original_name: None,
+            inferred_type: None,
+        }))
+    }
+
     /// Extract value and unit from an Interval expression
     /// Returns (value_expression, IntervalUnit)
     fn extract_interval_parts(
@@ -34014,17 +35698,24 @@ impl Dialect {
 
         fn unit_from_str(unit: &str) -> Option<IntervalUnit> {
             match unit.trim().to_ascii_uppercase().as_str() {
-                "YEAR" | "YEARS" => Some(IntervalUnit::Year),
-                "QUARTER" | "QUARTERS" => Some(IntervalUnit::Quarter),
+                "YEAR" | "YEARS" | "Y" | "YR" | "YRS" | "YY" | "YYYY" => Some(IntervalUnit::Year),
+                "QUARTER" | "QUARTERS" | "Q" | "QTR" | "QTRS" | "QQ" => Some(IntervalUnit::Quarter),
                 "MONTH" | "MONTHS" | "MON" | "MONS" | "MM" => Some(IntervalUnit::Month),
-                "WEEK" | "WEEKS" | "ISOWEEK" => Some(IntervalUnit::Week),
-                "DAY" | "DAYS" => Some(IntervalUnit::Day),
-                "HOUR" | "HOURS" => Some(IntervalUnit::Hour),
-                "MINUTE" | "MINUTES" => Some(IntervalUnit::Minute),
-                "SECOND" | "SECONDS" => Some(IntervalUnit::Second),
-                "MILLISECOND" | "MILLISECONDS" => Some(IntervalUnit::Millisecond),
-                "MICROSECOND" | "MICROSECONDS" => Some(IntervalUnit::Microsecond),
-                "NANOSECOND" | "NANOSECONDS" => Some(IntervalUnit::Nanosecond),
+                "WEEK" | "WEEKS" | "W" | "WK" | "WKS" | "WW" | "ISOWEEK" => {
+                    Some(IntervalUnit::Week)
+                }
+                "DAY" | "DAYS" | "D" | "DD" => Some(IntervalUnit::Day),
+                "HOUR" | "HOURS" | "H" | "HH" | "HR" | "HRS" => Some(IntervalUnit::Hour),
+                "MINUTE" | "MINUTES" | "MI" | "MIN" | "MINS" | "N" => Some(IntervalUnit::Minute),
+                "SECOND" | "SECONDS" | "S" | "SEC" | "SECS" | "SS" => Some(IntervalUnit::Second),
+                "MILLISECOND" | "MILLISECONDS" | "MS" | "MSEC" | "MSECS" | "MSECOND"
+                | "MSECONDS" | "MILLISEC" | "MILLISECS" | "MILLISECON" => {
+                    Some(IntervalUnit::Millisecond)
+                }
+                "MICROSECOND" | "MICROSECONDS" | "US" | "USEC" | "USECS" | "USECOND"
+                | "USECONDS" | "MICROSEC" | "MICROSECS" | "MCS" => Some(IntervalUnit::Microsecond),
+                "NANOSECOND" | "NANOSECONDS" | "NS" | "NSEC" | "NSECS" | "NSECOND" | "NSECONDS"
+                | "NANOSEC" | "NANOSECS" => Some(IntervalUnit::Nanosecond),
                 _ => None,
             }
         }
@@ -34092,26 +35783,206 @@ impl Dialect {
         }
     }
 
-    fn rewrite_tsql_interval_arithmetic(expr: &Expression) -> Option<Expression> {
+    fn data_type_is_interval(dt: &DataType) -> bool {
+        match dt {
+            DataType::Interval { .. } => true,
+            DataType::Custom { name } => name.trim().eq_ignore_ascii_case("INTERVAL"),
+            _ => false,
+        }
+    }
+
+    fn node_is_interval_cast(node: &Expression) -> bool {
+        match node {
+            Expression::Cast(c) | Expression::TryCast(c) | Expression::SafeCast(c) => {
+                Self::data_type_is_interval(&c.to)
+            }
+            _ => false,
+        }
+    }
+
+    fn reject_tsql_interval_casts(
+        expr: &Expression,
+        target: DialectType,
+        opts: &TranspileOptions,
+    ) -> Result<()> {
+        if !matches!(
+            opts.unsupported_level,
+            UnsupportedLevel::Raise | UnsupportedLevel::Immediate
+        ) {
+            return Ok(());
+        }
+
+        if expr.dfs().any(Self::node_is_interval_cast) {
+            return Err(crate::error::Error::unsupported(
+                "INTERVAL casts",
+                target.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn tsql_varchar_max_type() -> DataType {
+        DataType::Custom {
+            name: "VARCHAR(MAX)".to_string(),
+        }
+    }
+
+    fn rewrite_tsql_interval_casts_to_varchar(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Cast(mut cast) if Self::data_type_is_interval(&cast.to) => {
+                cast.to = Self::tsql_varchar_max_type();
+                cast.double_colon_syntax = false;
+                Ok(Expression::Cast(cast))
+            }
+            Expression::TryCast(mut cast) if Self::data_type_is_interval(&cast.to) => {
+                cast.to = Self::tsql_varchar_max_type();
+                cast.double_colon_syntax = false;
+                Ok(Expression::TryCast(cast))
+            }
+            Expression::SafeCast(mut cast) if Self::data_type_is_interval(&cast.to) => {
+                cast.to = Self::tsql_varchar_max_type();
+                cast.double_colon_syntax = false;
+                Ok(Expression::SafeCast(cast))
+            }
+            _ => Ok(e),
+        })
+    }
+
+    fn rewrite_tsql_interval_arithmetic(
+        expr: &Expression,
+        source: DialectType,
+    ) -> Option<Expression> {
         match expr {
             Expression::Add(op) => {
-                Self::extract_interval_parts(&op.right)?;
-                Some(Self::build_tsql_dateadd_from_interval(
-                    op.left.clone(),
-                    &op.right,
-                    false,
-                ))
+                if Self::extract_interval_parts(&op.right).is_some() {
+                    return Some(Self::build_tsql_dateadd_from_interval(
+                        op.left.clone(),
+                        &op.right,
+                        false,
+                    ));
+                }
+
+                if Self::is_postgres_family_source(source) {
+                    if Self::is_explicit_date_expr(&op.left)
+                        && Self::is_integer_day_offset_expr(&op.right)
+                    {
+                        return Some(Self::build_tsql_dateadd_days(
+                            op.left.clone(),
+                            op.right.clone(),
+                            false,
+                        ));
+                    }
+
+                    if Self::is_integer_day_offset_expr(&op.left)
+                        && Self::is_explicit_date_expr(&op.right)
+                    {
+                        return Some(Self::build_tsql_dateadd_days(
+                            op.right.clone(),
+                            op.left.clone(),
+                            false,
+                        ));
+                    }
+                }
+
+                None
             }
             Expression::Sub(op) => {
-                Self::extract_interval_parts(&op.right)?;
-                Some(Self::build_tsql_dateadd_from_interval(
-                    op.left.clone(),
-                    &op.right,
-                    true,
-                ))
+                if Self::extract_interval_parts(&op.right).is_some() {
+                    return Some(Self::build_tsql_dateadd_from_interval(
+                        op.left.clone(),
+                        &op.right,
+                        true,
+                    ));
+                }
+
+                if Self::is_postgres_family_source(source) {
+                    if Self::is_explicit_date_expr(&op.left)
+                        && Self::is_explicit_date_expr(&op.right)
+                    {
+                        return Some(Self::build_tsql_datediff_days(
+                            op.right.clone(),
+                            op.left.clone(),
+                        ));
+                    }
+
+                    if Self::is_explicit_date_expr(&op.left)
+                        && Self::is_integer_day_offset_expr(&op.right)
+                    {
+                        return Some(Self::build_tsql_dateadd_days(
+                            op.left.clone(),
+                            op.right.clone(),
+                            true,
+                        ));
+                    }
+                }
+
+                None
             }
             _ => None,
         }
+    }
+
+    fn is_postgres_family_source(source: DialectType) -> bool {
+        matches!(
+            source,
+            DialectType::PostgreSQL
+                | DialectType::Redshift
+                | DialectType::Materialize
+                | DialectType::RisingWave
+                | DialectType::CockroachDB
+        )
+    }
+
+    fn is_explicit_date_expr(expr: &Expression) -> bool {
+        use crate::expressions::Literal;
+
+        match expr {
+            Expression::Literal(lit) => matches!(lit.as_ref(), Literal::Date(_)),
+            Expression::Cast(c) | Expression::TryCast(c) | Expression::SafeCast(c) => {
+                matches!(c.to, crate::expressions::DataType::Date)
+            }
+            Expression::Paren(p) => Self::is_explicit_date_expr(&p.this),
+            Expression::CurrentDate(_)
+            | Expression::Date(_)
+            | Expression::MakeDate(_)
+            | Expression::ToDate(_)
+            | Expression::DateStrToDate(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_integer_day_offset_expr(expr: &Expression) -> bool {
+        use crate::expressions::Literal;
+
+        match expr {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::Number(n) => n.parse::<i64>().is_ok(),
+                _ => false,
+            },
+            Expression::Parameter(_) | Expression::Placeholder(_) => true,
+            Expression::Neg(op) => Self::is_integer_day_offset_expr(&op.this),
+            Expression::Paren(p) => Self::is_integer_day_offset_expr(&p.this),
+            _ => false,
+        }
+    }
+
+    fn build_tsql_datediff_days(start: Expression, end: Expression) -> Expression {
+        Expression::Function(Box::new(Function::new(
+            "DATEDIFF".to_string(),
+            vec![Expression::Identifier(Identifier::new("DAY")), start, end],
+        )))
+    }
+
+    fn build_tsql_dateadd_days(date: Expression, amount: Expression, subtract: bool) -> Expression {
+        Expression::Function(Box::new(Function::new(
+            "DATEADD".to_string(),
+            vec![
+                Expression::Identifier(Identifier::new("DAY")),
+                Self::tsql_dateadd_amount(amount, subtract),
+                date,
+            ],
+        )))
     }
 
     fn build_tsql_dateadd_from_interval(
@@ -38710,6 +40581,23 @@ impl Dialect {
                 };
                 s.to_ascii_uppercase()
             }
+            Expression::Cast(cast)
+                if cast.format.is_none()
+                    && cast.default.is_none()
+                    && Self::unit_cast_target_is_string(&cast.to)
+                    && matches!(
+                        &cast.this,
+                        Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_))
+                    ) =>
+            {
+                let Expression::Literal(lit) = &cast.this else {
+                    unreachable!()
+                };
+                let Literal::String(s) = lit.as_ref() else {
+                    unreachable!()
+                };
+                s.to_ascii_uppercase()
+            }
             Expression::Column(col) => col.name.name.to_ascii_uppercase(),
             Expression::Function(f) => {
                 let base = f.name.to_ascii_uppercase();
@@ -38722,6 +40610,24 @@ impl Dialect {
             }
             _ => "DAY".to_string(),
         }
+    }
+
+    fn unit_cast_target_is_string(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Char { .. }
+                | DataType::VarChar { .. }
+                | DataType::String { .. }
+                | DataType::Text
+                | DataType::TextWithLength { .. }
+        ) || matches!(
+            data_type,
+            DataType::Custom { name, .. }
+                if name.eq_ignore_ascii_case("VARCHAR")
+                    || name.eq_ignore_ascii_case("NVARCHAR")
+                    || name.eq_ignore_ascii_case("VARCHAR(MAX)")
+                    || name.eq_ignore_ascii_case("NVARCHAR(MAX)")
+        )
     }
 
     /// Parse unit string to IntervalUnit

@@ -130,6 +130,14 @@ impl ConnectorOperator {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TsqlDatePart {
+    Native(String),
+    Epoch,
+    IsoDayOfWeek,
+    Unsupported(String),
+}
+
 /// Identifier quote style (start/end characters)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IdentifierQuoteStyle {
@@ -4127,6 +4135,131 @@ impl Generator {
         }))
     }
 
+    fn positional_ordering_index(expression: &Expression) -> Option<usize> {
+        match expression {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::Number(n) => {
+                    let value = n.parse::<usize>().ok()?;
+                    value.checked_sub(1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn projection_sort_expression(expression: &Expression) -> Option<Expression> {
+        let expression = match expression {
+            Expression::Alias(alias) => &alias.this,
+            other => other,
+        };
+
+        match expression {
+            Expression::Star(_)
+            | Expression::Literal(_)
+            | Expression::Null(_)
+            | Expression::Boolean(_) => None,
+            _ => Some(expression.clone()),
+        }
+    }
+
+    fn resolve_positional_order_projection(
+        projections: &[Expression],
+        index: usize,
+    ) -> Option<Expression> {
+        Self::projection_sort_expression(projections.get(index)?)
+    }
+
+    fn set_output_identifier_at(expression: &Expression, index: usize) -> Option<Identifier> {
+        match expression {
+            Expression::Select(select) => {
+                Self::projection_output_identifier(select.expressions.get(index)?)
+            }
+            Expression::Union(union) => Self::set_output_identifier_at(&union.left, index),
+            Expression::Intersect(intersect) => {
+                Self::set_output_identifier_at(&intersect.left, index)
+            }
+            Expression::Except(except) => Self::set_output_identifier_at(&except.left, index),
+            Expression::Subquery(subquery) => subquery
+                .column_aliases
+                .get(index)
+                .cloned()
+                .or_else(|| Self::set_output_identifier_at(&subquery.this, index)),
+            _ => None,
+        }
+    }
+
+    fn resolve_single_subquery_star_projection(
+        select: &Select,
+        index: usize,
+    ) -> Option<Expression> {
+        if select.expressions.len() != 1
+            || !matches!(select.expressions.first(), Some(Expression::Star(_)))
+        {
+            return None;
+        }
+
+        let from = select.from.as_ref()?;
+        if from.expressions.len() != 1 {
+            return None;
+        }
+
+        let Expression::Subquery(subquery) = from.expressions.first()? else {
+            return None;
+        };
+
+        subquery
+            .column_aliases
+            .get(index)
+            .cloned()
+            .or_else(|| Self::set_output_identifier_at(&subquery.this, index))
+            .map(Self::column_expression)
+    }
+
+    fn resolve_tsql_positional_ordering_for_select(&self, select: &Select) -> Option<Select> {
+        if !matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) || self.config.null_ordering_supported
+        {
+            return None;
+        }
+
+        let order_by = select.order_by.as_ref()?;
+        let mut resolved_order_by = order_by.clone();
+        let mut changed = false;
+
+        for ordered in &mut resolved_order_by.expressions {
+            if !Self::ordered_requires_tsql_null_ordering_emulation(ordered) {
+                continue;
+            }
+
+            let Some(index) = Self::positional_ordering_index(&ordered.this) else {
+                continue;
+            };
+
+            let Some(resolved) =
+                Self::resolve_positional_order_projection(&select.expressions, index)
+                    .or_else(|| Self::resolve_single_subquery_star_projection(select, index))
+            else {
+                continue;
+            };
+
+            if resolved != ordered.this {
+                ordered.this = resolved;
+                changed = true;
+            }
+        }
+
+        if changed {
+            let mut resolved_select = select.clone();
+            resolved_select.order_by = Some(resolved_order_by);
+            Some(resolved_select)
+        } else {
+            None
+        }
+    }
+
     fn resolve_distinct_order_projection(
         projections: &[Expression],
         order_expression: &Expression,
@@ -4313,6 +4446,10 @@ impl Generator {
     fn generate_select(&mut self, select: &Select) -> Result<()> {
         use crate::dialects::DialectType;
 
+        if let Some(resolved_select) = self.resolve_tsql_positional_ordering_for_select(select) {
+            return self.generate_select(&resolved_select);
+        }
+
         if self.should_handle_tsql_distinct_null_ordering(select) {
             if let Some(wrapped_select) = self.try_build_tsql_distinct_null_ordering_wrapper(select)
             {
@@ -4422,7 +4559,10 @@ impl Generator {
             self.config.dialect,
             Some(DialectType::TSQL) | Some(DialectType::Fabric)
         ) && select.top.is_none()
-            && select.limit.is_some()
+            && select
+                .limit
+                .as_ref()
+                .is_some_and(|limit| !Self::is_noop_limit_expr(&limit.this))
             && select.offset.is_none(); // Don't use TOP when there's OFFSET
 
         // For TOP-supporting dialects: DISTINCT before TOP
@@ -5106,14 +5246,18 @@ impl Generator {
                     self.write_limit_expr(&offset.this)?;
                     self.write_space();
                     self.write_keyword("ROWS");
-                    // If there was a LIMIT, use FETCH NEXT ... ROWS ONLY
+                    // If there was a real LIMIT, use FETCH NEXT ... ROWS ONLY.
+                    // PostgreSQL LIMIT NULL / LIMIT ALL mean "no limit", so
+                    // T-SQL/Fabric should keep the OFFSET without FETCH.
                     if let Some(limit) = &select.limit {
-                        self.write_space();
-                        self.write_keyword("FETCH NEXT");
-                        self.write_space();
-                        self.write_limit_expr(&limit.this)?;
-                        self.write_space();
-                        self.write_keyword("ROWS ONLY");
+                        if !Self::is_noop_limit_expr(&limit.this) {
+                            self.write_space();
+                            self.write_keyword("FETCH NEXT");
+                            self.write_space();
+                            self.write_limit_expr(&limit.this)?;
+                            self.write_space();
+                            self.write_keyword("ROWS ONLY");
+                        }
                     }
                 } else {
                     self.write_keyword("OFFSET");
@@ -18245,12 +18389,39 @@ impl Generator {
             || func.name.eq_ignore_ascii_case("DATEPART"))
             && func.args.len() == 2
         {
-            self.write_keyword("DATEPART");
-            self.write("(");
-            self.write_tsql_date_part(&func.args[0])?;
-            self.write(", ");
-            self.generate_expression(&func.args[1])?;
-            self.write(")");
+            if let Some(part) = self.extract_date_part_string(&func.args[0]) {
+                let date_part = self.classify_tsql_date_part_name(&part);
+                self.generate_tsql_date_part(date_part, &func.args[1])?;
+            } else {
+                self.write_keyword("DATEPART");
+                self.write("(");
+                self.generate_expression(&func.args[0])?;
+                self.write(", ");
+                self.generate_expression(&func.args[1])?;
+                self.write(")");
+            }
+            return Ok(());
+        }
+
+        // TSQL/Fabric: DATETRUNC(datepart, value) requires an unquoted datepart keyword.
+        if matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) && (func.name.eq_ignore_ascii_case("DATETRUNC")
+            || func.name.eq_ignore_ascii_case("DATE_TRUNC"))
+            && func.args.len() == 2
+        {
+            if let Some(part) = self.extract_date_part_string(&func.args[0]) {
+                let date_part = self.classify_tsql_date_trunc_name(&part);
+                self.generate_tsql_date_trunc(date_part, &func.args[1])?;
+            } else {
+                self.write_keyword("DATETRUNC");
+                self.write("(");
+                self.generate_expression(&func.args[0])?;
+                self.write(", ");
+                self.generate_expression(&func.args[1])?;
+                self.write(")");
+            }
             return Ok(());
         }
 
@@ -19211,22 +19382,6 @@ impl Generator {
         }
     }
 
-    fn write_tsql_date_part(&mut self, expr: &Expression) -> Result<()> {
-        if let Some(part) = self.extract_date_part_string(expr) {
-            let upper = part.to_ascii_uppercase();
-            let unmapped = match upper.as_str() {
-                "DAYOFWEEK" => "WEEKDAY",
-                "WEEKISO" => "ISO_WEEK",
-                "TIMEZONE_MINUTE" => "TZOFFSET",
-                _ => part.as_str(),
-            };
-            self.write_keyword(unmapped);
-        } else {
-            self.generate_expression(expr)?;
-        }
-        Ok(())
-    }
-
     /// Extract date part string from expression (handles string literals and identifiers)
     fn extract_date_part_string(&self, expr: &Expression) -> Option<String> {
         match expr {
@@ -19244,8 +19399,288 @@ impl Generator {
                 // Simple column reference without table prefix, treat as identifier
                 Some(col.name.name.clone())
             }
+            Expression::Cast(cast)
+                if cast.format.is_none()
+                    && cast.default.is_none()
+                    && Self::is_string_data_type(&cast.to)
+                    && matches!(
+                        &cast.this,
+                        Expression::Literal(lit)
+                            if matches!(lit.as_ref(), crate::expressions::Literal::String(_))
+                    ) =>
+            {
+                self.extract_date_part_string(&cast.this)
+            }
             _ => None,
         }
+    }
+
+    fn classify_tsql_datetime_field(&self, field: &DateTimeField) -> TsqlDatePart {
+        match field {
+            DateTimeField::Year => TsqlDatePart::Native("YEAR".to_string()),
+            DateTimeField::Month => TsqlDatePart::Native("MONTH".to_string()),
+            DateTimeField::Day => TsqlDatePart::Native("DAY".to_string()),
+            DateTimeField::Hour => TsqlDatePart::Native("HOUR".to_string()),
+            DateTimeField::Minute => TsqlDatePart::Native("MINUTE".to_string()),
+            DateTimeField::Second => TsqlDatePart::Native("SECOND".to_string()),
+            DateTimeField::Millisecond => TsqlDatePart::Native("MILLISECOND".to_string()),
+            DateTimeField::Microsecond => TsqlDatePart::Native("MICROSECOND".to_string()),
+            DateTimeField::DayOfWeek => TsqlDatePart::Native("WEEKDAY".to_string()),
+            DateTimeField::DayOfYear => TsqlDatePart::Native("DAYOFYEAR".to_string()),
+            DateTimeField::Week => TsqlDatePart::Native("WEEK".to_string()),
+            DateTimeField::WeekWithModifier(modifier) => {
+                TsqlDatePart::Unsupported(format!("WEEK({modifier})"))
+            }
+            DateTimeField::Quarter => TsqlDatePart::Native("QUARTER".to_string()),
+            DateTimeField::Epoch => TsqlDatePart::Epoch,
+            DateTimeField::TimezoneMinute => TsqlDatePart::Native("TZOFFSET".to_string()),
+            DateTimeField::Timezone => TsqlDatePart::Unsupported("TIMEZONE".to_string()),
+            DateTimeField::TimezoneHour => TsqlDatePart::Unsupported("TIMEZONE_HOUR".to_string()),
+            DateTimeField::Date => TsqlDatePart::Unsupported("DATE".to_string()),
+            DateTimeField::Time => TsqlDatePart::Unsupported("TIME".to_string()),
+            DateTimeField::Custom(name) => self.classify_tsql_date_part_name(name),
+        }
+    }
+
+    fn classify_tsql_date_part_name(&self, part: &str) -> TsqlDatePart {
+        let trimmed = part.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        match upper.as_str() {
+            "YEAR" => TsqlDatePart::Native(trimmed.to_string()),
+            "YY" | "YYY" | "YYYY" | "YR" | "YEARS" | "YRS" => {
+                TsqlDatePart::Native("YEAR".to_string())
+            }
+            "QUARTER" => TsqlDatePart::Native(trimmed.to_string()),
+            "Q" | "QQ" | "QTR" | "QTRS" | "QUARTERS" => TsqlDatePart::Native("QUARTER".to_string()),
+            "MONTH" => TsqlDatePart::Native(trimmed.to_string()),
+            "MM" | "M" | "MON" | "MONS" | "MONTHS" => TsqlDatePart::Native("MONTH".to_string()),
+            "DAYOFYEAR" => TsqlDatePart::Native(trimmed.to_string()),
+            "DOY" | "DY" | "Y" => TsqlDatePart::Native("DAYOFYEAR".to_string()),
+            "DAY" => TsqlDatePart::Native(trimmed.to_string()),
+            "D" | "DD" | "DAYS" | "DAYOFMONTH" => TsqlDatePart::Native("DAY".to_string()),
+            "WEEK" | "W" | "WK" | "WW" | "WEEKOFYEAR" | "WOY" | "WY" | "WEEKS" => {
+                if upper == "WEEK" {
+                    TsqlDatePart::Native(trimmed.to_string())
+                } else {
+                    TsqlDatePart::Native("WEEK".to_string())
+                }
+            }
+            "WEEKDAY" => TsqlDatePart::Native(trimmed.to_string()),
+            "DAYOFWEEK" | "DOW" | "DW" => TsqlDatePart::Native("WEEKDAY".to_string()),
+            "ISODOW" | "ISO_DOW" | "DOW_ISO" | "DW_ISO" | "ISO_DAYOFWEEK" | "ISO_WEEKDAY"
+            | "DAYOFWEEKISO" | "DAYOFWEEK_ISO" | "WEEKDAY_ISO" => TsqlDatePart::IsoDayOfWeek,
+            "HOUR" => TsqlDatePart::Native(trimmed.to_string()),
+            "H" | "HH" | "HR" | "HOURS" | "HRS" => TsqlDatePart::Native("HOUR".to_string()),
+            "MINUTE" => TsqlDatePart::Native(trimmed.to_string()),
+            "MI" | "MIN" | "MINUTES" | "MINS" | "N" => TsqlDatePart::Native("MINUTE".to_string()),
+            "SECOND" => TsqlDatePart::Native(trimmed.to_string()),
+            "S" | "SEC" | "SECONDS" | "SECS" | "SS" => TsqlDatePart::Native("SECOND".to_string()),
+            "MILLISECOND" | "MS" | "MSEC" | "MSECS" | "MSECOND" | "MSECONDS" | "MILLISEC"
+            | "MILLISECS" | "MILLISECON" | "MILLISECONDS" => {
+                if upper == "MILLISECOND" {
+                    TsqlDatePart::Native(trimmed.to_string())
+                } else {
+                    TsqlDatePart::Native("MILLISECOND".to_string())
+                }
+            }
+            "MICROSECOND" | "US" | "USEC" | "USECS" | "MICROSEC" | "MICROSECS" | "USECOND"
+            | "USECONDS" | "MICROSECONDS" | "MCS" => {
+                if upper == "MICROSECOND" {
+                    TsqlDatePart::Native(trimmed.to_string())
+                } else {
+                    TsqlDatePart::Native("MICROSECOND".to_string())
+                }
+            }
+            "NANOSECOND" | "NS" | "NSEC" | "NANOSEC" | "NSECOND" | "NSECONDS" | "NANOSECS" => {
+                if upper == "NANOSECOND" {
+                    TsqlDatePart::Native(trimmed.to_string())
+                } else {
+                    TsqlDatePart::Native("NANOSECOND".to_string())
+                }
+            }
+            "TZOFFSET" => TsqlDatePart::Native(trimmed.to_string()),
+            "TZ" | "TZM" | "TIMEZONE_MINUTE" => TsqlDatePart::Native("TZOFFSET".to_string()),
+            "ISO_WEEK" | "ISOWEEK" | "ISOWK" | "ISOWW" | "WEEKISO" | "WEEKOFYEARISO"
+            | "WEEKOFYEAR_ISO" | "WEEK_ISO" => {
+                if upper == "ISO_WEEK" {
+                    TsqlDatePart::Native(trimmed.to_string())
+                } else {
+                    TsqlDatePart::Native("ISO_WEEK".to_string())
+                }
+            }
+            "EPOCH" | "EPOCH_SECOND" | "EPOCH_SECONDS" => TsqlDatePart::Epoch,
+            "DECADE" | "DECADES" | "DEC" | "DECS" | "CENTURY" | "CENTURIES" | "CENT" | "CENTS"
+            | "MILLENNIUM" | "MILLENIA" | "MIL" | "MILS" | "TIMEZONE" | "TIMEZONE_HOUR" | "TZH"
+            | "DATE" | "TIME" => TsqlDatePart::Unsupported(upper),
+            _ => TsqlDatePart::Unsupported(upper),
+        }
+    }
+
+    fn classify_tsql_date_trunc_field(&self, field: &DateTimeField) -> TsqlDatePart {
+        match field {
+            DateTimeField::Year => TsqlDatePart::Native("YEAR".to_string()),
+            DateTimeField::Month => TsqlDatePart::Native("MONTH".to_string()),
+            DateTimeField::Day => TsqlDatePart::Native("DAY".to_string()),
+            DateTimeField::Hour => TsqlDatePart::Native("HOUR".to_string()),
+            DateTimeField::Minute => TsqlDatePart::Native("MINUTE".to_string()),
+            DateTimeField::Second => TsqlDatePart::Native("SECOND".to_string()),
+            DateTimeField::Millisecond => TsqlDatePart::Native("MILLISECOND".to_string()),
+            DateTimeField::Microsecond => TsqlDatePart::Native("MICROSECOND".to_string()),
+            DateTimeField::DayOfYear => TsqlDatePart::Native("DAYOFYEAR".to_string()),
+            DateTimeField::Week => TsqlDatePart::Native("WEEK".to_string()),
+            DateTimeField::WeekWithModifier(modifier) => {
+                match modifier.to_ascii_uppercase().as_str() {
+                    "MONDAY" | "ISO" | "ISO_WEEK" => TsqlDatePart::Native("ISO_WEEK".to_string()),
+                    "SUNDAY" => TsqlDatePart::Native("WEEK".to_string()),
+                    _ => TsqlDatePart::Unsupported(format!("WEEK({modifier})")),
+                }
+            }
+            DateTimeField::Quarter => TsqlDatePart::Native("QUARTER".to_string()),
+            DateTimeField::DayOfWeek => TsqlDatePart::Unsupported("WEEKDAY".to_string()),
+            DateTimeField::Epoch => TsqlDatePart::Unsupported("EPOCH".to_string()),
+            DateTimeField::Timezone => TsqlDatePart::Unsupported("TIMEZONE".to_string()),
+            DateTimeField::TimezoneHour => TsqlDatePart::Unsupported("TIMEZONE_HOUR".to_string()),
+            DateTimeField::TimezoneMinute => {
+                TsqlDatePart::Unsupported("TIMEZONE_MINUTE".to_string())
+            }
+            DateTimeField::Date => TsqlDatePart::Unsupported("DATE".to_string()),
+            DateTimeField::Time => TsqlDatePart::Unsupported("TIME".to_string()),
+            DateTimeField::Custom(name) => self.classify_tsql_date_trunc_name(name),
+        }
+    }
+
+    fn classify_tsql_date_trunc_name(&self, part: &str) -> TsqlDatePart {
+        let upper = part.trim().to_ascii_uppercase();
+        match upper.as_str() {
+            "YEAR" | "YY" | "YYY" | "YYYY" | "YR" | "YEARS" | "YRS" => {
+                TsqlDatePart::Native("YEAR".to_string())
+            }
+            "QUARTER" | "Q" | "QQ" | "QTR" | "QTRS" | "QUARTERS" => {
+                TsqlDatePart::Native("QUARTER".to_string())
+            }
+            "MONTH" | "MM" | "M" | "MON" | "MONS" | "MONTHS" => {
+                TsqlDatePart::Native("MONTH".to_string())
+            }
+            "DAYOFYEAR" | "DOY" | "DY" | "Y" => TsqlDatePart::Native("DAYOFYEAR".to_string()),
+            "DAY" | "D" | "DD" | "DAYS" | "DAYOFMONTH" => TsqlDatePart::Native("DAY".to_string()),
+            "WEEK" | "W" | "WK" | "WW" | "WEEKS" | "WEEKOFYEAR" | "WOY" | "WY" => {
+                TsqlDatePart::Native("WEEK".to_string())
+            }
+            "ISO_WEEK" | "ISOWEEK" | "ISOWK" | "ISOWW" | "WEEKISO" | "WEEKOFYEARISO"
+            | "WEEKOFYEAR_ISO" | "WEEK_ISO" => TsqlDatePart::Native("ISO_WEEK".to_string()),
+            "HOUR" | "H" | "HH" | "HR" | "HOURS" | "HRS" => {
+                TsqlDatePart::Native("HOUR".to_string())
+            }
+            "MINUTE" | "MI" | "MIN" | "MINUTES" | "MINS" | "N" => {
+                TsqlDatePart::Native("MINUTE".to_string())
+            }
+            "SECOND" | "S" | "SEC" | "SECONDS" | "SECS" | "SS" => {
+                TsqlDatePart::Native("SECOND".to_string())
+            }
+            "MILLISECOND" | "MS" | "MSEC" | "MSECS" | "MSECOND" | "MSECONDS" | "MILLISEC"
+            | "MILLISECS" | "MILLISECON" | "MILLISECONDS" => {
+                TsqlDatePart::Native("MILLISECOND".to_string())
+            }
+            "MICROSECOND" | "US" | "USEC" | "USECS" | "MICROSEC" | "MICROSECS" | "USECOND"
+            | "USECONDS" | "MICROSECONDS" | "MCS" => {
+                TsqlDatePart::Native("MICROSECOND".to_string())
+            }
+            "WEEKDAY" | "DAYOFWEEK" | "DOW" | "DW" | "ISODOW" | "ISO_DOW" | "DOW_ISO"
+            | "DW_ISO" | "ISO_DAYOFWEEK" | "ISO_WEEKDAY" | "DAYOFWEEKISO" | "DAYOFWEEK_ISO"
+            | "WEEKDAY_ISO" | "NANOSECOND" | "NS" | "NSEC" | "NANOSEC" | "NSECOND" | "NSECONDS"
+            | "NANOSECS" | "TZOFFSET" | "TZ" | "TZM" | "TIMEZONE" | "TIMEZONE_HOUR"
+            | "TIMEZONE_MINUTE" | "TZH" | "EPOCH" | "EPOCH_SECOND" | "EPOCH_SECONDS" | "DECADE"
+            | "DECADES" | "DEC" | "DECS" | "CENTURY" | "CENTURIES" | "CENT" | "CENTS"
+            | "MILLENNIUM" | "MILLENIA" | "MIL" | "MILS" | "DATE" | "TIME" => {
+                TsqlDatePart::Unsupported(upper)
+            }
+            _ => TsqlDatePart::Unsupported(upper),
+        }
+    }
+
+    fn generate_tsql_date_part(&mut self, part: TsqlDatePart, expr: &Expression) -> Result<()> {
+        match part {
+            TsqlDatePart::Native(name) => self.generate_tsql_native_datepart(&name, expr),
+            TsqlDatePart::Epoch => self.generate_tsql_epoch_seconds(expr),
+            TsqlDatePart::IsoDayOfWeek => self.generate_tsql_iso_day_of_week(expr),
+            TsqlDatePart::Unsupported(name) => {
+                self.unsupported(format!("DATEPART {name} is not supported by T-SQL/Fabric"))?;
+                self.write_keyword("DATEPART");
+                self.write("(");
+                self.write_keyword(&name);
+                self.write(", ");
+                self.generate_expression(expr)?;
+                self.write(")");
+                Ok(())
+            }
+        }
+    }
+
+    fn generate_tsql_native_datepart(&mut self, name: &str, expr: &Expression) -> Result<()> {
+        self.write_keyword("DATEPART");
+        self.write("(");
+        self.write_keyword(name);
+        self.write(", ");
+        self.generate_expression(expr)?;
+        self.write(")");
+        Ok(())
+    }
+
+    fn generate_tsql_epoch_seconds(&mut self, expr: &Expression) -> Result<()> {
+        self.write_keyword("DATEDIFF");
+        self.write("(SECOND, ");
+        self.write_keyword("CAST");
+        self.write("('1970-01-01' AS ");
+        self.write_keyword("DATETIME2");
+        self.write("), ");
+        self.generate_expression(expr)?;
+        self.write(")");
+        Ok(())
+    }
+
+    fn generate_tsql_iso_day_of_week(&mut self, expr: &Expression) -> Result<()> {
+        self.write("(((DATEPART(WEEKDAY, ");
+        self.generate_expression(expr)?;
+        self.write(") + @@DATEFIRST - 2) % 7) + 1)");
+        Ok(())
+    }
+
+    fn generate_tsql_date_trunc(&mut self, part: TsqlDatePart, expr: &Expression) -> Result<()> {
+        match part {
+            TsqlDatePart::Native(name) => {
+                self.write_keyword("DATETRUNC");
+                self.write("(");
+                self.write_keyword(&name);
+                self.write(", ");
+                self.generate_expression(expr)?;
+                self.write(")");
+                Ok(())
+            }
+            TsqlDatePart::Epoch => {
+                self.generate_tsql_unsupported_date_trunc("EPOCH".to_string(), expr)
+            }
+            TsqlDatePart::IsoDayOfWeek => {
+                self.generate_tsql_unsupported_date_trunc("ISODOW".to_string(), expr)
+            }
+            TsqlDatePart::Unsupported(name) => {
+                self.generate_tsql_unsupported_date_trunc(name, expr)
+            }
+        }
+    }
+
+    fn generate_tsql_unsupported_date_trunc(
+        &mut self,
+        name: String,
+        expr: &Expression,
+    ) -> Result<()> {
+        self.unsupported(format!("DATETRUNC {name} is not supported by T-SQL/Fabric"))?;
+        self.write_keyword("DATETRUNC");
+        self.write("(");
+        self.write_keyword(&name);
+        self.write(", ");
+        self.generate_expression(expr)?;
+        self.write(")");
+        Ok(())
     }
 
     /// Normalize date part to uppercase singular form
@@ -20166,6 +20601,14 @@ impl Generator {
     }
 
     fn generate_date_trunc(&mut self, f: &DateTruncFunc) -> Result<()> {
+        if matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) {
+            let date_part = self.classify_tsql_date_trunc_field(&f.unit);
+            self.generate_tsql_date_trunc(date_part, &f.this)?;
+            return Ok(());
+        }
         if self.config.dialect == Some(DialectType::ClickHouse) {
             self.write("dateTrunc");
         } else {
@@ -20210,12 +20653,8 @@ impl Generator {
             self.config.dialect,
             Some(DialectType::TSQL) | Some(DialectType::Fabric)
         ) {
-            self.write_keyword("DATEPART");
-            self.write("(");
-            self.write_datetime_field(&f.field);
-            self.write(", ");
-            self.generate_expression(&f.this)?;
-            self.write(")");
+            let date_part = self.classify_tsql_datetime_field(&f.field);
+            self.generate_tsql_date_part(date_part, &f.this)?;
             return Ok(());
         }
         self.write_keyword("EXTRACT");
@@ -20655,7 +21094,7 @@ impl Generator {
         self.generate_expression(&f.this)?;
         if let Some(ref separator) = f.separator {
             self.write(", ");
-            self.generate_expression(separator)?;
+            self.generate_string_agg_separator(separator)?;
         }
         // TSQL/Fabric put aggregate ORDER BY in WITHIN GROUP after the closing paren.
         if !uses_within_group_order {
@@ -20704,6 +21143,56 @@ impl Generator {
             self.write(")");
         }
         Ok(())
+    }
+
+    fn generate_string_agg_separator(&mut self, separator: &Expression) -> Result<()> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL | crate::dialects::DialectType::Fabric)
+        ) {
+            if let Some(inner) = Self::tsql_string_agg_literal_separator_cast_inner(separator) {
+                return self.generate_expression(inner);
+            }
+        }
+
+        self.generate_expression(separator)
+    }
+
+    fn tsql_string_agg_literal_separator_cast_inner(separator: &Expression) -> Option<&Expression> {
+        let Expression::Cast(cast) = separator else {
+            return None;
+        };
+
+        if cast.format.is_some() || cast.default.is_some() {
+            return None;
+        }
+
+        if !Self::is_string_data_type(&cast.to) {
+            return None;
+        }
+
+        match &cast.this {
+            Expression::Literal(literal) if literal.is_string() => Some(&cast.this),
+            _ => None,
+        }
+    }
+
+    fn is_string_data_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Char { .. }
+                | DataType::VarChar { .. }
+                | DataType::String { .. }
+                | DataType::Text
+                | DataType::TextWithLength { .. }
+        ) || matches!(
+            data_type,
+            DataType::Custom { name, .. }
+                if name.eq_ignore_ascii_case("VARCHAR")
+                    || name.eq_ignore_ascii_case("NVARCHAR")
+                    || name.eq_ignore_ascii_case("VARCHAR(MAX)")
+                    || name.eq_ignore_ascii_case("NVARCHAR(MAX)")
+        )
     }
 
     fn generate_listagg(&mut self, f: &ListAggFunc) -> Result<()> {
@@ -26117,6 +26606,19 @@ impl Generator {
             }
         }
         self.generate_expression(expr)
+    }
+
+    fn is_noop_limit_expr(expr: &Expression) -> bool {
+        match expr {
+            Expression::Null(_) => true,
+            Expression::Identifier(identifier) => identifier.name.eq_ignore_ascii_case("ALL"),
+            Expression::Column(column) => {
+                column.table.is_none() && column.name.name.eq_ignore_ascii_case("ALL")
+            }
+            Expression::Var(var) => var.this.eq_ignore_ascii_case("ALL"),
+            Expression::Paren(paren) => Self::is_noop_limit_expr(&paren.this),
+            _ => false,
+        }
     }
 
     /// Format a comment with proper spacing.
@@ -35796,6 +36298,9 @@ impl Generator {
 
     fn generate_str_to_date(&mut self, e: &StrToDate) -> Result<()> {
         match self.config.dialect {
+            Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                self.generate_tsql_str_to_temporal(&e.this, e.format.as_deref(), "DATE")?;
+            }
             Some(DialectType::Spark) | Some(DialectType::Databricks) | Some(DialectType::Hive) => {
                 // TO_DATE(this, java_format)
                 self.write_keyword("TO_DATE");
@@ -36036,6 +36541,74 @@ impl Generator {
             }
         }
         result
+    }
+
+    fn tsql_convert_style_for_strftime(fmt: &str) -> Option<u16> {
+        match fmt.trim() {
+            "%b %d %Y %-I:%M%p" => Some(100),
+            "%m/%d/%y" => Some(1),
+            "%y.%m.%d" => Some(2),
+            "%d/%m/%y" => Some(3),
+            "%d.%m.%y" => Some(4),
+            "%d-%m-%y" => Some(5),
+            "%d %b %y" => Some(6),
+            "%b %d, %y" => Some(7),
+            "%H:%M:%S" => Some(108),
+            "%b %d %Y %-I:%M:%S:%f%p" => Some(109),
+            "%m-%d-%y" => Some(10),
+            "%y/%m/%d" => Some(11),
+            "%y%m%d" => Some(12),
+            "%d %b %Y %H:%M:%S:%f" => Some(113),
+            "%H:%M:%S:%f" => Some(114),
+            "%m/%d/%Y" => Some(101),
+            "%Y.%m.%d" => Some(102),
+            "%d/%m/%Y" => Some(103),
+            "%d.%m.%Y" => Some(104),
+            "%d-%m-%Y" => Some(105),
+            "%d %b %Y" => Some(106),
+            "%b %d, %Y" => Some(107),
+            "%m-%d-%Y" => Some(110),
+            "%Y/%m/%d" => Some(111),
+            "%Y%m%d" => Some(112),
+            "%Y-%m-%d %H:%M:%S" => Some(120),
+            "%Y-%m-%d %H:%M:%S.%f" => Some(121),
+            "%Y-%m-%dT%H:%M:%S" | "%Y-%m-%dT%H:%M:%S.%f" => Some(126),
+            "%Y-%m-%d" => Some(23),
+            _ => None,
+        }
+    }
+
+    fn generate_tsql_str_to_temporal(
+        &mut self,
+        this: &Expression,
+        format: Option<&str>,
+        target_type: &str,
+    ) -> Result<()> {
+        if let Some(format) = format {
+            if let Some(style) = Self::tsql_convert_style_for_strftime(format) {
+                self.write_keyword("CONVERT");
+                self.write("(");
+                self.write_keyword(target_type);
+                self.write(", ");
+                self.generate_expression(this)?;
+                self.write(", ");
+                self.write(&style.to_string());
+                self.write(")");
+                return Ok(());
+            }
+
+            self.unsupported(format!(
+                "T-SQL/Fabric {target_type} parsing format '{format}' has no CONVERT style mapping"
+            ))?;
+        }
+
+        self.write_keyword("CAST");
+        self.write("(");
+        self.generate_expression(this)?;
+        self.write(" AS ");
+        self.write_keyword(target_type);
+        self.write(")");
+        Ok(())
     }
 
     /// Decompose a JSON path string like "$.y[0].z" into individual parts: ["y", "0", "z"]
@@ -36412,6 +36985,9 @@ impl Generator {
                 self.write(", '");
                 self.write(&e.format);
                 self.write("')");
+            }
+            Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
+                self.generate_tsql_str_to_temporal(&e.this, Some(&e.format), "DATETIME2")?;
             }
             _ => {
                 // Default: STR_TO_TIME(this, format)

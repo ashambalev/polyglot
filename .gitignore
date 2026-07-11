@@ -102,3 +102,4 @@ tools/sqlglot-compare/fixtures/extracted/
 .codex-tmp/
 .vscode/
 .claude/
+prompts/

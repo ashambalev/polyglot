@@ -12,7 +12,8 @@ use crate::error::Result;
 use crate::expressions::{
     Alias, BinaryOp, BooleanLiteral, Cast, DataType, Exists, Expression, From, Function,
     Identifier, Join, JoinKind, Lateral, LateralView, Literal, NamedArgSeparator, NamedArgument,
-    Over, Select, StructField, Subquery, UnaryFunc, UnnestFunc, Where, With,
+    Over, Select, StructField, Subquery, UnaryFunc, UnnestFunc, Where, WindowFunction, With,
+    WithinGroup,
 };
 use std::cell::RefCell;
 
@@ -33,6 +34,148 @@ where
         result = transform(result)?;
     }
     Ok(result)
+}
+
+/// Rewrite PostgreSQL ordered-set percentile aggregates grouped by ordinary
+/// GROUP BY expressions into T-SQL/Fabric's analytic percentile form.
+///
+/// PostgreSQL allows `PERCENTILE_CONT/DISC(p) WITHIN GROUP (...)` as grouped
+/// aggregates. T-SQL and Fabric expose the same functions as window functions,
+/// so the equivalent row-per-group shape is `SELECT DISTINCT ... OVER
+/// (PARTITION BY group_key)` rather than `GROUP BY`.
+pub fn grouped_percentiles_to_tsql_windows(expr: Expression) -> Result<Expression> {
+    transform_recursive(expr, &grouped_percentiles_to_tsql_windows_inner)
+}
+
+fn grouped_percentiles_to_tsql_windows_inner(expr: Expression) -> Result<Expression> {
+    let Expression::Select(select) = expr else {
+        return Ok(expr);
+    };
+
+    rewrite_grouped_percentile_select(*select).map(|select| Expression::Select(Box::new(select)))
+}
+
+fn rewrite_grouped_percentile_select(select: Select) -> Result<Select> {
+    let Some(group_by) = &select.group_by else {
+        return Ok(select);
+    };
+
+    if select.having.is_some()
+        || group_by.all.is_some()
+        || group_by.totals
+        || group_by.expressions.is_empty()
+        || group_by.expressions.iter().any(is_complex_grouping_expr)
+    {
+        return Ok(select);
+    }
+
+    let partition_by = group_by.expressions.clone();
+    let mut changed = false;
+    let mut rewritten_expressions = Vec::with_capacity(select.expressions.len());
+
+    for expression in &select.expressions {
+        if is_group_projection(expression, &partition_by) {
+            rewritten_expressions.push(expression.clone());
+            continue;
+        }
+
+        let Some(rewritten) = rewrite_grouped_percentile_projection(expression, &partition_by)
+        else {
+            return Ok(select);
+        };
+
+        changed = true;
+        rewritten_expressions.push(rewritten);
+    }
+
+    if !changed {
+        return Ok(select);
+    }
+
+    let mut rewritten = select;
+    rewritten.expressions = rewritten_expressions;
+    rewritten.group_by = None;
+    rewritten.distinct = true;
+    Ok(rewritten)
+}
+
+fn is_complex_grouping_expr(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Cube(_) | Expression::Rollup(_) | Expression::GroupingSets(_)
+    ) || matches!(expr, Expression::Function(f) if f.name.eq_ignore_ascii_case("GROUPING SETS"))
+}
+
+fn is_group_projection(expr: &Expression, group_by: &[Expression]) -> bool {
+    let inner = match expr {
+        Expression::Alias(alias) => &alias.this,
+        other => other,
+    };
+
+    group_by.iter().any(|group_expr| inner == group_expr)
+}
+
+fn rewrite_grouped_percentile_projection(
+    expr: &Expression,
+    partition_by: &[Expression],
+) -> Option<Expression> {
+    match expr {
+        Expression::Alias(alias) => {
+            let rewritten = rewrite_grouped_percentile_expr(&alias.this, partition_by)?;
+            let mut alias = alias.as_ref().clone();
+            alias.this = rewritten;
+            Some(Expression::Alias(Box::new(alias)))
+        }
+        other => rewrite_grouped_percentile_expr(other, partition_by),
+    }
+}
+
+fn rewrite_grouped_percentile_expr(
+    expr: &Expression,
+    partition_by: &[Expression],
+) -> Option<Expression> {
+    let Expression::WithinGroup(within_group) = expr else {
+        return None;
+    };
+
+    if !is_percentile_ordered_set(&within_group.this) || within_group.order_by.len() != 1 {
+        return None;
+    }
+
+    let mut order_by = within_group.order_by.clone();
+    // T-SQL/Fabric percentile functions allow a single ORDER BY expression.
+    // They ignore NULL inputs, so PostgreSQL null-order emulation would be both
+    // unnecessary and invalid here.
+    order_by[0].nulls_first = None;
+
+    Some(Expression::WindowFunction(Box::new(WindowFunction {
+        this: Expression::WithinGroup(Box::new(WithinGroup {
+            this: within_group.this.clone(),
+            order_by,
+        })),
+        over: Over {
+            window_name: None,
+            partition_by: partition_by.to_vec(),
+            order_by: Vec::new(),
+            frame: None,
+            alias: None,
+        },
+        keep: None,
+        inferred_type: None,
+    })))
+}
+
+fn is_percentile_ordered_set(expr: &Expression) -> bool {
+    match expr {
+        Expression::Function(function) => is_percentile_name(&function.name),
+        Expression::AggregateFunction(function) => is_percentile_name(&function.name),
+        Expression::PercentileCont(_) | Expression::PercentileDisc(_) => true,
+        _ => false,
+    }
+}
+
+fn is_percentile_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PERCENTILE_CONT") || name.eq_ignore_ascii_case("PERCENTILE_DISC")
 }
 
 /// Convert UNNEST to EXPLODE (for Spark/Hive compatibility)
@@ -798,6 +941,81 @@ pub fn eliminate_distinct_on(expr: Expression) -> Result<Expression> {
     eliminate_distinct_on_for_dialect(expr, None, None)
 }
 
+/// Strip PostgreSQL CTE materialization hints for targets that do not support
+/// `AS MATERIALIZED` / `AS NOT MATERIALIZED`.
+pub fn strip_cte_materialization(expr: Expression) -> Result<Expression> {
+    transform_recursive(expr, &strip_cte_materialization_single)
+}
+
+fn strip_cte_materialization_single(expr: Expression) -> Result<Expression> {
+    Ok(match expr {
+        Expression::Select(mut select) => {
+            strip_with_cte_materialization(&mut select.with);
+            Expression::Select(select)
+        }
+        Expression::Union(mut union) => {
+            strip_with_cte_materialization(&mut union.with);
+            Expression::Union(union)
+        }
+        Expression::Intersect(mut intersect) => {
+            strip_with_cte_materialization(&mut intersect.with);
+            Expression::Intersect(intersect)
+        }
+        Expression::Except(mut except) => {
+            strip_with_cte_materialization(&mut except.with);
+            Expression::Except(except)
+        }
+        Expression::Pivot(mut pivot) => {
+            strip_with_cte_materialization(&mut pivot.with);
+            Expression::Pivot(pivot)
+        }
+        Expression::Insert(mut insert) => {
+            strip_with_cte_materialization(&mut insert.with);
+            Expression::Insert(insert)
+        }
+        Expression::Update(mut update) => {
+            strip_with_cte_materialization(&mut update.with);
+            Expression::Update(update)
+        }
+        Expression::Delete(mut delete) => {
+            strip_with_cte_materialization(&mut delete.with);
+            Expression::Delete(delete)
+        }
+        Expression::CreateTable(mut create_table) => {
+            strip_with_cte_materialization(&mut create_table.with_cte);
+            Expression::CreateTable(create_table)
+        }
+        Expression::With(mut with) => {
+            strip_cte_materialization_in_with(&mut with);
+            Expression::With(with)
+        }
+        Expression::Cte(mut cte) => {
+            cte.materialized = None;
+            Expression::Cte(cte)
+        }
+        _ => expr,
+    })
+}
+
+fn strip_with_cte_materialization(with: &mut Option<With>) {
+    if let Some(with) = with {
+        strip_cte_materialization_in_with(with);
+    }
+}
+
+fn strip_cte_materialization_in_with(with: &mut With) {
+    for cte in &mut with.ctes {
+        cte.materialized = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DistinctOnNullsMode {
+    None,
+    NullsFirst,
+    CaseExpr,
+}
+
 /// Eliminate DISTINCT ON with dialect-specific NULL ordering behavior.
 ///
 /// For dialects where NULLs don't sort first by default in DESC ordering,
@@ -807,8 +1025,6 @@ pub fn eliminate_distinct_on_for_dialect(
     target: Option<DialectType>,
     source: Option<DialectType>,
 ) -> Result<Expression> {
-    use crate::expressions::Case;
-
     // PostgreSQL and DuckDB support DISTINCT ON natively - skip elimination
     if matches!(
         target,
@@ -821,30 +1037,33 @@ pub fn eliminate_distinct_on_for_dialect(
     // Oracle/Redshift/Snowflake: NULLS FIRST is default for DESC -> no change needed
     // BigQuery/Spark/Presto/Hive/etc: need explicit NULLS FIRST
     // MySQL/TSQL: no NULLS FIRST syntax -> use CASE WHEN IS NULL
-    enum NullsMode {
-        None,       // Default NULLS FIRST behavior (Oracle, Redshift, Snowflake)
-        NullsFirst, // Add explicit NULLS FIRST (BigQuery, Spark, Presto, Hive, etc.)
-        CaseExpr,   // Use CASE WHEN IS NULL for NULLS FIRST simulation (MySQL, StarRocks, TSQL)
-    }
-
     let nulls_mode = match target {
         Some(DialectType::MySQL)
         | Some(DialectType::SingleStore)
         | Some(DialectType::TSQL)
-        | Some(DialectType::Fabric) => NullsMode::CaseExpr,
+        | Some(DialectType::Fabric) => DistinctOnNullsMode::CaseExpr,
         Some(DialectType::Oracle) | Some(DialectType::Redshift) | Some(DialectType::Snowflake) => {
-            NullsMode::None
+            DistinctOnNullsMode::None
         }
         Some(DialectType::StarRocks) => {
             if matches!(source, Some(DialectType::Redshift)) {
-                NullsMode::CaseExpr
+                DistinctOnNullsMode::CaseExpr
             } else {
-                NullsMode::None
+                DistinctOnNullsMode::None
             }
         }
         // All other dialects that don't support DISTINCT ON: use NULLS FIRST
-        _ => NullsMode::NullsFirst,
+        _ => DistinctOnNullsMode::NullsFirst,
     };
+
+    transform_recursive(expr, &|expr| eliminate_distinct_on_select(expr, nulls_mode))
+}
+
+fn eliminate_distinct_on_select(
+    expr: Expression,
+    nulls_mode: DistinctOnNullsMode,
+) -> Result<Expression> {
+    use crate::expressions::Case;
 
     match expr {
         Expression::Select(mut select) => {
@@ -858,14 +1077,14 @@ pub fn eliminate_distinct_on_for_dialect(
                         let mut exprs = order_by.expressions.clone();
                         // Add NULL ordering based on target dialect
                         match nulls_mode {
-                            NullsMode::NullsFirst => {
+                            DistinctOnNullsMode::NullsFirst => {
                                 for ord in &mut exprs {
                                     if ord.desc && ord.nulls_first.is_none() {
                                         ord.nulls_first = Some(true);
                                     }
                                 }
                             }
-                            NullsMode::CaseExpr => {
+                            DistinctOnNullsMode::CaseExpr => {
                                 // For each DESC column without explicit nulls ordering,
                                 // prepend: CASE WHEN col IS NULL THEN 1 ELSE 0 END DESC
                                 let mut new_exprs = Vec::new();
@@ -904,7 +1123,7 @@ pub fn eliminate_distinct_on_for_dialect(
                                 }
                                 exprs = new_exprs;
                             }
-                            NullsMode::None => {}
+                            DistinctOnNullsMode::None => {}
                         }
                         exprs
                     } else {
@@ -2165,6 +2384,8 @@ fn is_boolean_expression(expr: &Expression) -> bool {
             | Expression::Not(_)
             | Expression::Any(_)
             | Expression::All(_)
+            | Expression::NullSafeEq(_)
+            | Expression::NullSafeNeq(_)
             | Expression::EqualNull(_)
     )
 }
