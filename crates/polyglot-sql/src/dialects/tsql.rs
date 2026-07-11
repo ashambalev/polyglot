@@ -2650,7 +2650,7 @@ impl TSQLDialect {
     }
 
     fn postgres_format_to_strftime(format: &str) -> String {
-        let mapping = HashMap::from([
+        const POSTGRES_FORMAT_TO_STRFTIME: &[(&str, &str)] = &[
             ("FMHH24", "%-H"),
             ("FMHH12", "%-I"),
             ("FMDDD", "%-j"),
@@ -2685,8 +2685,9 @@ impl TSQLDialect {
             ("ww", "%U"),
             ("D", "%u"),
             ("d", "%u"),
-        ]);
-        crate::time::format_time(format, &mapping, None).unwrap_or_else(|| format.to_string())
+        ];
+        crate::format_tokens::convert_format_tokens(format, POSTGRES_FORMAT_TO_STRFTIME)
+            .unwrap_or_else(|| format.to_string())
     }
 
     fn formatted_str_to_time_or_fallback(

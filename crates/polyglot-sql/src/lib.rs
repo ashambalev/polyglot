@@ -22,6 +22,8 @@ pub mod dialects;
 pub mod diff;
 pub mod error;
 pub mod expressions;
+#[cfg(any(test, feature = "dialect-tsql"))]
+mod format_tokens;
 #[cfg(feature = "semantic")]
 pub mod function_catalog;
 mod function_registry;
