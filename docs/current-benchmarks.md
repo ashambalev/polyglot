@@ -168,6 +168,63 @@ SQLTree completed 13, SQLParse 10, SQLFluff 14, and moz-sql-parser 15. Missing
 bars and `N/A` cells mean that the parser errored or timed out during capability
 discovery; they do not represent measured parse times.
 
+## Transpilation
+
+The same upstream script also supports `--mode transpile`. In this mode,
+SQLGlot is called through `transpile(..., error_level=IGNORE)[0]` and Polyglot
+through `transpile(...)[0]`. The registered third-party transpiler set contains
+only Polyglot, so all three measured implementations completed all 16 queries.
+
+The run used the same machine, isolated environment, package versions,
+capability checks, and fastest-of-up-to-five timing method as the parsing
+benchmark. Its invocation added `--mode transpile` and wrote a separate result:
+
+```bash
+"$PYTHON" "$ROOT/external-projects/sqlglot/benchmarks/parse.py" \
+  --mode transpile \
+  --quiet \
+  --json "$ROOT/target/performance/sqlglot-transpile-all-c-v0.6.0.json"
+```
+
+No explicit input or output dialect was supplied. These results therefore
+measure each library's default parse-plus-SQL-generation path, not the cost of a
+specific cross-dialect rewrite.
+
+| Query | SQLGlot | SQLGlot[c] | Polyglot | SQLGlot / Polyglot | SQLGlot[c] / Polyglot |
+|---|---:|---:|---:|---:|---:|
+| TPC-H | 2.112 ms | 418.7 us | **147.1 us** | 14.35x | 2.85x |
+| Short | 151.5 us | 33.2 us | **8.9 us** | 16.99x | 3.72x |
+| Deep arithmetic | 5.647 ms | 1.439 ms | **426.6 us** | 13.24x | 3.37x |
+| Large `IN` | 303.003 ms | 63.033 ms | **21.272 ms** | 14.24x | 2.96x |
+| Values | 324.346 ms | 69.840 ms | **23.768 ms** | 13.65x | 2.94x |
+| Many joins | 8.867 ms | 1.961 ms | **391.3 us** | 22.66x | 5.01x |
+| Many unions | 31.080 ms | 6.623 ms | **2.342 ms** | 13.27x | 2.83x |
+| Nested subqueries | 965.5 us | 177.8 us | **30.8 us** | 31.40x | 5.78x |
+| Many columns | 8.869 ms | 2.056 ms | **592.9 us** | 14.96x | 3.47x |
+| Large `CASE` | 25.340 ms | 5.549 ms | **1.462 ms** | 17.33x | 3.79x |
+| Complex `WHERE` | 21.289 ms | 4.610 ms | **1.134 ms** | 18.78x | 4.07x |
+| Many CTEs | 12.333 ms | 2.524 ms | **482.0 us** | 25.59x | 5.24x |
+| Many windows | 13.794 ms | 3.266 ms | **793.5 us** | 17.38x | 4.12x |
+| Nested functions | 418.9 us | 92.5 us | **33.3 us** | 12.58x | 2.78x |
+| Large strings | 3.569 ms | 828.0 us | **301.5 us** | 11.84x | 2.75x |
+| Many numbers | 70.271 ms | 14.562 ms | **4.449 ms** | 15.79x | 3.27x |
+
+Across these queries, the transpilation geometric-mean ratio is **16.50x in
+Polyglot's favor against pure-Python SQLGlot** and **3.58x in Polyglot's favor
+against SQLGlot[c]**. Polyglot recorded the lowest transpilation time for every
+query in this run.
+
+![Logarithmic transpilation benchmark for SQLGlot compiled extensions 30.12.0 and Polyglot 0.6.0](images/current-benchmarks-transpile.png)
+
+The focused logarithmic chart compares SQLGlot[c] 30.12.0 with Polyglot 0.6.0
+across the complete corpus. Pure-Python SQLGlot remains available in the table.
+
+![Hybrid-scale transpilation benchmark for SQLGlot compiled extensions 30.12.0 and Polyglot 0.6.0](images/current-benchmarks-transpile-hybrid.png)
+
+The hybrid transpilation chart follows the parsing chart's scale: linear from 0
+through 5 ms, then base-2 logarithmic ticks at `5, 10, 20, 40, 80, ...`. Equal
+spacing above the transition therefore represents an exact doubling.
+
 ## Interpretation
 
 These tools do not all provide equivalent behavior. SQLParse is primarily a
