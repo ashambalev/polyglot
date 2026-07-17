@@ -1,6 +1,4 @@
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use polyglot_sql::dialects::DialectType;
 use polyglot_sql::lineage::lineage;
 use polyglot_sql::parse_one;
